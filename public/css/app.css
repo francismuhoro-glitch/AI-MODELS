@@ -8,6 +8,9 @@
   --mono: 'JetBrains Mono', ui-monospace, monospace;
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
+/* Author `display` rules (e.g. .modal-backdrop { display: grid }) beat the UA
+   [hidden] stylesheet, so the overlay/toast stayed visible while hidden=true. */
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color: var(--text); font-size: 14.5px; line-height: 1.5; }
 ::selection { background: rgba(91,140,255,.35); }
