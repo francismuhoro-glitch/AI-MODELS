@@ -87,7 +87,7 @@ async function generate({ trigger = 'manual' } = {}) {
   };
   db.upsert('briefs', brief);
   dbm.load().meta.lastBriefDate = today;
-  dbm.save();
+  await dbm.saveNow();
 
   // Brain keeps a memory of the brief
   brain.ingestNote({ title: `Morning brief — ${today}`, content: brief.markdown, source: 'system', kind: 'brief', tags: ['brief'], refId: brief.id });

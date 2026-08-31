@@ -31,6 +31,7 @@ async function respond(message) {
     source = 'offline-engine';
   }
   db.upsert('chats', { id: `chat-${Date.now()}-a`, role: 'assistant', content: reply, ts: Date.now(), engine: source });
+  await dbm.saveNow();
   return { reply, engine: source, llm: engine };
 }
 

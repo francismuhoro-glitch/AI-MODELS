@@ -7,7 +7,10 @@ const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 async function api(path, opts = {}) {
-  const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+  const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
+  const key = localStorage.getItem('aria.key');
+  if (key) headers['X-ARIA-Key'] = key;
+  const res = await fetch(path, { ...opts, headers });
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
   return res.json();
 }
@@ -84,10 +87,10 @@ const Sound = {
   toggle() { this.on = !this.on; localStorage.setItem('aria.sound', this.on ? '1' : '0'); this.renderChip(); return this.on; },
   label() { return this.on ? '🔊 Sound on' : '🔇 Sound off'; },
   renderChip() {
-    const b = $('#btn-sound'); if (!b) return;
-    b.textContent = this.on ? '🔊' : '🔇';
-    b.title = this.on ? 'Sound on — click to mute' : 'Muted — click to unmute';
-    const b2 = $('#btn-sound-toggle'); if (b2) b2.textContent = this.label();
+    $$('.js-sound').forEach(b => {
+      b.textContent = this.on ? '🔊' : '🔇';
+      b.title = this.on ? 'Sound on — click to mute' : 'Muted — click to unmute';
+    });
   }
 };
 
@@ -121,10 +124,10 @@ const Installer = {
       <p style="color:var(--dim);font-size:13.5px;line-height:1.8">Open your browser menu → <strong style="color:var(--text)">Install app</strong> / <strong style="color:var(--text)">Add to Home screen</strong>.<br>On Chrome desktop, use the install icon in the address bar.<br><br>The installed app works offline for your latest brief and greets you with voice every morning.</p>`);
   },
   render() {
-    const b = $('#btn-install'); if (!b) return;
-    b.hidden = this.standalone();
-    b.textContent = '📲'; b.title = 'Install ARIA OS on this device';
-    const b2 = $('#btn-install2'); if (b2) b2.textContent = this.standalone() ? '✓ Installed' : '📲 Install on this device';
+    $$('.js-install').forEach(b => {
+      b.hidden = this.standalone();
+      b.textContent = '📲'; b.title = 'Install ARIA OS on this device';
+    });
   }
 };
 
@@ -171,6 +174,7 @@ function updateSidebar() {
   const dot = STATE.stats.engine === 'ollama' ? '<span class="dot on"></span>' : '<span class="dot off"></span>';
   eng.innerHTML = `${dot}${STATE.stats.engine === 'ollama' ? 'local LLM · ollama' : 'offline engine'}`;
   $('#sync-chip').textContent = STATE.stats.lastSync ? `synced ${fmtAgo(STATE.stats.lastSync)} ago` : 'never synced';
+  Sound.renderChip(); Installer.render();
 }
 
 /* ---------------- router ---------------- */
@@ -180,7 +184,7 @@ let assistantInit = false;
 window.addEventListener('hashchange', route);
 async function route() {
   const view = (location.hash.replace('#/', '') || 'hub').split('?')[0];
-  $$('.nav-item').forEach(a => a.classList.toggle('active', a.dataset.view === view));
+  $$('.nav-item, .tabbar a').forEach(a => a.classList.toggle('active', a.dataset.view === view));
   const main = $('#main');
   main.innerHTML = '<div class="empty" style="padding:60px"><span class="spin">◌</span> loading…</div>';
   try { await (routes[view] || viewHub)(main, view); }
@@ -203,6 +207,8 @@ async function viewHub(main) {
       <div><h1>${greetWord}, ${esc(s.owner.name)}.</h1>
       <div class="date">${new Intl.DateTimeFormat('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: s.timezone }).format(Date.now())} · ${s.events.length} event${s.events.length === 1 ? '' : 's'} · ${s.unread} unread · ${s.tasks.length} open actions</div></div>
       <div class="head-actions">
+        <button class="btn js-sound" title="Toggle sound">🔊</button>
+        <button class="btn js-install" title="Install on this device">📲</button>
         <button class="btn" id="btn-sync">↻ Sync now</button>
         <button class="btn primary" id="btn-brief">✦ Generate brief</button>
       </div>
@@ -501,7 +507,7 @@ async function viewSettings(main) {
 
       <div class="card"><h3>📲 Install · 🔊 Sound · 🔔 Notifications</h3>
         <div style="display:flex;gap:9px;flex-wrap:wrap">
-          <button class="btn" id="btn-install2">📲 Install on this device</button>
+          <button class="btn js-install" data-force="1">📲 Install on this device</button>
           <button class="btn" id="btn-sound-toggle">${Sound.label()}</button>
           <button class="btn" id="btn-test-voice">▶ Test ARIA's voice</button>
         </div>
@@ -544,8 +550,7 @@ async function viewSettings(main) {
     await refreshState(); updateSidebar();
   };
   $$('button[data-cfg]', main).forEach(b => b.onclick = () => $(`#cfg-${b.dataset.cfg}`).classList.toggle('open'));
-  $('#btn-install2').onclick = () => Installer.prompt();
-  $('#btn-sound-toggle').onclick = () => { Sound.toggle(); toast(Sound.label()); };
+  $('#btn-sound-toggle').onclick = () => { Sound.toggle(); $('#btn-sound-toggle').textContent = Sound.label(); toast(Sound.label()); };
   $('#btn-test-voice').onclick = () => Sound.morning();
   $('#btn-push').onclick = () => PushClient.subscribe();
   $('#btn-push-test').onclick = () => PushClient.test();
@@ -585,8 +590,13 @@ function bindTaskToggles(sel) {
 (async function boot() {
   Installer.init();
   Sound.renderChip();
-  $('#btn-sound').onclick = () => { Sound.toggle(); toast(Sound.label()); if (Sound.on) Sound.pop(); };
-  $('#btn-install').onclick = () => Installer.prompt();
+  // Event delegation — covers buttons rendered later (hub, settings) too
+  document.addEventListener('click', (e) => {
+    const s = e.target.closest('.js-sound');
+    if (s) { Sound.toggle(); toast(Sound.label()); if (Sound.on) Sound.pop(); return; }
+    const i = e.target.closest('.js-install');
+    if (i) Installer.prompt();
+  });
   if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
   await refreshState().catch(() => {});
   route();

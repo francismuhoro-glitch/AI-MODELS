@@ -45,9 +45,10 @@ async function syncAll() {
     }
   }
   dbm.load().meta.lastSync = Date.now();
-  dbm.save();
+  await dbm.saveNow();
   const brain = require('../brain');
   brain.autoGrow();          // second brain learns from everything synced
+  await dbm.saveNow();
   return { ok: true, results, lastSync: dbm.load().meta.lastSync };
 }
 

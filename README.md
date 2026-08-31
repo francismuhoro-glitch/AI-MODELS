@@ -6,6 +6,10 @@ One dashboard that pulls **everything** from your calendars, email and messages 
 
 ---
 
+## 🚀 Hosting: Vercel, Supabase & your phone
+
+**Full deployment guide: [DEPLOY.md](DEPLOY.md)** — covers when you need Supabase, hosting on Vercel for free, using ARIA on your phone, and running it at home with pm2/Tailscale.
+
 ## 📲 Install it (phone, tablet, desktop)
 
 ARIA OS is a **PWA** — installable like a native app:

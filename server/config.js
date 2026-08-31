@@ -1,9 +1,12 @@
 'use strict';
-/* Settings: defaults + user overrides persisted in data/settings.json */
+/* Settings: defaults + user overrides.
+   Local mode: persisted to data/settings.json.
+   Supabase mode: persisted to the aria_docs store (via db layer). */
 const fs = require('fs');
 const path = require('path');
+const store = require('./store');
 
-const DATA_DIR = path.join(__dirname, '..', 'data');
+const DATA_DIR = store.dataDir();
 const FILE = path.join(DATA_DIR, 'settings.json');
 
 const DEFAULTS = {
@@ -31,10 +34,20 @@ function load() {
   return cache;
 }
 
-function save(patch) {
+/* Called by db.init(): merge settings restored from the backing store (Supabase mode). */
+function hydrate(savedSettings) {
+  if (savedSettings && typeof savedSettings === 'object') cache = deepMerge(load(), savedSettings);
+  return cache;
+}
+
+async function save(patch) {
   cache = deepMerge(load(), patch || {});
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(FILE, JSON.stringify(cache, null, 2));
+  if (store.isRemote()) {
+    await store.docSet('settings', cache);
+  } else {
+    try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(FILE, JSON.stringify(cache, null, 2)); }
+    catch (e) { console.error('[config] persist failed:', e.message); }
+  }
   return cache;
 }
 
@@ -47,4 +60,4 @@ function deepMerge(base, patch) {
   return base;
 }
 
-module.exports = { load, save, DATA_DIR };
+module.exports = { load, save, hydrate, DATA_DIR };
