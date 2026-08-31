@@ -135,6 +135,9 @@ const fmtAgo = (ts) => {
 };
 const prioDot = (p) => `<span class="dot-p ${p || 'low'}"></span>`;
 const ctxChip = (ctx) => ctx === 'business' ? '<span class="chip green">business</span>' : '<span class="chip blue">work</span>';
+/* Demo-seeded rows carry a "demo-" id prefix — badge them so fake data is never mistaken for real. */
+const isDemo = (item) => String(item?.id || '').startsWith('demo-');
+const demoChip = (item) => isDemo(item) ? '<span class="chip red">DEMO</span>' : '';
 
 /* ---------------- sound & ARIA's voice ---------------- */
 const Sound = {
@@ -164,13 +167,248 @@ const Sound = {
   },
   morning() { return this.voice('/audio/morning.mp3'); },
   priorityAlert() { this.ding(); return this.voice('/audio/priority.mp3'); },
-  toggle() { this.on = !this.on; localStorage.setItem('aria.sound', this.on ? '1' : '0'); this.renderChip(); return this.on; },
+  toggle() {
+    this.on = !this.on; localStorage.setItem('aria.sound', this.on ? '1' : '0'); this.renderChip();
+    if (!this.on) { try { Speech.cancelSpeak(); } catch (_) {} } // muted → stop talking
+    return this.on;
+  },
   label() { return this.on ? '🔊 Sound on' : '🔇 Sound off'; },
   renderChip() {
     $$('.js-sound').forEach(b => {
       b.textContent = this.on ? '🔊' : '🔇';
       b.title = this.on ? 'Sound on — click to mute' : 'Muted — click to unmute';
     });
+  }
+};
+
+/* strip markdown so speech synthesis reads replies as plain sentences
+   (no asterisks, hashes, backticks or link URLs read out loud) */
+function stripMd(s) {
+  return String(s || '')
+    .replace(/```[\s\S]*?```/g, (m) => m.replace(/```/g, ''))   // code blocks → speak the code
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')                        // images → nothing
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')                     // links → label
+    .replace(/^#{1,6}\s+/gm, '')                                 // headers
+    .replace(/(\*\*|__)([\s\S]*?)\1/g, '$2')                     // bold
+    .replace(/(\*|_)([^*_\n]+)\1/g, '$2')                        // italics
+    .replace(/`([^`]*)`/g, '$1')                                 // inline code
+    .replace(/^\s*(?:[-*+•]|\d+[.)])\s+/gm, '')                  // list markers
+    .replace(/^\s*>\s?/gm, '')                                   // blockquotes
+    .replace(/^\s*[-–—]{2,}\s*$/gm, '')                          // horizontal rules
+    .replace(/[~^]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/* ---------------- voice: speech recognition in + speech synthesis out ----------------
+   Browser-native Web Speech API only — no new dependencies, no paid services.
+   Recognition (the mic) needs HTTPS or localhost and works in Chrome/Edge/Safari, not Firefox.
+   Replies are read aloud with speechSynthesis, gated by the Sound.on mute toggle. */
+const Speech = {
+  on: localStorage.getItem('aria.speech') !== '0',     // speak ARIA's replies aloud
+  convo: localStorage.getItem('aria.convo') === '1',   // hands-free conversation mode
+  rec: null, _send: null, _voice: null, _utterance: null,
+  _speaking: false, listening: false, interim: '',
+  _gotFinal: false, _suppressRestart: false, _lastError: null, _leave: false,
+  _voicesHooked: false, _primeDone: false,
+
+  supported() { return !!(window.SpeechRecognition || window.webkitSpeechRecognition); },
+  secure() {
+    return location.protocol === 'https:' || location.hostname === 'localhost' ||
+      location.hostname === '127.0.0.1' || location.hostname === '[::1]' || location.hostname === '::1';
+  },
+  tts() { return 'speechSynthesis' in window; },
+
+  pickVoice(list) {
+    const en = (list || []).filter(v => /^en/i.test(v.lang || ''));
+    return en.find(v => /aria|female|samantha|zira|karen|moira|tessa|victoria|serena|allison|ava|susan|joanna|kendra|fiona|veena|monica|libby|sonia|amira/i.test(v.name))
+      || en.find(v => /(US|GB)$/i.test(v.lang || '')) || en[0] || null;
+  },
+
+  /* iOS Safari keeps speechSynthesis muted until a speak() happens inside a user gesture.
+     Prime it on the first tap so ARIA's first reply is not silent. */
+  prime() {
+    if (this._primeDone || !this.tts()) return;
+    this._primeDone = true;
+    if (!this._voicesHooked) {
+      this._voicesHooked = true;
+      const voices = window.speechSynthesis.getVoices();
+      if (voices.length) this._voice = this.pickVoice(voices);
+      window.speechSynthesis.onvoiceschanged = () => {
+        const v = window.speechSynthesis.getVoices();
+        if (v.length) this._voice = this.pickVoice(v);
+      };
+    }
+    if (/iphone|ipad|ipod/i.test(navigator.userAgent)) {
+      try {
+        const u = new SpeechSynthesisUtterance(' ');
+        u.volume = 0; u.rate = 2;
+        window.speechSynthesis.speak(u);
+      } catch (_) {}
+    }
+  },
+
+  setSend(fn) { this._send = typeof fn === 'function' ? fn : null; },
+
+  create() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const r = new SR();
+    r.lang = navigator.language || 'en-US';
+    r.continuous = false;
+    r.interimResults = true;
+    r.maxAlternatives = 1;
+    r.onresult = (e) => {
+      let interim = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const res = e.results[i];
+        if (res.isFinal) {
+          this._gotFinal = true;
+          this.interim = '';
+          this.finalize(res[0].transcript.trim());
+          return;
+        }
+        interim += res[0].transcript;
+      }
+      this.interim = interim;
+      const input = $('#chat-in');
+      if (input && this.listening) input.value = interim;   // live interim transcript
+    };
+    r.onerror = (e) => this.onRecError(e);
+    r.onend = () => {
+      const wasFinal = this._gotFinal, suppress = this._suppressRestart, err = this._lastError;
+      this._gotFinal = false; this._suppressRestart = false;
+      this.listening = false;
+      this.render();
+      // Conversation mode: recognition ended without a final answer (no-speech / flaky mic) → keep listening.
+      if (this.convo && !wasFinal && !suppress && !this._leave && (!err || err === 'no-speech' || err === 'aborted')) {
+        setTimeout(() => { if (this.convo && !this.listening && !this._leave) this.startMic(); }, 600);
+      }
+    };
+    return r;
+  },
+
+  onRecError(e) {
+    this.listening = false;
+    const err = (e && e.error) || '';
+    this._lastError = err;
+    this.render();
+    if (err === 'not-allowed' || err === 'service-not-allowed') {
+      toast('🎤 Microphone blocked — click the 🔒 / site-settings icon in your browser, allow the microphone for this site, then try again.');
+    } else if (err === 'audio-capture') {
+      toast('🎤 No microphone found — plug one in and try again.');
+    } else if (err === 'network') {
+      toast('🎤 Speech recognition failed — it needs a network connection and HTTPS.');
+    } else if (err === 'no-speech') {
+      /* gentle: one-shot mode just goes idle; conversation mode auto-restarts (see onend) */
+    } else if (err === 'language-not-supported') {
+      toast(`🎤 Voice input does not support ${this.rec ? this.rec.lang : 'this language'}.`);
+    } else if (err && err !== 'aborted') {
+      toast('🎤 Voice input stopped unexpectedly — tap the mic to try again.');
+    }
+  },
+
+  /* Final transcript → drop it in the input and go through the SAME send path as typing. */
+  finalize(text) {
+    if (!text) return;
+    const input = $('#chat-in');
+    if (input) { input.value = text; input.focus(); }
+    if (this._send) this._send();
+    else toast('Send is not ready yet — tap the mic again.');
+  },
+
+  startMic() {
+    this._leave = false;
+    if (!this.supported()) { toast('🎤 Voice input is not supported in this browser — try Chrome, Edge or Safari.'); return; }
+    if (!this.secure()) { toast('🔒 Voice input needs HTTPS (or localhost) — this page is plain HTTP, so the browser blocks the microphone.'); return; }
+    if (this.listening) return;
+    this.cancelSpeak();   // don't talk over the user
+    try {
+      if (!this.rec) this.rec = this.create();
+      this._lastError = null; this._gotFinal = false; this.interim = '';
+      this.prime();       // iOS: unlock speechSynthesis inside this user gesture
+      this.rec.start();
+      this.listening = true;
+    } catch (e) {
+      this.listening = false;
+      toast('🎤 Could not start the microphone — ' + (e.message || 'unknown error'));
+    }
+    this.render();
+  },
+
+  stopMic() {
+    if (this.rec) { try { this.rec.stop(); } catch (_) {} }
+    this.listening = false;
+    this.render();
+  },
+
+  cancelSpeak() {
+    this._speaking = false;
+    try {
+      if (this.tts()) {
+        if (this._utterance) { this._utterance.onend = this._utterance.onerror = null; this._utterance = null; }
+        window.speechSynthesis.cancel();
+      }
+    } catch (_) {}
+  },
+
+  /* Speak ARIA's reply aloud. Respects the Sound.on mute toggle + the voice preference;
+     strips markdown first so it does not read asterisks and hashes out loud. */
+  speak(text) {
+    if (!Sound.on || !this.on || !this.tts()) return Promise.resolve(false);
+    return new Promise((res) => {
+      try {
+        const synth = window.speechSynthesis;
+        synth.cancel();
+        const u = new SpeechSynthesisUtterance(stripMd(text));
+        if (this._voice) { u.voice = this._voice; u.lang = this._voice.lang; }
+        u.rate = 1; u.pitch = 1; u.volume = 1;
+        u.onend = () => { this._speaking = false; res(true); this.afterSpeak(); };
+        u.onerror = () => { this._speaking = false; res(false); this.afterSpeak(); };
+        this._utterance = u;
+        this._speaking = true;
+        synth.speak(u);
+      } catch (_) { res(false); }
+    });
+  },
+
+  /* Conversation mode: once ARIA finishes speaking, listen again.
+     Also used when replies are silent (muted / no TTS) so the back-and-forth continues. */
+  afterSpeak() {
+    if (!this.convo || this.listening || this._leave) return;
+    setTimeout(() => { if (this.convo && !this.listening && !this._leave) this.startMic(); }, 450);
+  },
+
+  /* Called on every view change so the mic is never left open when leaving the Assistant. */
+  leave() {
+    this._leave = true;
+    this.cancelSpeak();
+    this.stopMic();
+    this._send = null;
+  },
+
+  render() {
+    const mic = $('#chat-mic');
+    if (mic) {
+      mic.hidden = !this.supported();
+      mic.classList.toggle('listening', this.listening);
+      mic.title = this.listening ? 'Listening… tap to stop' : 'Talk to ARIA with your voice';
+      mic.textContent = this.listening ? '🔴' : '🎤';
+      mic.setAttribute('aria-pressed', this.listening ? 'true' : 'false');
+    }
+    const st = $('#mic-status');
+    if (st) { st.textContent = this.listening ? '🎙️ listening… speak now' : ''; st.classList.toggle('live', this.listening); }
+    const v = $('#btn-voice');
+    if (v) {
+      v.textContent = this.on ? '🔊 Voice replies: on' : '🔇 Voice replies: off';
+      v.classList.toggle('primary', this.on);
+      v.title = this.on ? 'ARIA reads her replies aloud' : 'Replies are text-only';
+    }
+    const c = $('#btn-convo');
+    if (c) {
+      c.textContent = this.convo ? '🎙️ Conversation mode: on' : '🎙️ Conversation mode: off';
+      c.classList.toggle('primary', this.convo);
+      c.title = this.convo ? 'Hands-free: ARIA keeps listening after each reply — toggle off to stop' : 'Hands-free back-and-forth: ARIA listens again after each reply';
+    }
   }
 };
 
@@ -263,6 +501,7 @@ let assistantInit = false;
 
 window.addEventListener('hashchange', route);
 async function route() {
+  Speech.leave(); // never leave the mic open (or ARIA talking) when navigating away
   const view = (location.hash.replace('#/', '') || 'hub').split('?')[0];
   $$('.nav-item, .tabbar a').forEach(a => a.classList.toggle('active', a.dataset.view === view));
   const main = $('#main');
@@ -350,7 +589,7 @@ function tlItem(e) {
   return `<div class="tl-item ${new Date(e.end) < Date.now() ? 'past' : ''}">
     <div class="tl-time">${fmtTime(e.start, STATE.timezone)}</div>
     <div class="tl-bar ${cal}"></div>
-    <div><div class="tl-title">${esc(e.title)}</div>
+    <div><div class="tl-title">${esc(e.title)} ${demoChip(e)}</div>
     <div class="tl-meta">${esc(e.calendar)}${e.location ? ' · ' + esc(e.location) : ''}${(e.attendees || []).length ? ' · ' + e.attendees.length + ' att.' : ''}</div></div>
   </div>`;
 }
@@ -420,7 +659,7 @@ async function viewInbox(main) {
 function emailRow(e) {
   return `<div class="row ${e.read ? '' : 'unread'}" data-email="${esc(e.id)}">${prioDot(e.priority)}
     <div class="r-main"><div class="r-title">${esc(e.subject)}</div>
-    <div class="r-sub">${esc(e.fromName || e.from)} · ${ctxChip(e.context)} <span style="opacity:.6">${esc(e.source)}</span></div></div>
+    <div class="r-sub">${demoChip(e)}${esc(e.fromName || e.from)} · ${ctxChip(e.context)} <span style="opacity:.6">${esc(e.source)}</span></div></div>
     <div class="r-time">${fmtAgo(e.receivedAt)}</div></div>`;
 }
 
@@ -430,7 +669,7 @@ async function openEmail(id, refreshMain) {
   openModal(`<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:6px">
     <h2 style="font-size:17px;line-height:1.35">${esc(e.subject)}</h2>
     <button class="btn small" onclick="closeModal()">✕</button></div>
-    <div style="color:var(--dim);font-size:12.5px;margin-bottom:12px">${esc(e.fromName || '')} &lt;${esc(e.from)}&gt; · ${esc(e.source)} · ${fmtDay(e.receivedAt, STATE.timezone)} ${fmtTime(e.receivedAt, STATE.timezone)} · ${ctxChip(e.context)} ${e.priority === 'high' ? '<span class="chip red">urgent</span>' : ''}</div>
+    <div style="color:var(--dim);font-size:12.5px;margin-bottom:12px">${demoChip(e)}${esc(e.fromName || '')} &lt;${esc(e.from)}&gt; · ${esc(e.source)} · ${fmtDay(e.receivedAt, STATE.timezone)} ${fmtTime(e.receivedAt, STATE.timezone)} · ${ctxChip(e.context)} ${e.priority === 'high' ? '<span class="chip red">urgent</span>' : ''}</div>
     <div style="white-space:pre-wrap;font-size:13.5px;color:var(--text)">${esc(e.body)}</div>
     <div style="margin-top:16px;display:flex;gap:8px"><button class="btn primary small" id="em-ask">✦ Ask ARIA to draft a reply</button></div><div id="em-draft" class="md" style="margin-top:10px"></div>`);
   $('#em-ask').onclick = async (ev) => {
@@ -453,7 +692,7 @@ async function viewMessages(main) {
 function msgRow(m) {
   const icon = m.source === 'whatsapp' ? '🟢' : m.source === 'slack' ? '🟣' : '⚪';
   return `<div class="row" data-msg="${esc(m.id)}">${prioDot(m.priority)}
-    <div class="r-main"><div class="r-title">${icon} ${esc(m.channel)}</div>
+    <div class="r-main"><div class="r-title">${icon} ${esc(m.channel)} ${demoChip(m)}</div>
     <div class="r-sub">${esc(m.from)}: ${esc(m.text).slice(0, 130)}</div></div>
     <div class="r-time">${fmtAgo(m.sentAt)}</div></div>`;
 }
@@ -509,6 +748,7 @@ async function openNote(n) {
 async function viewAssistant(main) {
   const history = await api('/api/assistant/history');
   const ai = await api('/api/ai/status');
+  const hasMic = Speech.supported(), isSecure = Speech.secure();
   main.innerHTML = `<div class="view-head"><div><h1>Executive Assistant</h1><div class="sub">Reasons over your real calendar, inbox, messages & brain</div></div>
     <span class="chip ${ai.activeEngine === 'ollama' ? 'green' : 'yellow'}">${ai.activeEngine === 'ollama' ? `🟢 local LLM · ${esc(ai.model || '')}` : '🟡 built-in offline engine'}</span></div>
     <div class="card chat-wrap">
@@ -516,25 +756,61 @@ async function viewAssistant(main) {
         ${history.length ? history.map(chatMsg).join('') : welcomeMsg(ai)}
       </div>
       <div class="suggests">${['What does my day look like?', 'What are my priorities?', 'How is my inbox?', 'Business snapshot', 'What do you know about suppliers?'].map(s => `<button class="btn" data-s="${esc(s)}">${esc(s)}</button>`).join('')}</div>
-      <div class="chat-input"><input id="chat-in" placeholder="Ask ARIA anything about your day, work or business…" autocomplete="off"><button class="btn primary" id="chat-send">Send ⏎</button></div>
+      <div class="chat-input"><input id="chat-in" placeholder="Ask ARIA anything about your day, work or business…" autocomplete="off"><button class="btn mic-btn" id="chat-mic" ${hasMic ? '' : 'hidden'} title="Talk to ARIA with your voice">🎤</button><button class="btn primary" id="chat-send">Send ⏎</button></div>
+      <div class="voice-bar">
+        <button class="btn small" id="btn-voice"></button>
+        <button class="btn small" id="btn-convo"></button>
+        <span class="mic-status" id="mic-status"></span>
+      </div>
+      <div class="voice-hint" id="voice-hint" ${hasMic && isSecure ? 'hidden' : ''}>${hasMic ? '🔒 Voice input needs HTTPS (or localhost) — this page is served over plain HTTP, so browsers block the microphone.' : '🎤 Voice input is not supported in this browser (e.g. Firefox). Use Chrome, Edge or Safari to talk to ARIA — typing always works.'}</div>
     </div>`;
   const scroll = $('#chat-scroll'); scroll.scrollTop = scroll.scrollHeight;
   const send = async () => {
     const input = $('#chat-in'); const text = input.value.trim(); if (!text) return;
+    if (Speech.listening) { Speech._suppressRestart = true; Speech.stopMic(); } // stop listening while ARIA thinks
     input.value = ''; Sound.pop();
     scroll.insertAdjacentHTML('beforeend', `<div class="msg user"><div class="md"><p>${esc(text)}</p></div></div><div class="msg aria" id="aria-typing"><span class="typing"><i></i><i></i><i></i></span></div>`);
     scroll.scrollTop = scroll.scrollHeight;
     try {
       const r = await POST('/api/assistant', { message: text });
       $('#aria-typing').outerHTML = `<div class="msg aria"><div class="md">${md(r.reply)}</div><div class="engine-tag">${esc(r.engine)}</div></div>`;
+      // Speak the reply aloud (respects the Sound mute + voice preference); conversation
+      // mode resumes listening once ARIA is done talking (or right away if replies are silent).
+      Speech.speak(r.reply).then((spoken) => { if (Speech.convo && !spoken) Speech.afterSpeak(); });
     } catch (e) {
       $('#aria-typing').outerHTML = `<div class="msg aria"><div class="md"><p>⚠️ ${esc(e.message)}</p></div></div>`;
+      if (Speech.convo) Speech.afterSpeak();
     }
     scroll.scrollTop = scroll.scrollHeight;
   };
-  $('#chat-send').onclick = send;
-  $('#chat-in').onkeydown = (e) => { if (e.key === 'Enter') send(); };
-  $$('.suggests .btn', main).forEach(b => b.onclick = () => { $('#chat-in').value = b.dataset.s; send(); });
+  Speech.setSend(send);
+  Speech.render();
+  /* Prime speechSynthesis on the FIRST tap in this view — iOS Safari only speaks after
+     a user gesture, so without this the first reply would be silent. */
+  main.addEventListener('click', () => Speech.prime(), { once: true });
+  $('#chat-send').onclick = () => { Speech.prime(); send(); };
+  $('#chat-mic').onclick = () => {
+    Speech.prime();
+    if (Speech.listening) { Speech._suppressRestart = true; Speech.stopMic(); }
+    else Speech.startMic();
+  };
+  $('#chat-in').onkeydown = (e) => { if (e.key === 'Enter') { Speech.prime(); send(); } };
+  $('#btn-voice').onclick = () => {
+    Speech.on = !Speech.on;
+    localStorage.setItem('aria.speech', Speech.on ? '1' : '0');
+    if (!Speech.on) Speech.cancelSpeak();
+    Speech.render();
+    toast(Speech.on ? 'ARIA will speak her replies aloud' : 'Voice replies off — ARIA answers in text only');
+  };
+  $('#btn-convo').onclick = () => {
+    Speech.convo = !Speech.convo;
+    localStorage.setItem('aria.convo', Speech.convo ? '1' : '0');
+    if (Speech.convo) Speech.startMic();
+    else { Speech._suppressRestart = true; Speech.stopMic(); }
+    Speech.render();
+    toast(Speech.convo ? 'Conversation mode on — ARIA listens again after each reply. Toggle it off (or tap the mic) to stop.' : 'Conversation mode off');
+  };
+  $$('.suggests .btn', main).forEach(b => b.onclick = () => { $('#chat-in').value = b.dataset.s; Speech.prime(); send(); });
 }
 
 function chatMsg(c) {
@@ -553,7 +829,7 @@ async function viewSettings(main) {
   const [s, conns] = await Promise.all([api('/api/settings'), api('/api/connectors')]);
   SETTINGS = s; CONNECTORS = conns;
   const connMeta = {
-    demo: ['🧪', 'Demo data', 'Realistic sample day (day job + business). Turn off once your real accounts are connected.'],
+    demo: ['🧪', 'Demo data', 'Sample day, clearly marked DEMO (first-boot seeding is opt-in via ARIA_DEMO=1). Turning it off asks whether to purge the fake data.'],
     google: ['📧', 'Gmail + Google Calendar', 'One-time OAuth setup: Google Cloud project → enable Gmail + Calendar APIs → OAuth client (redirect http://localhost:3111/oauth/google) → generate refresh token → paste below.'],
     microsoft: ['📩', 'Outlook Mail + Calendar', 'Azure app registration → delegated Mail.Read + Calendars.Read → device-code access token → paste below.'],
     slack: ['💬', 'Slack', 'Create a User Token (xoxp-) at api.slack.com/apps with scopes: channels:read, channels:history, im:history, groups:history — paste below.'],
@@ -630,6 +906,27 @@ async function viewSettings(main) {
     await refreshState(); updateSidebar();
   };
   $$('button[data-cfg]', main).forEach(b => b.onclick = () => $(`#cfg-${b.dataset.cfg}`).classList.toggle('open'));
+  /* Demo connector: toggling OFF offers to purge the fake data it seeded — never leave it silently.
+     On accept, disable the connector IMMEDIATELY (not just on Save) so the sync heartbeat
+     cannot re-seed fake data behind the user's back, then purge. */
+  const demoCb = $('input[data-conn="demo"]');
+  demoCb.onchange = () => {
+    if (demoCb.checked) { toast('Demo connector on — syncing will (re)seed sample data, clearly marked DEMO.'); return; }
+    const purge = confirm('Also delete the demo data already in your account?');
+    if (purge) {
+      POST('/api/connectors/demo', { enabled: false, config: {} })
+        .then(() => POST('/api/demo/purge'))
+        .then((r) => {
+          const removed = r.removed || {};
+          const total = Object.values(removed).reduce((a, b) => a + b, 0);
+          toast(`🧹 Demo off — purged ${total} items (${removed.emails} emails, ${removed.messages} messages, ${removed.events} events)`);
+          refreshState().then(updateSidebar).catch(() => {});
+        })
+        .catch((e) => toast(`⚠️ Demo purge failed: ${e.message}`));
+    } else {
+      toast('Demo data stays in your account — it is clearly marked DEMO. Toggle demo off again and confirm to purge it.');
+    }
+  };
   $('#btn-sound-toggle').onclick = () => { Sound.toggle(); $('#btn-sound-toggle').textContent = Sound.label(); toast(Sound.label()); };
   $('#btn-test-voice').onclick = () => Sound.morning();
   $('#btn-push').onclick = () => PushClient.subscribe();

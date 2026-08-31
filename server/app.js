@@ -208,6 +208,33 @@ app.post('/api/sync', async (req, res) => {
   try { res.json(await connectors.syncAll()); } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+/* ---------- Demo data purge ----------
+   Deletes every record the demo connector seeded, across all collections, rebuilds the
+   brain index so fake knowledge is gone too, and marks seeding complete so a later boot
+   never re-seeds.
+   Matching: ids prefixed "demo-" (the seeded rows themselves) plus the notes/tasks the
+   brain auto-derived from them (ids embed the demo reference, e.g. "note-email-demo-em-…",
+   "task-message-demo-msg-…"). Real connectors can never produce those patterns. */
+app.post('/api/demo/purge', async (req, res) => {
+  try {
+    const db = dbm.load();
+    const isDemoRow = (item) => {
+      const id = String(item.id || '');
+      return id.startsWith('demo-') || /^(?:task|note)-(?:email|msg|message)-demo-/.test(id);
+    };
+    const removed = {};
+    for (const col of ['emails', 'messages', 'events', 'notes', 'tasks']) {
+      const before = db[col].length;
+      db[col] = db[col].filter(item => !isDemoRow(item));
+      removed[col] = before - db[col].length;
+    }
+    db.meta.seeded = true;
+    brain.buildIndex();
+    await dbm.saveNow();
+    res.json({ ok: true, removed });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 /* ---------- Cron (Vercel scheduled; harmless in long-lived mode) ---------- */
 app.all('/api/cron/morning', async (req, res) => {
   try {
@@ -282,15 +309,22 @@ app.post('/api/push/test', async (req, res) => {
 
 app.get('/api/health', (req, res) => res.json({ ok: true, name: 'ARIA OS', ts: Date.now() }));
 
-/* ---------- One-time init (seeding) ---------- */
+/* ---------- One-time init ----------
+   Demo seeding is OPT-IN: a fresh install starts empty unless ARIA_DEMO=1 is set.
+   (Old builds seeded demo data whenever db.meta.seeded was false; that silently
+   flooded production deploys with fake mail.) */
 async function init() {
   await dbm.init();
   const db = dbm.load();
   if (!db.meta.seeded) {
-    await connectors.syncAll();
+    if (process.env.ARIA_DEMO === '1') {
+      await connectors.syncAll();
+      console.log('[boot] ARIA_DEMO=1 — demo data seeded…');
+    } else {
+      console.log('[boot] first boot — starting empty (set ARIA_DEMO=1 to seed demo data)');
+    }
     db.meta.seeded = true;
     await dbm.saveNow();
-    console.log('[boot] demo data seeded — second brain learning…');
   }
   return { ok: true };
 }
