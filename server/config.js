@@ -16,7 +16,8 @@ const DEFAULTS = {
   llm: { provider: 'auto', ollamaUrl: 'http://127.0.0.1:11434', model: 'llama3.1' },
   smtp: { host: '', port: 587, secure: false, user: '', pass: '', to: '' },
   connectors: {
-    demo: { enabled: true },
+    /* Demo is opt-in: only enabled out of the box when ARIA_DEMO=1 (first-boot seeding). */
+    demo: { enabled: process.env.ARIA_DEMO === '1' },
     google: { enabled: false, clientId: '', clientSecret: '', refreshToken: '' },
     microsoft: { enabled: false, accessToken: '' },
     slack: { enabled: false, userToken: '' },

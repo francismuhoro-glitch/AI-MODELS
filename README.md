@@ -39,7 +39,7 @@ Install the app, then **Settings → Enable morning notifications**. At wake tim
 | **🧠 Second Brain** | An ever-evolving library. It **automatically captures** priority emails, important messages, every brief and a rolling day-log — then indexes everything (BM25) so you can ask *"what do I know about ___?"*. Capture anything manually too. |
 | **🎯 Action items** | Asks inside emails/messages ("by Friday", "please send", invoices…) become trackable tasks automatically. |
 | **🤖 Executive Assistant** | Chat that reasons over your **real** schedule, inbox, messages and brain. Ask for your day, priorities, business snapshot, or to draft email replies. |
-| **🔌 Connectors** | Demo mode out of the box + real adapters: **Gmail/Google Calendar**, **Outlook**, **Slack** (works with a token today), **WhatsApp Business Cloud API** + a universal `/api/ingest` endpoint (iOS Shortcuts, Zapier, n8n…). |
+| **🔌 Connectors** | Opt-in **demo mode** + real adapters: **Gmail/Google Calendar**, **Outlook**, **Slack** (works with a token today), **WhatsApp Business Cloud API** + a universal `/api/ingest` endpoint (iOS Shortcuts, Zapier, n8n…). |
 
 ## 🚀 Run it
 
@@ -49,7 +49,13 @@ npm start
 # → http://localhost:3000
 ```
 
-First boot seeds realistic **demo data** so everything is alive immediately.
+First boot starts **empty**. To seed realistic **demo data** (every item clearly marked `DEMO`, purgeable from Settings → Connectors), boot with `ARIA_DEMO=1`:
+
+```bash
+ARIA_DEMO=1 npm start
+```
+
+You can also talk to ARIA by voice (Assistant → 🎤) in browsers with Web Speech API support (Chrome/Edge/Safari; needs HTTPS or localhost), and she reads her replies aloud.
 
 ## 🔑 Connect your real accounts
 
