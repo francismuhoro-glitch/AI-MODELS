@@ -99,6 +99,12 @@ async function generate({ trigger = 'manual' } = {}) {
     brief.emailStatus = await sendBrief(cfg, brief);
     db.upsert('briefs', brief);
   }
+  // Push notification to installed devices
+  try {
+    const { pushAll } = require('./push');
+    brief.pushStatus = await pushAll({ title: '☀️ Morning Brief ready', body: `${brief.meta.hot} urgent · ${brief.meta.events} events today — tap to read.`, url: '/#/briefs' });
+    db.upsert('briefs', brief);
+  } catch (_) {}
   return brief;
 }
 

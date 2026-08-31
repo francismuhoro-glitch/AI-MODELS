@@ -7,7 +7,7 @@ const { DATA_DIR } = require('./config');
 const FILE = path.join(DATA_DIR, 'state.json');
 
 const EMPTY = {
-  events: [], emails: [], messages: [], notes: [], briefs: [], tasks: [], chats: [],
+  events: [], emails: [], messages: [], notes: [], briefs: [], tasks: [], chats: [], subscriptions: [],
   meta: { lastSync: null, lastBriefDate: null, seeded: false }
 };
 

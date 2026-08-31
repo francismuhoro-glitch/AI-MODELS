@@ -6,6 +6,24 @@ One dashboard that pulls **everything** from your calendars, email and messages 
 
 ---
 
+## 📲 Install it (phone, tablet, desktop)
+
+ARIA OS is a **PWA** — installable like a native app:
+
+- **Android / Chrome**: open the dashboard → tap the **📲 button** in the sidebar (or Chrome menu → *Install app*).
+- **iPhone / iPad**: open in **Safari** → **Share** → **Add to Home Screen**.
+- **Desktop**: install icon in the address bar, or the 📲 button.
+
+Installed, it runs full-screen, works **offline** (your latest brief stays readable), and lives on your home screen with the ARIA icon.
+
+## 🔊 Sound & voice
+
+ARIA talks — a real voice greeting plays with your fresh morning brief, priority items announce themselves with a chime + voice, task completions chirp, sends pop. Mute with the **🔊 button** in the sidebar (per-device, remembered). Test the voice anytime: **Settings → Install · Sound · Notifications → Test ARIA's voice**.
+
+## 🔔 Morning notifications on your lock screen
+
+Install the app, then **Settings → Enable morning notifications**. At wake time (06:00) the brief is pushed to your device even with the app closed: *"☀️ Morning Brief ready — 3 urgent · 5 events today — tap to read."* Tap it and ARIA opens on the brief.
+
 ## ✨ What's inside
 
 | Module | What it does |

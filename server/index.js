@@ -165,6 +165,27 @@ app.post('/api/ingest/whatsapp', (req, res) => {
 
 app.get('/api/health', (req, res) => res.json({ ok: true, name: 'ARIA OS', ts: Date.now() }));
 
+/* ---------- Push notifications (installed devices) ---------- */
+app.get('/api/push/key', (req, res) => {
+  const { vapid } = require('./push');
+  const v = vapid();
+  res.json({ publicKey: v ? v.publicKey : null });
+});
+app.post('/api/push/subscribe', (req, res) => {
+  const sub = req.body;
+  if (!sub || !sub.endpoint) return res.status(400).json({ error: 'invalid subscription' });
+  const db = dbm.load();
+  db.subscriptions = db.subscriptions || [];
+  const i = db.subscriptions.findIndex(s => s.endpoint === sub.endpoint);
+  if (i >= 0) db.subscriptions[i] = sub; else db.subscriptions.push(sub);
+  dbm.save();
+  res.json({ ok: true, total: db.subscriptions.length });
+});
+app.post('/api/push/test', async (req, res) => {
+  try { res.json(await require('./push').pushAll({ title: '🔔 ARIA OS test', body: 'Notifications are working — your brief arrives every morning at ' + cfgm.load().wakeTime + '.', url: '/#/briefs' })); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 /* ---------- Boot ---------- */
 (async () => {
   // First run: seed demo data so the OS is alive immediately

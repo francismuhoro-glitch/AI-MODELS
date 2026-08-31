@@ -1,0 +1,22 @@
+{
+  "name": "ARIA OS — Personal AI Operating System",
+  "short_name": "ARIA OS",
+  "description": "Morning briefs, second brain and an executive assistant — powered by your calendars, email and messages.",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0a0e14",
+  "theme_color": "#0a0e14",
+  "categories": ["productivity", "business"],
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Morning Brief", "url": "/#/briefs", "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }] },
+    { "name": "Assistant", "url": "/#/assistant", "icons": [{ "src": "/icons/icon-192.png", "sizes": "192x192" }] }
+  ]
+}

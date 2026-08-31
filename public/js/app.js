@@ -53,10 +53,115 @@ const fmtAgo = (ts) => {
 const prioDot = (p) => `<span class="dot-p ${p || 'low'}"></span>`;
 const ctxChip = (ctx) => ctx === 'business' ? '<span class="chip green">business</span>' : '<span class="chip blue">work</span>';
 
+/* ---------------- sound & ARIA's voice ---------------- */
+const Sound = {
+  on: localStorage.getItem('aria.sound') !== '0',
+  ctx: null,
+  ensure() {
+    if (!this.ctx) { try { this.ctx = new (window.AudioContext || window.webkitAudioContext)(); } catch (_) {} }
+    if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+    return this.ctx;
+  },
+  tone(freq, t0, dur, type = 'sine', gain = 0.12) {
+    const ctx = this.ensure(); if (!ctx) return;
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(0, ctx.currentTime + t0);
+    g.gain.linearRampToValueAtTime(gain, ctx.currentTime + t0 + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + t0 + dur);
+    o.connect(g).connect(ctx.destination);
+    o.start(ctx.currentTime + t0); o.stop(ctx.currentTime + t0 + dur + 0.05);
+  },
+  ding() { if (!this.on) return; this.tone(880, 0, .35); this.tone(1318.5, .12, .5); },
+  chirp() { if (!this.on) return; this.tone(659.3, 0, .12, 'triangle', .09); this.tone(987.8, .09, .22, 'triangle', .09); },
+  pop() { if (!this.on) return; this.tone(523.3, 0, .09, 'sine', .06); },
+  voice(file) {
+    if (!this.on) return Promise.resolve(false);
+    return new Promise(res => { try { const a = new Audio(file); a.volume = .95; a.onended = () => res(true); a.play().then(() => {}).catch(() => res(false)); } catch (_) { res(false); } });
+  },
+  morning() { return this.voice('/audio/morning.mp3'); },
+  priorityAlert() { this.ding(); return this.voice('/audio/priority.mp3'); },
+  toggle() { this.on = !this.on; localStorage.setItem('aria.sound', this.on ? '1' : '0'); this.renderChip(); return this.on; },
+  label() { return this.on ? '🔊 Sound on' : '🔇 Sound off'; },
+  renderChip() {
+    const b = $('#btn-sound'); if (!b) return;
+    b.textContent = this.on ? '🔊' : '🔇';
+    b.title = this.on ? 'Sound on — click to mute' : 'Muted — click to unmute';
+    const b2 = $('#btn-sound-toggle'); if (b2) b2.textContent = this.label();
+  }
+};
+
+/* ---------------- install (PWA) ---------------- */
+const Installer = {
+  deferred: null,
+  init() {
+    window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); this.deferred = e; this.render(); });
+    window.addEventListener('appinstalled', () => { this.deferred = null; this.render(); toast('📱 ARIA OS installed — check your home screen'); });
+    this.render();
+  },
+  standalone() { return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true; },
+  async prompt() {
+    if (this.deferred) {
+      this.deferred.prompt();
+      const r = await this.deferred.userChoice;
+      this.deferred = null; this.render();
+      if (r.outcome === 'accepted') toast('Installing ARIA OS…');
+      return;
+    }
+    const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+    if (isIOS) openModal(`<h2 style="font-size:18px;margin-bottom:12px">📲 Install ARIA OS on iPhone / iPad</h2>
+      <ol style="line-height:2.1;color:var(--dim);font-size:14px;padding-left:20px">
+        <li>Open this page in <strong style="color:var(--text)">Safari</strong></li>
+        <li>Tap the <strong style="color:var(--text)">Share</strong> button <span style="opacity:.6">(square with an arrow up)</span></li>
+        <li>Scroll down and tap <strong style="color:var(--text)">Add to Home Screen</strong></li>
+        <li>Tap <strong style="color:var(--text)">Add</strong> — done ✨</li>
+      </ol>
+      <p style="color:var(--faint);font-size:12.5px;margin-top:12px">ARIA will run full-screen like a native app — morning brief, second brain and assistant, with voice.</p>`);
+    else openModal(`<h2 style="font-size:18px;margin-bottom:10px">📲 Install ARIA OS</h2>
+      <p style="color:var(--dim);font-size:13.5px;line-height:1.8">Open your browser menu → <strong style="color:var(--text)">Install app</strong> / <strong style="color:var(--text)">Add to Home screen</strong>.<br>On Chrome desktop, use the install icon in the address bar.<br><br>The installed app works offline for your latest brief and greets you with voice every morning.</p>`);
+  },
+  render() {
+    const b = $('#btn-install'); if (!b) return;
+    b.hidden = this.standalone();
+    b.textContent = '📲'; b.title = 'Install ARIA OS on this device';
+    const b2 = $('#btn-install2'); if (b2) b2.textContent = this.standalone() ? '✓ Installed' : '📲 Install on this device';
+  }
+};
+
+/* ---------------- push notifications (morning wake-up) ---------------- */
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - base64String.length % 4) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(base64); const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+const PushClient = {
+  async subscribe() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return toast('Push not supported in this browser');
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') return toast('Notification permission was denied');
+    const reg = await navigator.serviceWorker.ready;
+    const { publicKey } = await api('/api/push/key');
+    if (!publicKey) return toast('Server push not configured');
+    const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlBase64ToUint8Array(publicKey) });
+    await POST('/api/push/subscribe', sub);
+    toast('🔔 Morning notifications enabled — brief arrives at ' + (STATE?.wakeTime || '06:00'));
+  },
+  async test() { await POST('/api/push/test'); toast('Test notification sent — check your device'); }
+};
+
 /* ---------------- state ---------------- */
 let STATE = null; let SETTINGS = null; let CONNECTORS = [];
 
-async function refreshState() { STATE = await api('/api/state'); return STATE; }
+let lastHighSeen = null;
+async function refreshState() {
+  STATE = await api('/api/state');
+  const high = STATE.inbox.filter(e => e.priority === 'high' && !e.read).length + STATE.messages.filter(m => m.priority === 'high' && !m.read).length;
+  if (lastHighSeen !== null && high > lastHighSeen) Sound.priorityAlert();
+  lastHighSeen = high;
+  return STATE;
+}
 
 function updateSidebar() {
   if (!STATE) return;
@@ -136,8 +241,13 @@ async function viewHub(main) {
     </div>`;
 
   renderBriefCard(s.brief);
-  $('#btn-sync').onclick = async (e) => { e.target.disabled = true; e.target.textContent = '↻ syncing…'; await POST('/api/sync'); await route(); toast('Connectors synced'); };
-  $('#btn-brief').onclick = async (e) => { e.target.disabled = true; e.target.textContent = '✦ composing…'; const b = await POST('/api/brief/generate'); await refreshState(); renderBriefCard(STATE.brief); e.target.disabled = false; e.target.textContent = '✦ Generate brief'; toast(b.meta ? `Brief ready — ${b.meta.hot} urgent items flagged` : 'Brief ready'); };
+  // greet with voice when a fresh brief is on the hub (once per session; browser may require a tap first)
+  if (s.brief && Date.now() - s.brief.generatedAt < 10 * 60_000 && !sessionStorage.getItem('aria.greeted')) {
+    sessionStorage.setItem('aria.greeted', '1');
+    Sound.morning();
+  }
+  $('#btn-sync').onclick = async (e) => { e.target.disabled = true; e.target.textContent = '↻ syncing…'; await POST('/api/sync'); await route(); toast('Connectors synced'); Sound.pop(); };
+  $('#btn-brief').onclick = async (e) => { e.target.disabled = true; e.target.textContent = '✦ composing…'; const b = await POST('/api/brief/generate'); await refreshState(); renderBriefCard(STATE.brief); e.target.disabled = false; e.target.textContent = '✦ Generate brief'; toast(b.meta ? `Brief ready — ${b.meta.hot} urgent items flagged` : 'Brief ready'); if (b.meta && b.meta.hot > 0) Sound.priorityAlert(); };
   bindTaskToggles('#hub-tasks');
   $$('.row[data-email]', main).forEach(r => r.onclick = () => openEmail(r.dataset.email));
 }
@@ -164,15 +274,18 @@ function renderBriefCard(brief) {
   if (!brief) { el.innerHTML = `<h3>☀️ Morning Brief</h3><div class="empty">No brief yet. Hit <strong>Generate brief</strong> — or wait for ${esc(STATE.wakeTime)} tomorrow morning.</div>`; return; }
   const briefMd = md(brief.markdown).replace('<h2>⚡ The one thing</h2>', '').replace(/<p>The one thing<\/p>/, '');
   el.innerHTML = `<div class="brief-head"><h3 style="margin:0">☀️ Morning Brief <span class="right">${esc(brief.date)} · ${esc(brief.trigger || 'manual')}</span></h3>
-    <button class="btn small" onclick="location.hash='#/briefs'">archive →</button></div>
+    <span style="display:flex;gap:7px"><button class="btn small" id="btn-hear" title="Play ARIA's voice greeting">🔊 hear it</button>
+    <button class="btn small" onclick="location.hash='#/briefs'">archive →</button></span></div>
     <div class="md">${briefMd}</div>`;
+  $('#btn-hear').onclick = () => Sound.morning();
 }
 
 /* ===== BRIEFS ===== */
 async function viewBriefs(main) {
   const briefs = await api('/api/briefs');
   main.innerHTML = `<div class="view-head"><div><h1>Morning Briefs</h1><div class="sub">Every day at ${esc((await api('/api/settings')).wakeTime)} · dashboard + email</div></div>
-    <button class="btn primary" id="btn-brief2">✦ Generate now</button></div>
+    <button class="btn primary" id="btn-brief2">✦ Generate now</button>
+    <button class="btn" id="btn-hear2" title="Play ARIA's voice greeting">🔊</button></div>
     <div class="grid">${briefs.length ? briefs.map(b => `
       <div class="card" style="cursor:pointer" onclick="openBrief('${b.id}')">
         <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
@@ -185,6 +298,7 @@ async function viewBriefs(main) {
         <div class="note-snip" style="margin-top:8px">${esc((b.markdown || '').replace(/[#*_]/g, '').slice(0, 220))}…</div>
       </div>`).join('') : '<div class="card empty">No briefs yet — generate your first one.</div>'}</div>`;
   $('#btn-brief2').onclick = async (e) => { e.target.disabled = true; e.target.textContent = '✦ composing…'; await POST('/api/brief/generate'); route(); toast('Brief generated'); };
+  $('#btn-hear2').onclick = () => Sound.morning();
 }
 
 window.openBrief = async (id) => {
@@ -321,7 +435,7 @@ async function viewAssistant(main) {
   const scroll = $('#chat-scroll'); scroll.scrollTop = scroll.scrollHeight;
   const send = async () => {
     const input = $('#chat-in'); const text = input.value.trim(); if (!text) return;
-    input.value = '';
+    input.value = ''; Sound.pop();
     scroll.insertAdjacentHTML('beforeend', `<div class="msg user"><div class="md"><p>${esc(text)}</p></div></div><div class="msg aria" id="aria-typing"><span class="typing"><i></i><i></i><i></i></span></div>`);
     scroll.scrollTop = scroll.scrollHeight;
     try {
@@ -385,6 +499,19 @@ async function viewSettings(main) {
         <label class="field">Send brief to<input id="s-smtpto" value="${esc(s.smtp.to)}" placeholder="you@gmail.com"></label>
       </div><p style="color:var(--faint);font-size:12px;margin-top:10px">Gmail: enable 2FA → create an App Password → use it above.</p></div>
 
+      <div class="card"><h3>📲 Install · 🔊 Sound · 🔔 Notifications</h3>
+        <div style="display:flex;gap:9px;flex-wrap:wrap">
+          <button class="btn" id="btn-install2">📲 Install on this device</button>
+          <button class="btn" id="btn-sound-toggle">${Sound.label()}</button>
+          <button class="btn" id="btn-test-voice">▶ Test ARIA's voice</button>
+        </div>
+        <div style="display:flex;gap:9px;flex-wrap:wrap;margin-top:10px">
+          <button class="btn" id="btn-push">🔔 Enable morning notifications</button>
+          <button class="btn ghost" id="btn-push-test">Send test notification</button>
+        </div>
+        <p style="color:var(--faint);font-size:12px;margin-top:12px">Install puts ARIA on your home screen / desktop like a native app — full screen, offline access to your latest brief, and her voice every morning. Notifications deliver the brief to your lock screen at ${esc(s.wakeTime)} even before you open the app.</p>
+      </div>
+
       <div class="card"><h3>🔌 Connectors</h3>
         ${conns.map(c => { const meta = connMeta[c.id] || ['⚪', c.id, '']; const conf = s.connectors[c.id] || {}; return `
         <div class="connector">
@@ -417,6 +544,11 @@ async function viewSettings(main) {
     await refreshState(); updateSidebar();
   };
   $$('button[data-cfg]', main).forEach(b => b.onclick = () => $(`#cfg-${b.dataset.cfg}`).classList.toggle('open'));
+  $('#btn-install2').onclick = () => Installer.prompt();
+  $('#btn-sound-toggle').onclick = () => { Sound.toggle(); toast(Sound.label()); };
+  $('#btn-test-voice').onclick = () => Sound.morning();
+  $('#btn-push').onclick = () => PushClient.subscribe();
+  $('#btn-push-test').onclick = () => PushClient.test();
 }
 
 function configFields(id, conf) {
@@ -444,12 +576,18 @@ function taskRow(t) {
 }
 function bindTaskToggles(sel) {
   $$(sel).forEach(el => el.querySelectorAll('.task input').forEach(cb => cb.onchange = async () => {
+    if (cb.checked) Sound.chirp();
     await POST(`/api/tasks/${cb.closest('.task').dataset.task}/toggle`); route();
   }));
 }
 
 /* ---------------- boot ---------------- */
 (async function boot() {
+  Installer.init();
+  Sound.renderChip();
+  $('#btn-sound').onclick = () => { Sound.toggle(); toast(Sound.label()); if (Sound.on) Sound.pop(); };
+  $('#btn-install').onclick = () => Installer.prompt();
+  if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
   await refreshState().catch(() => {});
   route();
   setInterval(() => { refreshState().then(updateSidebar).catch(() => {}); }, 60_000);

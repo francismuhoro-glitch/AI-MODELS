@@ -34,6 +34,10 @@ body { font-family: 'Inter', system-ui, sans-serif; background: var(--bg); color
 .engine-chip .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; background: var(--faint); }
 .engine-chip .dot.on { background: var(--green); box-shadow: 0 0 8px var(--green); }
 .engine-chip .dot.off { background: var(--yellow); }
+.foot-btns { display: flex; gap: 6px; }
+.foot-btns button { flex: 1; background: var(--card2); border: 1px solid var(--border2); color: var(--dim); border-radius: 9px; padding: 7px 0; font-size: 15px; cursor: pointer; transition: all .15s; }
+.foot-btns button:hover { color: var(--text); border-color: var(--accent); }
+.foot-btns button[hidden] { display: none; }
 .nav-settings { margin-top: 2px; }
 
 /* ---------- Main ---------- */

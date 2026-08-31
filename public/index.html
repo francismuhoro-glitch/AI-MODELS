@@ -4,6 +4,14 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ARIA OS — Personal AI Operating System</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#0a0e14">
+<meta name="description" content="Morning briefs, second brain and an executive assistant — powered by your calendars, email and messages.">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="ARIA OS">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/css/app.css">
@@ -28,6 +36,10 @@
     <div class="sidebar-foot">
       <div class="engine-chip" id="engine-chip" title="AI engine powering briefs & assistant">⚪ checking AI…</div>
       <div class="sync-chip" id="sync-chip">—</div>
+      <div class="foot-btns">
+        <button id="btn-sound" title="Toggle sound">🔊</button>
+        <button id="btn-install" title="Install on this device">📲</button>
+      </div>
       <a href="#/settings" class="nav-item nav-settings" data-view="settings"><svg viewBox="0 0 24 24"><path d="m9.3 2 .4 2.2c-.6.2-1.1.5-1.6.9L6 4.4 3.3 9l1.8 1.3a7 7 0 0 0 0 1.9L3.3 13.5 6 18l2.1-.8c.5.4 1 .7 1.6.9L9.3 21h5.4l.4-2.2c.6-.2 1.1-.5 1.6-.9l2.1.8 2.7-4.6-1.8-1.3a7 7 0 0 0 0-1.9l1.8-1.3L18.7 4.4l-2.1.8c-.5-.4-1-.7-1.6-.9L14.7 2zm2.7 6.5a3.5 3.5 0 1 1 0 7 3.5 3.5 0 0 1 0-7z"/></svg>Settings</a>
     </div>
   </aside>
