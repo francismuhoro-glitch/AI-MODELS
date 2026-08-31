@@ -6,14 +6,94 @@ const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => [...el.querySelectorAll(sel)];
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+/* ---------------- auth key (cookie + localStorage) ----------------
+   The passphrase is kept in TWO places on purpose:
+     • localStorage → sent as the X-ARIA-Key header on fetch() calls
+     • aria_key cookie → rides along with plain navigations (home-screen launch, reload,
+       service-worker refresh), which cannot carry a custom header.
+   Keeping only one of them is what produced the unlock loop: the page authenticated its API
+   calls but the document itself kept coming back locked. */
+const Auth = {
+  LS: 'aria.key',
+  COOKIE: 'aria_key',
+  get() {
+    try { const v = localStorage.getItem(this.LS); if (v) return v; } catch (_) {}
+    return this.cookie();
+  },
+  cookie() {
+    const m = document.cookie.match(/(?:^|;\s*)aria_key=([^;]*)/);
+    if (!m) return null;
+    try { return decodeURIComponent(m[1]); } catch (_) { return m[1]; }
+  },
+  set(v) {
+    try { localStorage.setItem(this.LS, v); } catch (_) {}
+    document.cookie = `${this.COOKIE}=${encodeURIComponent(v)}; path=/; max-age=31536000; samesite=lax` +
+      (location.protocol === 'https:' ? '; secure' : '');
+  },
+  clear() {
+    try { localStorage.removeItem(this.LS); } catch (_) {}
+    document.cookie = `${this.COOKIE}=; path=/; max-age=0; samesite=lax`;
+  },
+  /* Self-heal installs unlocked by an older build: key in localStorage, no cookie → mirror it. */
+  sync() {
+    let saved = null;
+    try { saved = localStorage.getItem(this.LS); } catch (_) {}
+    if (saved && this.cookie() !== saved) this.set(saved);
+    else if (!saved && this.cookie()) { try { localStorage.setItem(this.LS, this.cookie()); } catch (_) {} }
+  }
+};
+
 async function api(path, opts = {}) {
   const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
-  const key = localStorage.getItem('aria.key');
+  const key = Auth.get();
   if (key) headers['X-ARIA-Key'] = key;
-  const res = await fetch(path, { ...opts, headers });
+  const res = await fetch(path, { credentials: 'same-origin', ...opts, headers });
+  if (res.status === 401) { Unlock.show(); throw new Error('locked — enter your passphrase'); }
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
   return res.json();
 }
+
+/* Self-healing unlock overlay — shown whenever the API answers 401 (expired/absent/wrong key),
+   so the app recovers in place instead of dead-ending on "unauthorized". */
+const Unlock = {
+  el: null,
+  show() {
+    if (this.el) return;
+    const el = document.createElement('div');
+    el.id = 'aria-unlock';
+    el.setAttribute('role', 'dialog');
+    el.setAttribute('aria-modal', 'true');
+    el.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(6,9,14,.92);backdrop-filter:blur(6px);display:grid;place-items:center';
+    el.innerHTML = `<form style="background:#131a26;border:1px solid #223047;padding:30px;border-radius:16px;width:min(340px,90vw);text-align:center;font-family:system-ui,-apple-system,sans-serif">
+      <h1 style="font-size:18px;margin:0 0 4px;color:#e8eef7">🧠 ARIA OS</h1>
+      <p style="color:#8b9bb4;font-size:12.5px;margin:0 0 18px">session locked — enter your passphrase</p>
+      <input name="k" type="password" autocomplete="current-password" style="width:100%;box-sizing:border-box;background:#0f141d;border:1px solid #2c3d5a;color:#e8eef7;border-radius:10px;padding:11px 13px;font-size:15px;outline:none">
+      <button type="submit" style="width:100%;margin-top:12px;background:linear-gradient(135deg,#5b8cff,#7c5bff);border:0;color:#fff;border-radius:10px;padding:11px;font-size:15px;font-weight:700;cursor:pointer">Unlock</button>
+    </form>`;
+    const form = el.querySelector('form');
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      const v = form.k.value;
+      if (!v) return;
+      Auth.set(v); // cookie + localStorage, so both navigations and fetches authenticate
+      try {
+        const res = await fetch('/api/health', { credentials: 'same-origin', headers: { 'X-ARIA-Key': v } });
+        if (!res.ok) throw new Error('bad key');
+        this.hide();
+        location.reload(); // reload the document so the server serves the real dashboard shell
+      } catch (_) {
+        Auth.clear();
+        form.k.value = '';
+        form.k.style.borderColor = '#e2557a';
+        form.k.placeholder = 'wrong passphrase — try again';
+      }
+    };
+    document.body.appendChild(el);
+    this.el = el;
+    form.k.focus();
+  },
+  hide() { if (this.el) { this.el.remove(); this.el = null; } }
+};
 const POST = (path, body) => api(path, { method: 'POST', body: JSON.stringify(body || {}) });
 
 function toast(msg, ms = 2600) {
@@ -588,6 +668,7 @@ function bindTaskToggles(sel) {
 
 /* ---------------- boot ---------------- */
 (async function boot() {
+  Auth.sync(); // mirror a key stranded in localStorage into the cookie (older builds) and vice versa
   Installer.init();
   Sound.renderChip();
   // Event delegation — covers buttons rendered later (hub, settings) too
@@ -598,7 +679,7 @@ function bindTaskToggles(sel) {
     if (i) Installer.prompt();
   });
   if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
-  await refreshState().catch(() => {});
+  await refreshState().catch(() => {}); // a 401 here surfaces the unlock overlay via api()
   route();
   setInterval(() => { refreshState().then(updateSidebar).catch(() => {}); }, 60_000);
 })();

@@ -17,16 +17,80 @@ const app = express();
 app.use(express.json({ limit: '2mb' }));
 
 /* Optional single-passphrase protection — set ARIA_PASSWORD env var to lock the dashboard + API.
-   The browser remembers it (localStorage); requests send it via X-ARIA-Key header. */
+   Accepted credentials, in order: X-ARIA-Key header, aria_key cookie, ?key= query param.
+
+   Why the cookie matters: a browser *navigation* (typing the URL, tapping the home-screen icon,
+   a service-worker refresh) cannot attach a custom header, so a key living only in localStorage
+   could never unlock the document itself — the unlock form saved the key, reloaded, got the
+   unlock form again, and the dashboard reported "unauthorized — send X-ARIA-Key header".
+   The cookie rides along with every navigation, which breaks that deadlock. */
+const AUTH_COOKIE = 'aria_key';
+const COOKIE_MAX_AGE = 365 * 24 * 60 * 60 * 1000; // 1 year
+
+function readCookie(req, name) {
+  const raw = req.headers.cookie;
+  if (!raw) return null;
+  for (const part of raw.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq < 0) continue;
+    if (part.slice(0, eq).trim() !== name) continue;
+    const val = part.slice(eq + 1).trim();
+    try { return decodeURIComponent(val); } catch (_) { return val; }
+  }
+  return null;
+}
+
+function setAuthCookie(req, res, value) {
+  const secure = req.secure || String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+  res.cookie(AUTH_COOKIE, value, { path: '/', maxAge: COOKIE_MAX_AGE, sameSite: 'lax', httpOnly: false, secure });
+}
+
+/* Unlock page — stores the passphrase in BOTH places: the cookie (so navigations authenticate)
+   and localStorage (so fetch() keeps sending X-ARIA-Key). It also self-heals installs that were
+   unlocked by an older build: a key stranded in localStorage is mirrored into the cookie once. */
+const UNLOCK_PAGE = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ARIA OS — unlock</title><style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0a0e14;color:#e8eef7;display:grid;place-items:center;min-height:100vh;margin:0}form{background:#131a26;border:1px solid #223047;padding:30px;border-radius:16px;width:min(340px,90vw);text-align:center}h1{font-size:18px;margin-bottom:4px}p{color:#8b9bb4;font-size:12.5px;margin:0 0 18px}input{width:100%;box-sizing:border-box;background:#0f141d;border:1px solid #2c3d5a;color:#e8eef7;border-radius:10px;padding:11px 13px;font-size:15px;outline:none}button{width:100%;margin-top:12px;background:linear-gradient(135deg,#5b8cff,#7c5bff);border:0;color:#fff;border-radius:10px;padding:11px;font-size:15px;font-weight:700;cursor:pointer}</style></head><body>
+<form id="unlock" autocomplete="on"><h1>🧠 ARIA OS</h1><p>enter your passphrase</p><input name="k" type="password" autofocus autocomplete="current-password"><button type="submit">Unlock</button></form>
+<script>
+(function () {
+  var LS = 'aria.key';
+  function save(v) {
+    try { localStorage.setItem(LS, v); } catch (e) {}
+    document.cookie = 'aria_key=' + encodeURIComponent(v) + '; path=/; max-age=31536000; samesite=lax' + (location.protocol === 'https:' ? '; secure' : '');
+  }
+  document.getElementById('unlock').onsubmit = function () {
+    var v = this.k.value; if (!v) return false;
+    save(v); location.reload(); return false;
+  };
+  /* self-heal: unlocked by an older build → key is in localStorage but not in the cookie */
+  try {
+    var saved = localStorage.getItem(LS);
+    if (saved && document.cookie.indexOf('aria_key=') === -1 && !sessionStorage.getItem('aria.rehydrate')) {
+      sessionStorage.setItem('aria.rehydrate', '1');
+      save(saved); location.reload();
+    }
+  } catch (e) {}
+  /* drop a stale service worker that may be serving a cached unlock shell */
+  if ('serviceWorker' in navigator) navigator.serviceWorker.getRegistrations().then(function (rs) { rs.forEach(function (r) { r.update(); }); }).catch(function () {});
+})();
+</script>
+</body></html>`;
+
 app.use((req, res, next) => {
   const pass = process.env.ARIA_PASSWORD;
   if (!pass) return next();
-  const key = req.headers['x-aria-key'] || req.query.key;
-  if (key === pass) return next();
-  if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'unauthorized — send X-ARIA-Key header (or ?key=)' });
+  const cookieKey = readCookie(req, AUTH_COOKIE);
+  const key = req.headers['x-aria-key'] || cookieKey || req.query.key;
+  if (key === pass) {
+    // Unlocking via ?key= (shared link, iOS Shortcut) also plants the cookie so navigations stick.
+    if (cookieKey !== pass && req.query.key === pass) setAuthCookie(req, res, pass);
+    return next();
+  }
+  if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'unauthorized — send X-ARIA-Key header, aria_key cookie (or ?key=)' });
   const isDocument = req.accepts('html') && !/\.[a-z0-9]+$/i.test(req.path);
   if (isDocument) {
-    return res.send(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>ARIA OS — unlock</title><style>body{font-family:system-ui;background:#0a0e14;color:#e8eef7;display:grid;place-items:center;min-height:100vh;margin:0}form{background:#131a26;border:1px solid #223047;padding:30px;border-radius:16px;width:min(340px,90vw);text-align:center}h1{font-size:18px;margin-bottom:4px}p{color:#8b9bb4;font-size:12.5px;margin:0 0 18px}input{width:100%;box-sizing:border-box;background:#0f141d;border:1px solid #2c3d5a;color:#e8eef7;border-radius:10px;padding:11px 13px;font-size:15px;outline:none}button{width:100%;margin-top:12px;background:linear-gradient(135deg,#5b8cff,#7c5bff);border:0;color:#fff;border-radius:10px;padding:11px;font-size:15px;font-weight:700;cursor:pointer}</style></head><body><form onsubmit="localStorage.setItem('aria.key',this.k.value);location.reload();return false"><h1>🧠 ARIA OS</h1><p>enter your passphrase</p><input name="k" type="password" autofocus autocomplete="current-password"><button>Unlock</button></form></body></html>`);
+    res.set('Cache-Control', 'no-store, must-revalidate');
+    res.set('X-ARIA-Locked', '1'); // lets the service worker refuse to cache this page as the app shell
+    return res.type('html').send(UNLOCK_PAGE);
   }
   return next();
 });
