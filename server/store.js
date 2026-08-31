@@ -13,7 +13,9 @@ const SUPA_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_KEY ||
 const TABLE = 'aria_docs';
 
 const isRemote = () => !!(SUPA_URL && SUPA_KEY);
-const dataDir = () => process.env.ARIA_DATA_DIR || path.join(__dirname, '..', 'data');
+const dataDir = () => process.env.ARIA_DATA_DIR
+  || (process.env.VERCEL ? '/tmp/aria-data' /* serverless: filesystem is ephemeral & read-only outside /tmp */
+    : path.join(__dirname, '..', 'data'));
 
 function filePath(id) { return path.join(dataDir(), `${id}.json`); }
 
