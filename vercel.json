@@ -1,16 +1,6 @@
 {
-  "builds": [
-    { "src": "api/index.js", "use": "@vercel/node", "config": { "includeFiles": ["server/**", "public/**"] } },
-    { "src": "public/**", "use": "@vercel/static" }
-  ],
-  "routes": [
-    { "src": "/manifest.webmanifest", "dest": "/public/manifest.webmanifest" },
-    { "src": "/sw.js", "dest": "/public/sw.js" },
-    { "src": "/css/(.*)", "dest": "/public/css/$1" },
-    { "src": "/js/(.*)", "dest": "/public/js/$1" },
-    { "src": "/icons/(.*)", "dest": "/public/icons/$1" },
-    { "src": "/audio/(.*)", "dest": "/public/audio/$1" },
-    { "src": "/(.*)", "dest": "/api/index.js" }
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/api/index" }
   ],
   "crons": [
     { "path": "/api/cron/morning", "schedule": "0 3 * * *" }
