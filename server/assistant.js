@@ -235,7 +235,7 @@ async function offlineEngine(msg, context, engineStatus) {
   let hits = brain.search(msg, 3);
 
   // 2. If nothing found in local brain, search live internet
-  if (!hits.length && !/^(hi|hello|hey|schedule|calendar|day look|priorit|inbox|email|slack|whatsapp|business|help)/i.test(m)) {
+  if (!hits.length && !/(hi|hello|hey|schedule|calendar|day look|priorit|inbox|email|emails|slack|whatsapp|business|help)/i.test(m)) {
     try {
       const newNotes = await websearch.searchAndIngest(msg, 2);
       if (newNotes && newNotes.length) hits = brain.search(msg, 3);

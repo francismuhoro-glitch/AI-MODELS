@@ -971,12 +971,12 @@ async function viewAssistant(main) {
     scroll.scrollTop = scroll.scrollHeight;
     try {
       const r = await POST('/api/assistant', { message: text });
-      $('#aria-typing').outerHTML = `<div class="msg aria"><div class="md">${md(r.reply)}</div><div class="engine-tag">${esc(r.engine)}</div></div>`;
+      const _typ = $('#aria-typing'); if (_typ) _typ.outerHTML = `<div class="msg aria"><div class="md">${md(r.reply)}</div><div class="engine-tag">${esc(r.engine)}</div></div>`;
       // Speak the reply aloud (respects the Sound mute + voice preference); conversation
       // mode resumes listening once ARIA is done talking (or right away if replies are silent).
       Speech.speak(r.reply).then((spoken) => { if (Speech.convo && !spoken) Speech.afterSpeak(); });
     } catch (e) {
-      $('#aria-typing').outerHTML = `<div class="msg aria"><div class="md"><p>⚠️ ${esc(e.message)}</p></div></div>`;
+      const _typ = $('#aria-typing'); if (_typ) _typ.outerHTML = `<div class="msg aria"><div class="md"><p>⚠️ ${esc(e.message)}</p></div></div>`;
       if (Speech.convo) Speech.afterSpeak();
     }
     scroll.scrollTop = scroll.scrollHeight;
