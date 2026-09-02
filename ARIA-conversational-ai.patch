@@ -1,0 +1,1441 @@
+diff --git a/README.md b/README.md
+index d75affc..848dfd3 100644
+--- a/README.md
++++ b/README.md
+@@ -38,7 +38,8 @@ Install the app, then **Settings → Enable morning notifications**. At wake tim
+ | **💬 Messages** | Slack + WhatsApp in one feed. |
+ | **🧠 Second Brain** | An ever-evolving library. It **automatically captures** priority emails, important messages, every brief and a rolling day-log — then indexes everything (BM25) so you can ask *"what do I know about ___?"*. Capture anything manually too. |
+ | **🎯 Action items** | Asks inside emails/messages ("by Friday", "please send", invoices…) become trackable tasks automatically. |
+-| **🤖 Executive Assistant** | Chat that reasons over your **real** schedule, inbox, messages and brain. Ask for your day, priorities, business snapshot, or to draft email replies. |
++| **🤖 Executive Assistant** | Chat that reasons over your **real** schedule, inbox, messages and brain — and **remembers the conversation**: follow-ups like *"what about tomorrow?"* and *"add another one for Friday"* just work, with people and topics carried across turns. |
++| **🗓️ Autonomous Scheduler** | Say *"plan my day tomorrow"*, *"build a weekly plan"* or *"organize this week"* and ARIA drafts a full calendar around your rhythm — wake-up brief, 2-hour deep-work blocks for high-priority tasks, a meeting window that never double-books, morning & end-of-day inbox triage, business vs day-job blocks, 15-minute buffers — then refines on command (*"move the standup to 10am"*, *"remove the inbox triage"*, *"confirm the plan"*). |
+ | **🤖 Agency Swarm** | ARIA becomes your **Executive Chief of Staff**: hand her a complex, multi-step mission and she decomposes it and delegates to background specialists — **ResearcherAgent** (second brain + web), **AnalystAgent** (priorities, inbox, financial records), **CopywriterAgent** (emails, proposals, daily summaries) — then signs off one executive report. Every step is replayed live in the UI. |
+ | **🔌 Connectors** | Opt-in **demo mode** + real adapters: **Gmail/Google Calendar**, **Outlook**, **Slack** (works with a token today), **WhatsApp Business Cloud API** + a universal `/api/ingest` endpoint (iOS Shortcuts, Zapier, n8n…). |
+ 
+@@ -58,6 +59,10 @@ ARIA_DEMO=1 npm start
+ 
+ You can also talk to ARIA by voice (Assistant → 🎤, or Agency Swarm → 🎤) in browsers with Web Speech API support (Chrome/Edge/Safari; needs HTTPS or localhost), and she reads her replies aloud. The loop is fully two-way and synchronized: what you say lands in the input, is posted to `/api/assistant` (or `/api/agency/run` in the swarm), appended to the transcript, and read back with `speechSynthesis` — the mic is always released while ARIA talks, and the optional wake-word listener (`localStorage.aria.wake = '1'`) re-arms only once she is idle.
+ 
++**She speaks like a person, not a screen.** Every reply is cleaned before `speechSynthesis`: markdown, code blocks and raw JSON are stripped, raw URLs become *"link"*, emojis become words (📅 → *"calendar"*, ✅ → *"completed"*, 🌐 → *"web result"*), dashes and symbol runs become natural pauses at rate 1.0, offline answers get a conversational lead-in (*"Here's what I found on your calendar…"*), and replies longer than 400 characters are summarised aloud with *"I've shown the full details on your screen."*
++
++**Discretion mode** (Settings, on by default) keeps secrets off the air: passwords, API keys, tokens, M-Pesa PINs, card & account numbers, email addresses and phone numbers are redacted from speech (they stay readable on screen), full inboxes are summarised (*"you have 3 unread — check the app"*), long lists are capped (*"you have 15 open tasks — the top 3 are…"*), and profanity is filtered out of web results and swarm reports.
++
+ ### 🤖 Agency Swarm — delegate a whole mission
+ 
+ Open **🤖 Agency Swarm** in the sidebar (or the card on the Hub) and hand over something big:
+diff --git a/public/js/app.js b/public/js/app.js
+index e2a1ff9..71420c2 100644
+--- a/public/js/app.js
++++ b/public/js/app.js
+@@ -181,25 +181,126 @@ const Sound = {
+   }
+ };
+ 
+-/* strip markdown so speech synthesis reads replies as plain sentences
+-   (no asterisks, hashes, backticks or link URLs read out loud) */
++/* ---------------- natural speech pipeline ----------------
++   Replies are written for the screen (markdown, emojis, links, code). Before
++   speechSynthesis reads one aloud it goes through cleanForSpeech(): markdown and
++   code/JSON are stripped, raw URLs become "link", emojis become natural words
++   (calendar emoji -> "calendar"), dashes and symbol runs become spoken pauses,
++   offline data dumps get a conversational lead-in ("Here's what I found on your
++   calendar..."), long replies are capped at 400 characters with a pointer to the
++   screen, and sensitive strings (PINs, tokens, card numbers, emails, phone numbers)
++   never reach the voice. */
+ function stripMd(s) {
+   return String(s || '')
+-    .replace(/```[\s\S]*?```/g, (m) => m.replace(/```/g, ''))   // code blocks → speak the code
+-    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')                        // images → nothing
+-    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')                     // links → label
+-    .replace(/^#{1,6}\s+/gm, '')                                 // headers
+-    .replace(/(\*\*|__)([\s\S]*?)\1/g, '$2')                     // bold
+-    .replace(/(\*|_)([^*_\n]+)\1/g, '$2')                        // italics
+-    .replace(/`([^`]*)`/g, '$1')                                 // inline code
+-    .replace(/^\s*(?:[-*+•]|\d+[.)])\s+/gm, '')                  // list markers
+-    .replace(/^\s*>\s?/gm, '')                                   // blockquotes
+-    .replace(/^\s*[-–—]{2,}\s*$/gm, '')                          // horizontal rules
+-    .replace(/[~^]/g, '')
++    .replace(/```[\s\S]*?```/g, ' ')                            // code blocks -> removed here
++    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')                       // images -> nothing
++    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')                   // links -> label
++    .replace(/^#{1,6}\s+/gm, '')                                // headers
++    .replace(/(\*\*|__)([\s\S]*?)\1/g, '$2')                    // bold
++    .replace(/(\*|_)([^*_\n]+)\1/g, '$2')                       // italics
++    .replace(/~~([^~]+)~~/g, '$1')                              // strikethrough
++    .replace(/`([^`]*)`/g, '$1')                                // inline code
++    .replace(/^\s*(?:[-*+\u2022]|\d+[.)])\s+/gm, '')             // list markers
++    .replace(/^\s*>\s?/gm, '')                                  // blockquotes
++    .replace(/^\s*[-\u2013\u2014]{2,}\s*$/gm, '')               // horizontal rules
++    .replace(/\[|\]|\(|\)/g, ' ')                               // leftover brackets
++    .replace(/[~^]+/g, ' ')
+     .replace(/\s+/g, ' ')
+     .trim();
+ }
+ 
++/* Emojis that carry meaning are translated into words; the rest are dropped. */
++const EMOJI_SPEECH = {
++  '\u{1F4C5}': 'calendar', '\u{1F5D3}\uFE0F': 'calendar', '\u{1F4C6}': 'calendar', '\u2705': 'completed', '\u2714\uFE0F': 'completed',
++  '\u{1F310}': 'web result', '\u{1F517}': 'link', '\u{1F525}': 'high priority', '\u26A1': 'quick', '\u{1F389}': 'done',
++  '\u{1F9E0}': 'memory', '\u{1F4DA}': 'learning', '\u26A0\uFE0F': 'warning', '\u274C': 'removed', '\u23F0': 'alarm',
++  '\u{1F4E9}': 'email', '\u2709\uFE0F': 'email', '\u{1F4E5}': 'inbox', '\u{1F4AC}': 'message', '\u{1F3EA}': 'business',
++  '\u2600\uFE0F': 'morning', '\u{1F916}': 'agent', '\u{1F3AF}': 'priorities', '\u{1F4CC}': 'pinned', '\u{1F514}': 'notification',
++  '\u{1F4C4}': 'document', '\u{1F4B0}': 'money', '\u{1F4C8}': 'growth', '\u{1F5D1}\uFE0F': 'deleted', '\u{1F50D}': 'search',
++  '\u{1F7E2}': 'on', '\u{1F7E1}': 'pending', '\u{1F534}': 'off', '\u{1F7E3}': 'agent', '\u{1F44B}': 'hello'
++};
++
++/* Client-side backstop of the server's discretion filter - secrets never reach TTS even
++   when the spoken text comes from a swarm report or an older cached payload. */
++function redactSpeechSecrets(t) {
++  return String(t || '')
++    .replace(/\b(?:sk|pk|rk|gh|gl|npm)[-_](?:live|test|pub)?[-_]?[A-Za-z0-9_-]{8,}\b/gi, 'a secret key')
++    .replace(/\b(api key|apikey|api-key|access token|auth token|token|secret|password|passwd|pwd)\b(?:\s+is|:|=)?\s*[\w.+-]{4,}/gi, '$1 redacted')
++    .replace(/\bmpesa\s+pin\b(?:\s+is|:|=)?\s*\d{4,5}/gi, 'your M-Pesa PIN, redacted')
++    .replace(/\bpin\b(?:\s+is|:|=)?\s*\d{4,5}\b/gi, 'a PIN, redacted')
++    .replace(/\b(?:\d[ -]?){13,16}\b/g, 'a card number')
++    .replace(/\b(?:\+?254|0)(?:[ -]?\d){8,9}\b/g, 'a phone number')
++    .replace(/\b[\w.+-]+@(?:[\w-]+\.)+[a-z]{2,}\b/gi, 'an email address');
++}
++
++/* Offline-engine answers are data dumps; wrap them in an executive spoken lead-in. */
++function conversationalLeadIn(t) {
++  if (/^(hi|hello|hey|here|based|looking|you have|i've|i |your|sure|got it|sorry|unfortunately|done|no |yes |good )/i.test(t)) return t;
++  const lead =
++    /schedule|calendar|agenda|today|tomorrow|events?|meeting/i.test(t) ? "Here's what I found on your calendar." :
++    /inbox|unread|email/i.test(t) ? 'Looking at your inbox now.' :
++    /priorit|urgent|task|focus/i.test(t) ? "Here's what needs your attention." :
++    /business|revenue|order|supplier|sales|invoice/i.test(t) ? "Here's your business snapshot." :
++    /found in your brain|brain|remember/i.test(t) ? 'Based on our earlier conversation,' :
++    /web result|live web|search/i.test(t) ? "Here's what I found on the web." :
++    "Here's what I found.";
++  return lead + ' ' + t;
++}
++
++const SPEECH_CAP = 400;
++
++function cleanForSpeech(text, opts = {}) {
++  let t = String(text == null ? '' : text);
++  if (!t.trim()) return '';
++
++  // 1. Fenced code blocks and raw JSON are never read aloud
++  let hadCode = false;
++  t = t.replace(/```[a-zA-Z0-9_-]*\n?[\s\S]*?```/g, () => { hadCode = true; return ' '; });
++  const trimmed = t.trim();
++  if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
++    try { JSON.parse(trimmed); hadCode = true; t = ' '; } catch (_) { /* not JSON - keep */ }
++  }
++
++  // 2. Markdown -> plain words
++  t = stripMd(t);
++
++  // 3. Raw URLs -> "link"; never spelled out letter by letter
++  t = t.replace(/\b(?:https?|ftp):\/\/\S+/gi, 'link').replace(/\bwww\.\S+/gi, 'link');
++
++  // 4. Secrets (PINs, tokens, cards, emails, phone numbers) never reach the voice
++  t = redactSpeechSecrets(t);
++
++  // 5. Emojis -> natural words; any pictographic leftover is dropped
++  t = Array.from(t).map(ch => (Object.prototype.hasOwnProperty.call(EMOJI_SPEECH, ch) ? (EMOJI_SPEECH[ch] ? ' ' + EMOJI_SPEECH[ch] + ' ' : ' ') : ch)).join('');
++  t = t.replace(/\p{Extended_Pictographic}/gu, '').replace(/[\uFE0F\u200D\u20E3]/gu, '');
++
++  // 6. Repetitive symbols & long dashes -> spoken pauses (commas); tidy punctuation
++  t = t.replace(/#/g, ' ')
++    .replace(/([*_~`>|=+])\1+/g, ' ')
++    .replace(/\s*(?:\u2014+|\u2013+|-{2,})\s*/g, ', ')
++    .replace(/\s*[\u2022\u00B7\u25AA]+\s*/g, ', ')
++    .replace(/([!,.?;:]){2,}/g, '$1')
++    .replace(/\s{2,}/g, ' ')
++    .trim();
++
++  if (!t) return hadCode ? 'I sent the code to your screen instead of reading it.' : '';
++
++  // 7. Conversational tone for offline fallback replies
++  if (opts.offline) t = conversationalLeadIn(t);
++
++  if (hadCode) t += " There's code on your screen I won't read aloud.";
++
++  // 8. Length cap: speak the summary, point at the screen for the rest
++  if (t.length > SPEECH_CAP) {
++    let cut = t.lastIndexOf('. ', SPEECH_CAP);
++    if (cut < SPEECH_CAP * 0.5) cut = t.lastIndexOf(', ', SPEECH_CAP);
++    if (cut < SPEECH_CAP * 0.5) cut = t.lastIndexOf(' ', SPEECH_CAP);
++    if (cut < 0) cut = SPEECH_CAP;
++    t = t.slice(0, cut + 1).trim().replace(/,\s*$/, '. ') + " I've shown the full details on your screen.";
++  }
++  return t;
++}
++
+ /* ---------------- voice: speech recognition in + speech synthesis out ----------------
+    Browser-native Web Speech API only — no new dependencies, no paid services.
+    Recognition (the mic) needs HTTPS or localhost and works in Chrome/Edge/Safari, not Firefox.
+@@ -375,10 +476,11 @@ const Speech = {
+     if (was) this.emit('asst-speak-done', { cancelled: true });
+   },
+ 
+-  /* Speak ARIA's reply aloud. Respects the Sound.on mute toggle + the voice preference;
+-     strips markdown first so it does not read asterisks and hashes out loud. */
+-  speak(text) {
+-    const body = stripMd(text);
++  /* Speak ARIA's reply aloud. Respects the Sound.on mute toggle + the voice preference.
++     The reply goes through cleanForSpeech() first so markdown, URLs, code/JSON and emojis
++     are never read aloud; long replies are summarised with a pointer to the screen. */
++  speak(text, opts = {}) {
++    const body = cleanForSpeech(text, opts);
+     if (!Sound.on || !this.on || !this.tts() || !body) {
+       /* Silent path still closes the loop so hands-free conversation never stalls. */
+       this.emit('asst-speak-done', { spoken: false });
+@@ -403,7 +505,9 @@ const Speech = {
+         synth.cancel();
+         const u = new SpeechSynthesisUtterance(body);
+         if (this._voice) { u.voice = this._voice; u.lang = this._voice.lang; }
+-        u.rate = 1; u.pitch = 1; u.volume = 1;
++        /* Natural cadence: rate 1.0 and the cleaned text keeps its commas & periods,
++           which speechSynthesis turns into pauses. */
++        u.rate = 1.0; u.pitch = 1; u.volume = 1;
+         u.onend = () => done(true);
+         u.onerror = () => done(false);
+         this._utterance = u;
+@@ -583,6 +687,7 @@ function normalizeSettings(raw) {
+     llm: { provider: 'auto', ollamaUrl: '', model: '', ...(s.llm || {}) },
+     smtp: { host: '', port: 587, user: '', pass: '', to: '', ...(s.smtp || {}) },
+     brief: { email: false, ...(s.brief || {}) },
++    discretion: s.discretion !== false,
+     connectors: s.connectors || {}
+   };
+ }
+@@ -974,7 +1079,10 @@ async function viewAssistant(main) {
+       const _typ = $('#aria-typing'); if (_typ) _typ.outerHTML = `<div class="msg aria"><div class="md">${md(r.reply)}</div><div class="engine-tag">${esc(r.engine)}</div></div>`;
+       // Speak the reply aloud (respects the Sound mute + voice preference); conversation
+       // mode resumes listening once ARIA is done talking (or right away if replies are silent).
+-      Speech.speak(r.reply).then((spoken) => { if (Speech.convo && !spoken) Speech.afterSpeak(); });
++      /* Speak the discretion-filtered twin (secrets redacted server-side); the client
++         pipeline still strips markdown/URLs/emojis and caps the length. */
++      Speech.speak(r.speech || r.reply, { engine: r.engine, offline: /offline/.test(r.engine || '') })
++        .then((spoken) => { if (Speech.convo && !spoken) Speech.afterSpeak(); });
+     } catch (e) {
+       const _typ = $('#aria-typing'); if (_typ) _typ.outerHTML = `<div class="msg aria"><div class="md"><p>⚠️ ${esc(e.message)}</p></div></div>`;
+       if (Speech.convo) Speech.afterSpeak();
+@@ -1043,11 +1151,13 @@ function agencyStepRow(step, state) {
+   </div>`;
+ }
+ 
+-/* Pull the executive paragraph out of the report — that is what ARIA reads aloud. */
++/* Pull the executive paragraph out of the report — that is what ARIA reads aloud,
++   run through the natural-speech pipeline (no markdown/URLs/emojis, length-capped). */
+ function agencySpokenSummary(markdown) {
+   const m = String(markdown || '').match(/###\s*Executive summary\s*\n([\s\S]*?)(?:\n###|$)/i);
+   const body = (m ? m[1] : String(markdown || '')).trim();
+-  return stripMd(body).split('\n').filter(Boolean).slice(0, 3).join(' ').slice(0, 700);
++  const lines = stripMd(body).split('\n').filter(Boolean).slice(0, 3).join(' ');
++  return cleanForSpeech(lines) || cleanForSpeech(body);
+ }
+ 
+ async function viewAgency(main) {
+@@ -1294,6 +1404,10 @@ async function viewSettings(main) {
+           <button class="btn" id="btn-push">🔔 Enable morning notifications</button>
+           <button class="btn ghost" id="btn-push-test">Send test notification</button>
+         </div>
++        <label class="switch" style="display:flex;gap:9px;align-items:center;margin-top:12px" title="When on, ARIA never speaks passwords, PINs, tokens, card numbers, addresses or full email contents aloud — you read those on screen.">
++          <input type="checkbox" id="s-discretion" ${s.discretion !== false ? 'checked' : ''}>
++          <span>🤫 Discretion mode — keep secrets & long lists off the air</span>
++        </label>
+         <p style="color:var(--faint);font-size:12px;margin-top:12px">Install puts ARIA on your home screen / desktop like a native app — full screen, offline access to your latest brief, and her voice every morning. Notifications deliver the brief to your lock screen at ${esc(s.wakeTime)} even before you open the app.</p>
+       </div>
+ 
+@@ -1318,7 +1432,8 @@ async function viewSettings(main) {
+       owner: { name: $('#s-name').value, timezone: $('#s-tz').value, location: { lat: +$('#s-lat').value, lon: +$('#s-lon').value, label: $('#s-loc-label').value } },
+       wakeTime: $('#s-wake').value,
+       llm: { provider: $('#s-provider').value, ollamaUrl: $('#s-ourl').value, model: $('#s-model').value },
+-      smtp: { host: $('#s-smtphost').value, port: +$('#s-smtpport').value || 587, user: $('#s-smtpuser').value, pass: $('#s-smtppass').value, to: $('#s-smtpto').value }
++      smtp: { host: $('#s-smtphost').value, port: +$('#s-smtpport').value || 587, user: $('#s-smtpuser').value, pass: $('#s-smtppass').value, to: $('#s-smtpto').value },
++      discretion: $('#s-discretion').checked
+     });
+     for (const c of conns) {
+       const enabled = $(`input[data-conn="${c.id}"]`).checked;
+@@ -1522,6 +1637,7 @@ window.addEventListener('asst-mic-done', () => WakeWord.rearm());
+ window.addEventListener('asst-speak-start', () => WakeWord.release());
+ window.addEventListener('asst-speak-done', () => WakeWord.rearm());
+ window.AriaWakeWord = WakeWord;
++Speech.cleanForSpeech = cleanForSpeech;
+ window.AriaSpeech = Speech;
+ 
+ /* Opt-in only (localStorage aria.wake = '1'). Enabling it unprompted would hold the
+diff --git a/scripts/test-app.js b/scripts/test-app.js
+index 4b2894d..0616379 100644
+--- a/scripts/test-app.js
++++ b/scripts/test-app.js
+@@ -205,6 +205,109 @@ function check(name, cond, detail) {
+     check('researcher meta contains web info (may be 0 in restricted env)', true);
+   }
+ 
++  console.log('\n[3c] Conversational memory (multi-turn follow-ups)');
++  /* Turn 1 asks about today; turn 2 ("what about tomorrow?") must be resolved as a
++     follow-up and answer for TOMORROW — using the seeded tomorrow event as proof. */
++  const tomorrowTs = Date.now() + 864e5;
++  const evTom = await post('/api/events', { title: 'Tomorrow Memory Check', start: tomorrowTs });
++  check('seed: tomorrow event created', evTom.status === 200 && !!(evTom.json || {}).id);
++  const t1 = await post('/api/assistant', { message: 'what is my schedule today?' });
++  check('turn 1: schedule query answered', t1.status === 200 && typeof (t1.json || {}).reply === 'string' && /schedule/i.test(t1.json.reply));
++  const t2 = await post('/api/assistant', { message: 'what about tomorrow?' });
++  const t2j = t2.json || {};
++  check('turn 2: recognized as a follow-up', t2j.followUp === true, JSON.stringify({ followUp: t2j.followUp, to: t2j.resolvedTo }));
++  check('turn 2: resolved against the earlier question', /what is my schedule tomorrow/i.test(t2j.resolvedTo || ''), t2j.resolvedTo);
++  check('turn 2: answers for TOMORROW with tomorrow\u2019s events', /tomorrow/i.test(t2j.reply || '') && /Tomorrow Memory Check/i.test(t2j.reply || ''), (t2j.reply || '').slice(0, 140));
++  check('every assistant reply ships a TTS-safe speech twin', typeof t2j.speech === 'string' && t2j.speech.length > 0);
++
++  console.log('\n[3d] Entity carry-over (people persist across turns)');
++  const meet1 = await post('/api/assistant', { message: 'schedule a meeting with Kamau tomorrow at 2pm' });
++  check('first meeting with Kamau scheduled', meet1.status === 200 && /Scheduled/i.test((meet1.json || {}).reply || ''), (meet1.json || {}).reply);
++  const meet2 = await post('/api/assistant', { message: 'add another one for Friday' });
++  check('follow-up scheduling is recognized', meet2.status === 200 && /Scheduled/i.test((meet2.json || {}).reply || ''), (meet2.json || {}).reply);
++  check('follow-up carried over "Kamau" without asking again', /with Kamau/i.test((meet2.json || {}).resolvedTo || ''), (meet2.json || {}).resolvedTo);
++  const evNow = (await get('/api/events')).json || [];
++  const kamau = evNow.filter(e => /kamau/i.test(e.title || ''));
++  check('two Kamau events exist', kamau.length >= 2, JSON.stringify(kamau.map(e => e.title)));
++  const { dayKey: dk } = require('../server/util');
++  const ARIA_TZ = 'Africa/Nairobi';
++  const todayKeyStr = dk(Date.now(), ARIA_TZ);
++  const [yy, mm2, dd2] = todayKeyStr.split('-').map(Number);
++  let friKey = null;
++  for (let i = 1; i <= 7 && !friKey; i++) {
++    const dt = new Date(Date.UTC(yy, mm2 - 1, dd2 + i));
++    if (dt.getUTCDay() === 5) friKey = `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`;
++  }
++  check('the carried-over meeting lands on Friday', kamau.some(e => dk(e.start, ARIA_TZ) === friKey), String(kamau.map(e => dk(e.start, ARIA_TZ))));
++
++  console.log('\n[3e] Autonomous multi-step scheduling');
++  const planResp = await post('/api/assistant', { message: 'plan my day tomorrow' });
++  const planReply = (planResp.json || {}).reply || '';
++  check('planner request returns an executive summary', planResp.status === 200 && planReply.length > 150, planReply.slice(0, 80));
++  check('summary ends with a confirmation prompt', /shall i lock this plan in|confirm the plan/i.test(planReply), planReply.slice(-120));
++  const stPlan = (await get('/api/state')).json || {};
++  const planEvents = (stPlan.allEvents || []).filter(e => e.source === 'planner' && !e.confirmed);
++  const planTomorrowKey = dk(Date.now() + 864e5, ARIA_TZ);
++  check('plan created multiple calendar blocks', planEvents.length >= 4, String(planEvents.length));
++  check('plan targets tomorrow', planEvents.every(e => dk(e.start, ARIA_TZ) === planTomorrowKey), String([...new Set(planEvents.map(e => dk(e.start, ARIA_TZ)))]));
++  const rhythm = stPlan.rhythm || { wakeHour: 6, sleepHour: 22 };
++  const wallH = (ts) => +new Intl.DateTimeFormat('en-GB', { timeZone: ARIA_TZ, hour: '2-digit', hour12: false }).format(new Date(ts));
++  check('plan respects the rhythm config (wake \u2192 sleep)', planEvents.every(e => wallH(e.start) >= rhythm.wakeHour && wallH(e.start) <= rhythm.sleepHour), JSON.stringify({ rhythm }));
++  check('plan includes a wake-up brief', planEvents.some(e => /wake-up brief/i.test(e.title)));
++  check('plan includes focus blocks for prioritised tasks', planEvents.some(e => /deep work/i.test(e.title)));
++  check('plan includes inbox triage windows', planEvents.filter(e => /triage/i.test(e.title)).length >= 1);
++  check('plan includes a meeting slot', planEvents.some(e => /meeting/i.test(e.title)));
++  const sorted = planEvents.slice().sort((a, b) => a.start - b.start);
++  const overlaps = sorted.some((e, i) => i > 0 && e.start < sorted[i - 1].end);
++  check('no double booking inside the plan', !overlaps, JSON.stringify(sorted.map(e => [e.start, e.end])));
++  const allTomorrow = (stPlan.allEvents || []).filter(e => dk(e.start, ARIA_TZ) === planTomorrowKey).sort((a, b) => a.start - b.start);
++  const allOverlaps = allTomorrow.some((e, i) => i > 0 && e.start < allTomorrow[i - 1].end);
++  check('no double booking with existing calendar entries', !allOverlaps);
++
++  /* Iterative refinement: remove a block, then move an existing meeting. */
++  const rmResp = await post('/api/assistant', { message: 'remove the inbox triage' });
++  check('refinement: "remove the inbox triage" acknowledged', rmResp.status === 200 && /Removed/i.test((rmResp.json || {}).reply || ''), (rmResp.json || {}).reply);
++  const stRm = (await get('/api/state')).json || {};
++  check('refinement: triage blocks are gone', !((stRm.allEvents || []).some(e => e.source === 'planner' && /triage/i.test(e.title))));
++  const mvResp = await post('/api/assistant', { message: 'move the standup to 10am' });
++  check('refinement: "move the standup to 10am" acknowledged', mvResp.status === 200 && /Moved/i.test((mvResp.json || {}).reply || ''), (mvResp.json || {}).reply);
++  const stMv = (await get('/api/state')).json || {};
++  const standup = (stMv.allEvents || []).find(e => /standup/i.test(e.title || ''));
++  const wallTime = (ts) => new Intl.DateTimeFormat('en-GB', { timeZone: ARIA_TZ, hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(ts));
++  check('refinement: the standup now starts at 10:00', standup && wallTime(standup.start) === '10:00', standup && wallTime(standup.start));
++
++  console.log('\n[3f] Discretion mode, sensitive-data filter & profanity');
++  const secretResp = await post('/api/assistant', { message: 'remember that my M-Pesa PIN is 4821 and my api key is sk-live-abcdef1234567890' });
++  const secretReply = (secretResp.json || {}).reply || '';
++  const secretSpeech = (secretResp.json || {}).speech || '';
++  check('sensitive details stay readable on screen (text only)', /4821/.test(secretReply) && /sk-live/i.test(secretReply), secretReply.slice(0, 100));
++  check('TTS output never contains the M-Pesa PIN', !/4821/.test(secretSpeech), secretSpeech.slice(0, 140));
++  check('TTS output never contains the API key', !/sk-live/i.test(secretSpeech) && !/abcdef1234567890/.test(secretSpeech), secretSpeech.slice(0, 140));
++  const inboxQ = await post('/api/assistant', { message: 'how is my inbox?' });
++  const inboxReply = (inboxQ.json || {}).reply || '';
++  const inboxSpeech = (inboxQ.json || {}).speech || '';
++  check('"how is my inbox?" is personal (never a web search)', inboxReply.length > 0 && !/web search results/i.test(inboxReply), inboxReply.slice(0, 80));
++  check('discretion summarizes the inbox instead of reading it', /unread/i.test(inboxSpeech) && /check the app/i.test(inboxSpeech), inboxSpeech.slice(0, 120));
++  check('discretion never speaks full email contents', !/Funds transferred via M-Pesa/i.test(inboxSpeech));
++  const assistantModule2 = require('../server/assistant');
++  check('redactSensitive masks tokens/emails/cards/phones', (() => {
++    const out = assistantModule2.redactSensitive('token is ghp_abc123def456ghi mail me at joe@doe.com pay to 0722 123 456 card 4111 1111 1111 1111');
++    return !/ghp_abc|joe@doe\.com|0722 123 456|4111 1111/.test(out);
++  })());
++  check('applyDiscretion caps long lists ("top 3 are")', /top 3 are/i.test(assistantModule2.applyDiscretion('Open tasks:\n- a\n- b\n- c\n- d\n- e\n- f\n- g\n- h')));
++  check('cleanProfanity masks profanity in outputs', (() => {
++    const out = require('../server/util').cleanProfanity('this vendor is shit and the whole thing sucks ass');
++    return !/\b(shit|ass)\b/i.test(out);
++  })());
++  const isPlanner = assistantModule2.isPlannerRequest;
++  check('planner detection: "plan my day tomorrow"', isPlanner('plan my day tomorrow') === true);
++  check('planner detection: "create my schedule for tomorrow"', isPlanner('create my schedule for tomorrow') === true);
++  check('planner detection: "build a weekly plan"', isPlanner('build a weekly plan') === true);
++  check('planner detection: "organize this week"', isPlanner('organize this week') === true);
++  check('planner detection rejects questions about plans', isPlanner('what is a weekly plan?') === false);
++  const follow = assistantModule2.resolveFollowUp('what about tomorrow?', { conv: { lastIntent: 'schedule-query', lastQuery: 'what is my schedule today', entities: {} } });
++  check('resolveFollowUp rewrites "what about tomorrow?"', follow.isFollowUp === true && /tomorrow/i.test(follow.message), follow.message);
++
+   console.log('\n[4] Frontend render (jsdom)');
+   const errors = [];
+   const vc = new VirtualConsole();
+@@ -264,6 +367,20 @@ function check(name, cond, detail) {
+   check('spoken turn gets an ARIA reply in the transcript', (chatHtml.match(/msg aria/g) || []).length >= 1);
+   check('reply is handed to speechSynthesis', typeof spoke === 'string' && spoke.length > 0, String(spoke).slice(0, 40));
+ 
++  console.log('\n[5b] Natural speech filtering (client pipeline)');
++  const cfs = (t, o) => w.AriaSpeech.cleanForSpeech(t, o || {});
++  const mixed = cfs('**Hello** boss — visit https://example.com/x for \u{1F4C5} details, `code`, ~~struck~~, # Head, [link](https://x.y) \u2705');
++  check('no markdown syntax survives into speech', !/[*_#`~]|https?:|\[|\]/.test(mixed), mixed);
++  check('raw URLs are spoken as "link"', !/https?:\/\//i.test(mixed) && /link/i.test(mixed), mixed);
++  check('emojis are translated to natural words', /calendar/i.test(mixed) && /completed/i.test(mixed), mixed);
++  check('code blocks are never read aloud', !/secret|token/.test(cfs('```js\nconst secret = "token";\n```')));
++  check('raw JSON is never read aloud', !/invoice/.test(cfs('{"invoice": 42}')));
++  const longSpeech = cfs('ARIA works through your day, one block at a time. '.repeat(30));
++  check('long replies are capped with a screen pointer', longSpeech.length < 480 && /full details on your screen/i.test(longSpeech), String(longSpeech.length));
++  check('offline replies get a conversational lead-in', /^(here's|looking|based on)/i.test(cfs('**Today Schedule**: 10:00 Team Standup', { offline: true })), cfs('**Today Schedule**: 10:00 Team Standup', { offline: true }));
++  check('secrets never reach TTS (client backstop)', !/4821|sk-live/.test(cfs('your pin is 4821 and key sk-live-abcdef123456')));
++  check('dashes & symbol runs become spoken pauses', !/\u2014|-{2,}/.test(cfs('first part — second part -- third **part**')));
++
+   /* Agency view: mission → live steps → final output → read aloud. */
+   w.location.hash = '#/agency';
+   w.dispatchEvent(new w.HashChangeEvent('hashchange'));
+diff --git a/server/agency.js b/server/agency.js
+index d280fa7..397fdeb 100644
+--- a/server/agency.js
++++ b/server/agency.js
+@@ -16,7 +16,7 @@ const dbm = require('./db');
+ const cfgm = require('./config');
+ const brain = require('./brain');
+ const registry = require('./agents');
+-const { snippet } = require('./util');
++const { snippet, cleanProfanity } = require('./util');
+ 
+ const MAX_RUNS = 40;
+ const MODES = ['sequential', 'parallel'];
+@@ -94,9 +94,9 @@ async function run(opts = {}) {
+     else for (const a of live) await runAgent(a, ctx);
+   }
+ 
+-  /* 3. ARIA signs off. */
++  /* 3. ARIA signs off. Swarm output is profanity-filtered before it reaches the user. */
+   const finalStep = await runAgent(registry.director, ctx, 'synthesize');
+-  const finalOutput = finalStep.result;
++  const finalOutput = cleanProfanity(finalStep.result);
+   const finishedAt = Date.now();
+ 
+   const record = {
+diff --git a/server/assistant.js b/server/assistant.js
+index 5f89762..227f16a 100644
+--- a/server/assistant.js
++++ b/server/assistant.js
+@@ -1,6 +1,20 @@
+ 'use strict';
+ /**
+- * ARIA Assistant — deterministic intent routing + actions + web search + LLM fallback
++ * ARIA Assistant — deterministic intent routing + actions + web search + LLM fallback.
++ *
++ * Conversation intelligence (this module):
++ *   • Multi-turn memory  — the last 10 turns from db.chats are passed into llmChat() and a
++ *     persistent conversation state (db.meta.conversation) tracks the last intent, the last
++ *     query template and key entities (people, dates, topics) across turns.
++ *   • Follow-up handling — "what is my schedule today?" → "what about tomorrow?" is rewritten
++ *     into a full question using the previous turn, and entity carry-over lets
++ *     "schedule a meeting with Kamau" → "add another one for Friday" work without a name.
++ *   • Autonomous planner — "plan my day tomorrow" / "build a weekly plan" generates a full
++ *     calendar (wake brief, focus blocks, meeting slots, triage windows, buffers) around the
++ *     user's rhythm and existing events, with iterative refinement ("move the standup to
++ *     10am", "remove the inbox triage").
++ *   • Speech discretion — every reply ships a TTS-safe `speech` field: secrets redacted
++ *     (PINs, tokens, cards, emails, phones), long lists summarised, profanity masked.
+  */
+ const dbm = require('./db');
+ const brain = require('./brain');
+@@ -8,10 +22,12 @@ const cfgm = require('./config');
+ const weblearn = require('./weblearn');
+ const websearch = require('./websearch');
+ const { llmChat, llmStatus } = require('./llm');
+-const { dayKey, timeStr, dayLabel, snippet, extractTopics } = require('./util');
++const { dayKey, timeStr, dayLabel, dayKeyAdd, dayKeyDow, zonedTime, snippet, extractTopics, cleanProfanity } = require('./util');
+ 
+ const SYSTEM_PROMPT = `You are ARIA, the user's private executive assistant inside ARIA OS.
+ You manage their day job and their business. You are concise, proactive, well-organized.
++You remember the earlier turns of this conversation (provided as history) — resolve follow-up
++questions like "what about tomorrow?" or "add another one" using that context instead of asking again.
+ Use the provided CONTEXT (calendar, emails, chats, second-brain notes) to answer the user's query.
+ If something is unknown, say so and suggest what to check. Never invent meetings or emails.`;
+ 
+@@ -50,11 +66,15 @@ const PERSONAL_OPERATIONAL_PATTERNS = [
+   /^(?:complete\s+task|mark\s+done|finish\s+task|done\s+with)/i,
+   /^(?:call\s+me|my\s+name\s+is)/i,
+   /^(?:what(?:'s|\s+is)\s+my\s+name)/i,
++  /* "how is my inbox?" / "how does my calendar look?" are operational, never web searches */
++  /^how\s+(?:is|are|does|do)\s+(?:my|our|the)\s+(?:inbox|calendar|schedule|day|business|email|emails)\b/i,
++  /^(?:plan|organize|organise|build|create)\b.*\b(?:day|schedule|plan|week)\b/i,
++  /^(?:move|remove|delete|drop|cancel)\s+(?:the\s+|my\s+)?\S+/i,
+ ];
+ 
+ function isWebSearchQuery(msg) {
+   const m = String(msg || '').trim();
+-  return WEB_SEARCH_PATTERNS.some(p => p.test(m));
++  return WEB_SEARCH_PATTERNS.some(p => p.test(m)) && !isPersonalQuery(m);
+ }
+ 
+ function isPersonalQuery(msg) {
+@@ -62,46 +82,199 @@ function isPersonalQuery(msg) {
+   return PERSONAL_OPERATIONAL_PATTERNS.some(p => p.test(m));
+ }
+ 
++/* ════════════════════════════════════════════════════════════════════════
++   1. CONVERSATION MEMORY — history, entity carry-over, follow-up resolution
++   ════════════════════════════════════════════════════════════════════════ */
++const MEMORY_TURNS = 10;   // window passed to the LLM (6–10 turns per spec)
++
++/* Persistent per-conversation state — survives restarts inside db.meta. */
++function convState(db) {
++  if (!db.meta || typeof db.meta !== 'object') db.meta = {};
++  if (!db.meta.conversation || typeof db.meta.conversation !== 'object') {
++    db.meta.conversation = { entities: {}, lastIntent: null, lastQuery: null, lastSubject: null, lastPerson: null, pendingPlan: null, updatedAt: 0 };
++  }
++  const c = db.meta.conversation;
++  if (!c.entities || typeof c.entities !== 'object') c.entities = {};
++  if (!Array.isArray(c.entities.people)) c.entities.people = [];
++  if (!Array.isArray(c.entities.topics)) c.entities.topics = [];
++  return c;
++}
++
++/* The last N chat turns, oldest first — fed to the LLM as message history. */
++function recentHistory(db, turns = MEMORY_TURNS) {
++  const chats = (db.chats || []).slice().sort((a, b) => (a.ts || 0) - (b.ts || 0));
++  return chats.slice(-turns).map(c => ({
++    role: c.role === 'assistant' ? 'assistant' : 'user',
++    content: String(c.content || '')
++  }));
++}
++
++function buildMemory(db) {
++  const conv = convState(db);
++  return { conv, history: recentHistory(db), entities: conv.entities };
++}
++
++const DAY_PHRASE_RE = /(today|tonight|tomorrow|yesterday|next week|this week|weekend|(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))/i;
++
++/* Which kind of operational query is this? Used to remember the "topic" of a turn. */
++function classifyQuery(msg) {
++  const m = String(msg || '').toLowerCase();
++  if (/\b(schedule|calendar|agenda|my day|meetings|what('s| is) on|day look|free|busy)\b/.test(m)) return 'schedule-query';
++  if (/\b(priorit|urgent|important|to[- ]?do|tasks|focus)\b/.test(m)) return 'priorities-query';
++  if (/\b(inbox|email|unread|messages)\b/.test(m)) return 'inbox-query';
++  if (/\b(business|revenue|orders|suppliers|sales)\b/.test(m)) return 'business-query';
++  return null;
++}
++
++/* Rewrite a remembered query so it points at a new day: "…today" → "…tomorrow". */
++function swapDayInQuery(query, target) {
++  const q = String(query || '');
++  if (/\b(today|tonight)\b/i.test(q)) return q.replace(/\b(today|tonight)\b/i, target);
++  if (/\btomorrow\b/i.test(q)) return q.replace(/\btomorrow\b/i, target);
++  if (/\byesterday\b/i.test(q)) return q.replace(/\byesterday\b/i, target);
++  if (/\b(?:mon|tues|wednes|thurs|fri|satur|sun)day\b/i.test(q)) return q.replace(/\b(?:mon|tues|wednes|thurs|fri|satur|sun)day\b/i, target);
++  if (/\b(?:next|this)\s+week\b/i.test(q)) return q.replace(/\b(?:next|this)\s+week\b/i, target);
++  return `${q} ${target}`;
++}
++
++/**
++ * Detect a follow-up and rewrite it into a self-contained question using the
++ * previous turn. Returns { isFollowUp, message, note }.
++ */
++function resolveFollowUp(message, memory) {
++  const raw = String(message || '').trim();
++  const conv = (memory && memory.conv) || {};
++  const out = { isFollowUp: false, message: raw, note: null };
++  if (!raw) return out;
++
++  let target = null;
++
++  /* "what about tomorrow?" / "how about friday?" / "and next week?" / bare "tomorrow?" */
++  let mm = raw.match(/^(?:what|how)\s+about\s+(.+?)\s*[?.!]*$/i) || raw.match(/^and\s+(?:what\s+about\s+|for\s+|on\s+)?(.+?)\s*[?.!]*$/i) || raw.match(/^(?:what\s+)?(today|tonight|tomorrow|yesterday|next week|this week|weekend|(?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\s*[?.!]*$/i);
++  if (mm) target = (mm[1] || '').trim();
++
++  if (target && DAY_PHRASE_RE.test(target) && conv.lastIntent === 'schedule-query' && conv.lastQuery) {
++    const rewritten = swapDayInQuery(conv.lastQuery, target);
++    out.isFollowUp = true;
++    out.message = rewritten;
++    out.note = `Follow-up to "${conv.lastQuery}" — resolved to "${rewritten}"`;
++    return out;
++  }
++
++  /* "add another one for Friday" — entity carry-over from the last scheduled item. */
++  mm = raw.match(/^(?:add|schedule|create|book)\s+another\s+(?:one|meeting|event|appointment|session)(?:\s+(?:for|on|at)\s+(.+?))?\s*[?.!]*$/i);
++  if (mm && (conv.lastIntent === 'schedule-create' || conv.lastSubject || conv.lastPerson)) {
++    const when = (mm[1] || '').trim();
++    const person = conv.lastPerson ? ` with ${conv.lastPerson}` : '';
++    const rewritten = `schedule a meeting${person}${when ? ' for ' + when : ''}`;
++    out.isFollowUp = true;
++    out.message = rewritten;
++    out.note = `Follow-up scheduling — carried over ${person ? `"${conv.lastPerson}"` : 'the previous subject'} from the earlier request`;
++    return out;
++  }
++
++  return out;
++}
++
++/* Remember the entities + query topic of this turn for the NEXT turn's carry-over. */
++function updateMemory(db, rawMessage, effectiveMessage, intent) {
++  const conv = convState(db);
++  const m = String(rawMessage || '');
++  const topics = extractTopics(m, 3);
++  conv.entities.topics = [...new Set([...(conv.entities.topics || []), ...topics])].slice(-10);
++
++  const personMatch = m.match(/\b(?:with|for|to|call|meet\s+with)\s+([A-Za-z][a-z'’-]+(?:\s+[A-Z][a-z'’-]+)?)/);
++  if (personMatch) {
++    const candidate = personMatch[1].trim();
++    if (!/^(me|us|them|him|her|you|the|a|an|my|our|your)$/i.test(candidate) && !DAY_PHRASE_RE.test(candidate)) {
++      conv.entities.people = [...new Set([...(conv.entities.people || []), candidate.toLowerCase()])].slice(-10);
++      conv.lastPerson = candidate.charAt(0).toUpperCase() + candidate.slice(1);
++    }
++  }
++
++  const cls = classifyQuery(effectiveMessage);
++  if (intent) {
++    /* An explicit intent (schedule-create, plan, …) is authoritative — never let the
++       generic query classifier mistake "schedule a meeting…" for a schedule question. */
++    conv.lastIntent = intent;
++    if (intent === 'schedule-create') conv.lastSubject = conv.lastSubject || null;
++  } else if (cls) {
++    conv.lastIntent = cls;
++    conv.lastQuery = String(effectiveMessage || '').trim();
++  }
++  conv.updatedAt = Date.now();
++  return conv;
++}
++
++/* ════════════════════════════════════════════════════════════════════════
++   2. MAIN ENTRY — respond()
++   ════════════════════════════════════════════════════════════════════════ */
+ async function respond(message) {
+   const cfg = cfgm.load();
+   const db = dbm.load();
+   const engine = llmStatus();
++  const raw = String(message || '').trim();
++
++  db.upsert('chats', { id: `chat-${Date.now()}-u`, role: 'user', content: raw, ts: Date.now() });
+ 
+-  db.upsert('chats', { id: `chat-${Date.now()}-u`, role: 'user', content: message, ts: Date.now() });
++  /* Conversation memory: recent turns + persistent entity/topic state. */
++  const memory = buildMemory(db);
+ 
+-  const pre = await routeIntent(String(message || ''));
+-  let reply, source;
++  /* Follow-up resolution — "what about tomorrow?" becomes a full question. */
++  const resolved = resolveFollowUp(raw, memory);
++  const effective = resolved.message || raw;
++
++  let reply, source, intent = null;
++  const pre = await routeIntent(effective, memory);
+   if (pre) {
+-    reply = pre;
++    reply = pre.reply;
++    intent = pre.intent || null;
+     source = 'intent';
+-  } else if (isWebSearchQuery(message)) {
++  } else if (isWebSearchQuery(effective)) {
+     // Explicit web search query -> directly trigger live web search
+-    reply = await handleWebSearch(message);
++    reply = await handleWebSearch(effective);
+     source = 'web-search';
+   } else {
+-    const context = brain.contextPack(message);
++    const context = brain.contextPack(effective);
++    /* Multi-turn memory: pass everything except the current turn (it is the user turn below). */
++    const history = memory.history.filter((h, i) => !(i === memory.history.length - 1 && h.role === 'user'));
++    const followUpNote = resolved.isFollowUp ? `\n\n(This message is a FOLLOW-UP. ${resolved.note || ''})` : '';
+     const { text, engine: usedEngine } = await llmChat(
+       SYSTEM_PROMPT,
+-      `CONTEXT:\n${context}\n\nCURRENT TIME: ${dayLabel(Date.now(), cfg.owner.timezone)} ${timeStr(Date.now(), cfg.owner.timezone)} (${cfg.owner.timezone})\n\nUSER: ${message}`
++      `CONTEXT:\n${context}\n\nCURRENT TIME: ${dayLabel(Date.now(), cfg.owner.timezone)} ${timeStr(Date.now(), cfg.owner.timezone)} (${cfg.owner.timezone})\n\nUSER: ${effective}${followUpNote}`,
++      history
+     );
+     if (text) {
+       reply = text;
+       source = usedEngine;
+     } else {
+-      reply = await offlineEngine(message, context, engine);
++      reply = await offlineEngine(effective, context, engine);
+       source = 'offline-engine';
+     }
+   }
+ 
++  updateMemory(db, raw, effective, intent);
++
+   db.upsert('chats', { id: `chat-${Date.now()}-a`, role: 'assistant', content: reply, ts: Date.now(), engine: source });
+   await dbm.saveNow();
+-  return { reply, engine: source, llm: engine };
++
++  /* TTS-safe twin of the reply: secrets redacted, lists summarised, profanity masked.
++     The full detail stays in `reply` for the screen. */
++  const speech = toSpeechText(reply, { discretion: cfg.discretion !== false });
++
++  return {
++    reply,
++    speech,
++    engine: source,
++    llm: engine,
++    ...(resolved.isFollowUp ? { followUp: true, resolvedFrom: raw, resolvedTo: effective } : {})
++  };
+ }
+ 
+ /* ─── Web search handler ──────────────────────────────────────────────── */
+ async function handleWebSearch(message) {
+   try {
+-    const webHits = await websearch.searchWeb(message, 3);
++    const webHits = (await websearch.searchWeb(message, 3)).map(h => ({ ...h, title: cleanProfanity(h.title), snippet: cleanProfanity(h.snippet) }));
+     if (webHits && webHits.length > 0) {
+       // Ingest top result into Supabase in background
+       if (webHits[0].url && webHits[0].url.startsWith('http')) {
+@@ -122,8 +295,19 @@ function parseRelativeDateTime(text) {
+   const clean = String(text).toLowerCase();
+ 
+   if (clean.includes('tomorrow')) targetDate.setDate(now.getDate() + 1);
+-  else if (clean.includes('next monday')) targetDate.setDate(now.getDate() + ((1 + 7 - now.getDay()) % 7 || 7));
+-  else if (clean.includes('next friday')) targetDate.setDate(now.getDate() + ((5 + 7 - now.getDay()) % 7 || 7));
++  else if (clean.includes('tonight')) { /* today */ }
++  else if (/next\s+monday/.test(clean)) targetDate.setDate(now.getDate() + ((1 + 7 - now.getDay()) % 7 || 7));
++  else if (/next\s+friday/.test(clean)) targetDate.setDate(now.getDate() + ((5 + 7 - now.getDay()) % 7 || 7));
++  else {
++    /* Any named weekday: "on friday", "for tuesday" → the next occurrence (strictly future). */
++    const days = { sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6 };
++    const wd = clean.match(/\b(?:on|for|this|next\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/);
++    if (wd) {
++      const want = days[wd[1]];
++      const delta = (want - now.getDay() + 7) % 7 || 7;
++      targetDate.setDate(now.getDate() + delta);
++    }
++  }
+ 
+   let hours = 9, minutes = 0;
+   const tm = clean.match(/at\s+(\d+)(?::(\d+))?\s*(am|pm)?/);
+@@ -133,24 +317,69 @@ function parseRelativeDateTime(text) {
+     const ampm = tm[3];
+     if (ampm === 'pm' && hours < 12) hours += 12;
+     if (ampm === 'am' && hours === 12) hours = 0;
++  } else {
++    const bare = clean.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/);
++    if (bare) {
++      hours = parseInt(bare[1], 10);
++      if (bare[2]) minutes = parseInt(bare[2], 10);
++      if (bare[3] === 'pm' && hours < 12) hours += 12;
++      if (bare[3] === 'am' && hours === 12) hours = 0;
++    }
+   }
+   targetDate.setHours(hours, minutes, 0, 0);
+   return targetDate.getTime();
+ }
+ 
+-async function routeIntent(msg) {
++/* ════════════════════════════════════════════════════════════════════════
++   3. INTENT ROUTING (incl. autonomous planner + schedule refinement)
++   ════════════════════════════════════════════════════════════════════════ */
++async function routeIntent(msg, memory) {
+   const m = String(msg || '').trim();
+   if (!m) return null;
+   const db = dbm.load();
+   const cfg = cfgm.load();
+   const tz = (cfg.owner && cfg.owner.timezone) || 'Africa/Nairobi';
++  const conv = convState(db);
++
++  /* ---- Plan confirmation / cancellation (before generic event removal) ---- */
++  if (conv.pendingPlan && (/^(?:confirm|lock(?:\s+it)?(?:\s+in)?|approve|keep|sounds\s+good|yes(?:\s+please)?)\b/i.test(m) || /^(?:yes|confirm|lock it in|approve)[.!\s]*$/i.test(m))) {
++    return { reply: await confirmPlan(), intent: 'plan-confirm' };
++  }
++  if (conv.pendingPlan && /^(?:cancel|scrap|discard|delete|throw\s+away)\s+(?:the\s+|my\s+)?plan\b/i.test(m)) {
++    return { reply: await cancelPlan(), intent: 'plan-cancel' };
++  }
+ 
+-  // Schedule Event
+-  let mm = m.match(/^(?:schedule|add event|create meeting|meeting with|calendar)\s+(.+)$/i);
++  /* ---- Autonomous multi-step scheduling ---- */
++  if (isPlannerRequest(m)) {
++    return { reply: await generateSchedule(m), intent: 'plan' };
++  }
++
++  /* ---- Schedule refinement: "move the standup to 10am" ---- */
++  let mm = m.match(/^move\s+(?:the\s+|my\s+|our\s+)?(.+?)\s+to\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*[?.!]*$/i);
++  if (mm) {
++    const moved = await moveEvent(mm[1], parseInt(mm[2], 10), mm[3] ? parseInt(mm[3], 10) : 0, (mm[4] || '').toLowerCase(), tz);
++    if (moved) return { reply: moved, intent: 'schedule-refine' };
++  }
++
++  /* ---- Schedule refinement: "remove the inbox triage" / "cancel my 3pm" ---- */
++  mm = m.match(/^(?:remove|delete|drop|cancel)\s+(?:the\s+|my\s+|our\s+)?(.+?)(?:\s+(?:from|off)\s+(?:the\s+|my\s+)?(?:plan|schedule|day|calendar))?\s*[?.!]*$/i);
++  if (mm && !/^(?:task|todo|reminder)\b/i.test(mm[1])) {
++    const removed = await removeEvent(mm[1], tz);
++    if (removed) return { reply: removed, intent: 'schedule-refine' };
++  }
++
++  /* ---- Schedule Event ---- */
++  mm = m.match(/^(?:schedule|add event|create meeting|meeting with|calendar)\s+(.+)$/i);
+   if (mm) {
+     const raw = mm[1].trim();
+     const start = parseRelativeDateTime(raw);
+-    const cleanTitle = raw.replace(/(at\s+\d+(:\d+)?\s*(am|pm)|tomorrow|today|next\s+[a-z]+|on\s+[a-z]+)/gi, '').trim() || 'Appointment';
++    const cleanTitle = titleCase(
++      raw.replace(/(at\s+\d+(:\d+)?\s*(am|pm)?|\b\d{1,2}(:\d{2})?\s*(am|pm)\b|tomorrow|today|tonight|yesterday|next\s+\w+|on\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|for\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|tonight)\b|this\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|week)\b)/gi, '')
++        .replace(/^(?:a|an|the|another)\s+/i, '')
++        .replace(/\b(?:for|on|at|this|next)\s*$/i, '')
++        .replace(/\s+/g, ' ')
++        .trim()
++    ) || 'Appointment';
+     const newEvent = {
+       id: `event-${Date.now()}`,
+       title: cleanTitle,
+@@ -161,12 +390,14 @@ async function routeIntent(msg) {
+     };
+     db.events = db.events || [];
+     db.events.push(newEvent);
++    conv.lastIntent = 'schedule-create';
++    conv.lastSubject = cleanTitle;
+     await dbm.saveNow();
+     brain.buildIndex();
+-    return `📅 **Event Scheduled:** "${newEvent.title}" on ${dayLabel(newEvent.start, tz)} at ${timeStr(newEvent.start, tz)}.`;
++    return { reply: `📅 **Event Scheduled:** "${newEvent.title}" on ${dayLabel(newEvent.start, tz)} at ${timeStr(newEvent.start, tz)}.`, intent: 'schedule-create' };
+   }
+ 
+-  // Add Task
++  /* ---- Add Task ---- */
+   mm = m.match(/^(?:add task|todo|remind me to|prioritize|create task):?\s+(.+)$/i);
+   if (mm) {
+     const taskTitle = mm[1].trim();
+@@ -181,10 +412,10 @@ async function routeIntent(msg) {
+       context: /client|invoice|sale|biz/i.test(taskTitle) ? 'business' : 'day-job'
+     });
+     await dbm.saveNow();
+-    return `✅ **Task Added:** "${db.inbox[0].title}" (Priority: ${isHigh ? '🔥 High' : '⚡ Normal'})`;
++    return { reply: `✅ **Task Added:** "${db.inbox[0].title}" (Priority: ${isHigh ? '🔥 High' : '⚡ Normal'})`, intent: 'task-add' };
+   }
+ 
+-  // Complete Task
++  /* ---- Complete Task ---- */
+   mm = m.match(/^(?:complete task|mark done|finish task|done with)\s+(.+)$/i);
+   if (mm) {
+     const q = mm[1].toLowerCase().trim();
+@@ -192,68 +423,373 @@ async function routeIntent(msg) {
+     if (item) {
+       item.done = true;
+       await dbm.saveNow();
+-      return `🎉 **Completed Task:** "${item.title}"`;
++      return { reply: `🎉 **Completed Task:** "${item.title}"`, intent: 'task-complete' };
+     }
+   }
+ 
+-  // Identity Commands
++  /* ---- Identity Commands ---- */
+   mm = m.match(/^my name is\s+(.{2,60}?)\s*$/i);
+-  if (mm) return await setName(mm[1].replace(/[.!?]+$/, '').trim());
++  if (mm) return { reply: await setName(mm[1].replace(/[.!?]+$/, '').trim()), intent: 'identity' };
+   mm = m.match(/^(?:please\s+)?call me\s+([a-z]+(?:[ -][a-z]+){0,2})\s*[.!?]*$/i);
+-  if (mm && !/^(later|tomorrow|now|soon|back)$/i.test(mm[1].split(/[\s-]+/)[0].trim())) return await setName(mm[1].trim());
++  if (mm && !/^(later|tomorrow|now|soon|back)$/i.test(mm[1].split(/[\s-]+/)[0].trim())) return { reply: await setName(mm[1].trim()), intent: 'identity' };
+ 
+-  if (/^(what(?:'s| is) my name|who am i|do you know (?:my name|who i am)|what do you know about me)\??$/i.test(m)) return identityReply();
++  if (/^(what(?:'s| is) my name|who am i|do you know (?:my name|who i am)|what do you know about me)\??$/i.test(m)) return { reply: identityReply(), intent: 'identity' };
+ 
+-  // Remember Commands
++  /* ---- Remember Commands ---- */
+   mm = m.match(/^(?:remember|note)(?:\s+that|\s+this)?\s+(.{3,2000})/i);
+-  if (mm) return await rememberReply(mm[1].trim());
++  if (mm) return { reply: await rememberReply(mm[1].trim()), intent: 'remember' };
+ 
+-  // Web learning URL
++  /* ---- Web learning URL ---- */
+   const urlMatch = m.match(/https?:\/\/[^\s"'<>\]]+/i);
+   if (urlMatch && (/\b(read|learn|summaris[ez]|fetch|get|open|check|ingest)\b/i.test(m) || m === urlMatch[0])) {
+-    return await learnReply(urlMatch[0].replace(/[.,;!?]+$/, ''));
++    return { reply: await learnReply(urlMatch[0].replace(/[.,;!?]+$/, '')), intent: 'learn' };
+   }
+ 
+   return null;
+ }
+ 
+-async function setName(name) {
+-  name = String(name).trim().replace(/\s+/g, ' ').slice(0, 40);
+-  await cfgm.save({ owner: { name } });
+-  brain.ingestNote({ title: 'My name is ' + name, content: 'My name is ' + name + '. Please call me ' + name + ' from now on.', source: 'assistant', tags: ['identity'] });
++const titleCase = (s) => { const t = String(s || '').trim(); return t ? t.charAt(0).toUpperCase() + t.slice(1) : t; };
++
++/* ════════════════════════════════════════════════════════════════════════
++   4. AUTONOMOUS MULTI-STEP SCHEDULER
++   ════════════════════════════════════════════════════════════════════════ */
++const PLANNER_PATTERNS = [
++  /\bplan\s+(?:out\s+)?(?:my\s+|the\s+)?day\b/i,
++  /\bplan\s+(?:my\s+|for\s+)?tomorrow\b/i,
++  /\bcreate\s+(?:my\s+|the\s+)?schedule\b/i,
++  /\bbuild\s+(?:a|my|the)\s+(?:full\s+|weekly\s+|daily\s+)?plan\b/i,
++  /\b(?:a|my)\s+weekly\s+plan\b/i,
++  /\borganize|organise\b.*\b(?:this|my|the|next)\s+(?:week|day)\b/i,
++  /\bplan\s+(?:my|the|this|next)\s+week\b/i,
++  /\bschedule\s+(?:my|the|this)\s+(?:whole\s+)?(?:day|week)\b/i,
++];
++
++function isPlannerRequest(msg) {
++  const m = String(msg || '');
++  if (/^(?:what|who|why|define|explain|how\s+does)\b/i.test(m)) return false;   // questions about plans ≠ plan requests
++  return PLANNER_PATTERNS.some(p => p.test(m));
++}
++
++/* Which day(s) should the plan cover? "plan my day tomorrow" → 1 day; weekly → next 5 weekdays. */
++function planTargetDays(msg, tz) {
++  const m = String(msg || '').toLowerCase();
++  const todayKey = dayKey(Date.now(), tz);
++  if (/week|weekly/.test(m)) {
++    const days = [];
++    let i = 1;
++    while (days.length < 5 && i < 14) {
++      const k = dayKeyAdd(todayKey, i);
++      const dow = dayKeyDow(k);
++      if (dow !== 0 && dow !== 6) days.push(k);
++      i++;
++    }
++    return { scope: 'week', days };
++  }
++  const offset = /\btoday\b/.test(m) ? 0 : 1;   // "plan my day" defaults to tomorrow
++  return { scope: 'day', days: [dayKeyAdd(todayKey, offset)] };
++}
++
++const PRIORITY_RANK = { high: 0, medium: 1, low: 2 };
++
++/* Place sequential blocks into the work day, jumping over existing calendar entries. */
++function placeBlocks(blocks, busy, workStart, workEnd, bufferMs = 15 * 60000) {
++  const placed = [];
++  let t = workStart;
++  const conflicts = busy.slice().sort((a, b) => a.start - b.start);
++  for (const b of blocks) {
++    let start = Math.max(t, b.earliest || 0);
++    let moved = true;
++    while (moved) {
++      moved = false;
++      for (const c of conflicts) {
++        if (start < c.end && start + b.duration > c.start) { start = c.end + bufferMs; moved = true; }
++      }
++    }
++    if (start + b.duration <= workEnd + bufferMs) {
++      placed.push({ ...b, start, end: start + b.duration });
++      t = start + b.duration + bufferMs;
++    }
++  }
++  return placed;
++}
++
++/**
++ * Generate a full day (or week) plan: wake-up brief, focus blocks for prioritised tasks,
++ * a meeting window that never double-books, triage windows, business/day-job blocks and
++ * 15-minute buffers. Previous unconfirmed planner events for the same days are replaced.
++ */
++async function generateSchedule(message) {
++  const cfg = cfgm.load();
++  const db = dbm.load();
++  const tz = (cfg.owner && cfg.owner.timezone) || 'Africa/Nairobi';
++  const rhythm = cfg.rhythm || { wakeHour: 6, workStartHour: 8, workEndHour: 17, sleepHour: 22 };
++  const { scope, days } = planTargetDays(message, tz);
++  const planId = `plan-${Date.now()}`;
++
++  /* 1. Unfinished tasks, high → medium → low (stable within a priority). */
++  const tasks = (db.tasks || db.inbox || []).filter(t => !t.done)
++    .slice()
++    .sort((a, b) => ((PRIORITY_RANK[a.priority] ?? 1) - (PRIORITY_RANK[b.priority] ?? 1)) || ((a.ts || a.createdAt || 0) - (b.ts || b.createdAt || 0)));
++
++  /* 2. Unread emails + messages that need action (they feed the triage windows). */
++  const unreadEmails = (db.emails || []).filter(e => !e.read);
++  const actionMsgs = (db.messages || []).filter(x => !x.read && (x.priority === 'high' || x.priority === 'medium' || /\b(please|confirm|reply|respond|send|invoice|order|urgent)\b/i.test(x.text || '')));
++
++  /* 3. Replace any previous unconfirmed plan for these days (iterative re-planning). */
++  const daySet = new Set(days);
++  db.events = (db.events || []).filter(e => !(e.source === 'planner' && !e.confirmed && daySet.has(dayKey(e.start, tz))));
++
++  const created = [];
++  let cursor = 0;
++  for (const day of days) {
++    const isToday = day === dayKey(Date.now(), tz);
++    const workStart = zonedTime(day, rhythm.workStartHour, 0, tz);
++    const workEnd = zonedTime(day, rhythm.workEndHour, 0, tz);
++    const sleepAt = zonedTime(day, rhythm.sleepHour, 0, tz);
++
++    /* Existing calendar entries for the day (never double-booked, never moved). */
++    const busy = (db.events || [])
++      .filter(e => dayKey(e.start, tz) === day && e.source !== 'planner')
++      .map(e => ({ start: e.start, end: e.end || e.start + 36e5, title: e.title }));
++
++    /* Wake-up brief — fixed at the rhythm's wake hour. */
++    const briefAt = Math.max(zonedTime(day, rhythm.wakeHour, 0, tz), isToday ? Date.now() : 0);
++    created.push({
++      id: `${planId}-${day}-brief`, planId, planDay: day, title: 'Wake-up brief — ARIA morning summary',
++      start: briefAt, end: briefAt + 20 * 60000, context: 'day-job', source: 'planner', kind: 'brief', confirmed: false
++    });
++
++    /* Work-day blocks, in executive order. Tasks are consumed as they are scheduled so a
++       weekly plan spreads them across days instead of repeating the same list. */
++    const remaining = tasks.slice(cursor);
++    const highOfDay = remaining.filter(t => t.priority === 'high').slice(0, 2);
++    const restOfDay = remaining.filter(t => t.priority !== 'high');
++    const bizRest = restOfDay.filter(t => t.context === 'business').slice(0, 2);
++    const jobRest = restOfDay.filter(t => t.context !== 'business').slice(0, 2);
++    cursor += highOfDay.length + bizRest.length + jobRest.length;
++
++    const blocks = [];
++    if (highOfDay[0]) blocks.push({ title: `Deep work: ${snippet(highOfDay[0].title, 60)}`, duration: 2 * 3600000, context: highOfDay[0].context === 'business' ? 'business' : 'day-job', kind: 'focus' });
++    blocks.push({ title: `Inbox triage — ${unreadEmails.length} unread email${unreadEmails.length === 1 ? '' : 's'}, ${actionMsgs.length} message${actionMsgs.length === 1 ? '' : 's'}`, duration: 30 * 60000, context: 'day-job', kind: 'triage' });
++    blocks.push({ title: 'Meetings & calls window', duration: 3600000, context: 'day-job', kind: 'meetings', earliest: workStart + 3 * 3600000 });
++    if (highOfDay[1]) blocks.push({ title: `Deep work: ${snippet(highOfDay[1].title, 60)}`, duration: 2 * 3600000, context: highOfDay[1].context === 'business' ? 'business' : 'day-job', kind: 'focus' });
++    if (bizRest.length) blocks.push({ title: `Business block: ${snippet(bizRest.map(t => t.title).join(', '), 60)}`, duration: 3600000, context: 'business', kind: 'business' });
++    if (jobRest.length) blocks.push({ title: `Day-job block: ${snippet(jobRest.map(t => t.title).join(', '), 60)}`, duration: 3600000, context: 'day-job', kind: 'dayjob' });
++    blocks.push({ title: 'End-of-day triage — inbox zero', duration: 30 * 60000, context: 'day-job', kind: 'triage', earliest: workEnd - 30 * 60000 });
++
++    const placed = placeBlocks(blocks, busy, workStart, workEnd);
++    for (const b of placed) {
++      created.push({
++        id: `${planId}-${day}-${created.length}`, planId, planDay: day,
++        title: b.title, start: b.start, end: b.end, context: b.context, source: 'planner', kind: b.kind, confirmed: false
++      });
++    }
++  }
++
++  for (const ev of created) (db.events = db.events || []).push(ev);
+   brain.buildIndex();
++
++  /* 4. Park the plan as pending so "confirm the plan" / refinements can act on it. */
++  const conv = convState(db);
++  conv.pendingPlan = { planId, days, scope, ts: Date.now() };
++
++  const label = scope === 'week' ? `the week ahead (${days[0]} → ${days[days.length - 1]})` : dayLabel(zonedTime(days[0], 12, 0, tz), tz);
++  const focusCount = created.filter(e => e.kind === 'focus').length;
++  const summary = [
++    `🗓️ **Plan ready — ${label}**`,
++    '',
++    `I built your schedule around your rhythm (up at ${String(rhythm.wakeHour).padStart(2, '0')}:00, ${String(rhythm.workStartHour).padStart(2, '0')}:00–${String(rhythm.workEndHour).padStart(2, '0')}:00 focus window) and drafted **${created.length} calendar blocks**:`,
++    '',
++    ...created.filter(e => e.planDay === days[0]).map(e => `- ${timeStr(e.start, tz)}–${timeStr(e.end, tz)} — ${e.title}${e.context === 'business' ? ' _[business]_' : ''}`),
++    ...(scope === 'week' ? [`\n…and ${created.length - created.filter(e => e.planDay === days[0]).length} more blocks across the remaining ${days.length - 1} weekdays.`] : []),
++    '',
++    `${tasks.filter(t => !t.done).length} open tasks on file, ${focusCount} deep-work block${focusCount === 1 ? '' : 's'} scheduled, ${unreadEmails.length} unread email${unreadEmails.length === 1 ? '' : 's'} triaged twice daily. Existing meetings are respected — nothing is double-booked.`,
++    '',
++    `**Shall I lock this plan in?** Say "confirm the plan" — or tell me what to change, e.g. "move the standup to 10am" or "remove the inbox triage".`
++  ].join('\n');
++
+   await dbm.saveNow();
+-  return `Got it — I'll call you **${name}** from now on. I saved it in Settings and wrote it into my brain.`;
++  return summary;
+ }
+ 
+-function identityReply() {
++async function confirmPlan() {
++  const db = dbm.load();
+   const cfg = cfgm.load();
+-  const name = (cfg.owner && cfg.owner.name) || 'Boss';
+-  const where = cfg.owner && cfg.owner.location && cfg.owner.location.label ? `${cfg.owner.location.label}, ${cfg.owner.timezone}` : (cfg.owner ? cfg.owner.timezone : 'Africa/Nairobi');
+-  const hits = brain.search(name, 3).filter(h => !/^day log/i.test(h.title));
+-  let out = `Your name is **${name}** — stored in Settings → Rhythm and remembered in my brain. You're in ${where}.\n\n`;
+-  if (hits.length) out += `What I know about you so far:\n` + hits.map(h => `- **${h.title}** _[${h.kind}]_ — ${snippet(h.snippet, 140)}`).join('\n');
+-  return out;
++  const tz = (cfg.owner && cfg.owner.timezone) || 'Africa/Nairobi';
++  const conv = convState(db);
++  const planId = conv.pendingPlan && conv.pendingPlan.planId;
++  let n = 0;
++  for (const e of db.events || []) {
++    if (e.source === 'planner' && (!planId || e.planId === planId)) { e.confirmed = true; n++; }
++  }
++  conv.pendingPlan = null;
++  await dbm.saveNow();
++  return `✅ **Plan locked in** — ${n} block${n === 1 ? '' : 's'} are now on your calendar. I'll remind you as each one comes up. Want any last tweaks? Just say "move X to Y".`;
+ }
+ 
+-async function rememberReply(content) {
+-  const note = brain.ingestNote({ title: snippet(content, 80), content, source: 'assistant', tags: ['memory'] });
++async function cancelPlan() {
++  const db = dbm.load();
++  const conv = convState(db);
++  const planId = conv.pendingPlan && conv.pendingPlan.planId;
++  const before = (db.events || []).length;
++  db.events = (db.events || []).filter(e => !(e.source === 'planner' && (!planId || e.planId === planId) && !e.confirmed));
++  const removed = before - (db.events || []).length;
++  conv.pendingPlan = null;
+   brain.buildIndex();
+   await dbm.saveNow();
+-  const topic = extractTopics(content, 1)[0] || 'that';
+-  return `🧠 Remembered: "${snippet(content, 160)}" — saved to brain. Ask me "what do you know about ${topic}?" anytime.`;
++  return `🗑️ Plan cancelled — ${removed} drafted block${removed === 1 ? '' : 's'} removed. Your own calendar entries were never touched. Say "plan my day" whenever you want a fresh one.`;
+ }
+ 
+-async function learnReply(url) {
+-  try {
+-    const note = await weblearn.learnFromUrl(url);
+-    return `📚 Done — I read **${note.title}**\n\n${snippet(note.content, 280)}`;
+-  } catch (e) {
+-    return `⚠️ Could not read page: ${e.message}`;
++/* Fuzzy-find an event by the user's words ("the standup", "inbox triage", "meeting with kamau"). */
++function findEventByWords(query, tz, opts = {}) {
++  const db = dbm.load();
++  const words = String(query || '').toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length > 2 && !/^(the|and|for|with|my|our|from|meeting|event|block)$/i.test(w));
++  if (!words.length) return null;
++  const now = Date.now();
++  const candidates = (db.events || []).filter(e => {
++    if (opts.plannerOnly && e.source !== 'planner') return false;
++    const title = String(e.title || '').toLowerCase();
++    return words.every(w => title.includes(w)) || words.some(w => title.includes(w));
++  }).map(e => {
++    const title = String(e.title || '').toLowerCase();
++    const matched = words.filter(w => title.includes(w)).length;
++    /* Prefer events matching every word, then future ones, then the earliest. */
++    const future = e.start >= now - 12 * 3600000 ? 0 : 1;
++    return { e, score: matched * 10 - future * 5 - (e.source === 'planner' ? 0.5 : 0) - e.start / 1e13 };
++  }).sort((a, b) => b.score - a.score);
++  return candidates.length ? candidates[0].e : null;
++}
++
++/* "move the standup to 10am" — keep the day, change the wall-clock time. */
++async function moveEvent(what, hour, minute, ampm, tz) {
++  const ev = findEventByWords(what, tz);
++  if (!ev) return null;
++  let h = hour;
++  if (!ampm && hour <= 7) h = hour + 12;          // "move the review to 3" → 15:00
++  if (ampm === 'pm' && h < 12) h += 12;
++  if (ampm === 'am' && h === 12) h = 0;
++  const day = dayKey(ev.start, tz);
++  const newStart = zonedTime(day, h, minute || 0, tz);
++  const duration = (ev.end || ev.start + 36e5) - ev.start;
++  const clash = (dbm.load().events || []).find(e => e.id !== ev.id && e.start < newStart + duration && (e.end || e.start + 36e5) > newStart);
++  ev.start = newStart;
++  ev.end = newStart + duration;
++  if (ev.source === 'planner' && ev.kind === 'brief') ev.kind = 'moved';
++  brain.buildIndex();
++  await dbm.saveNow();
++  return `⏰ **Moved:** "${ev.title}" now starts at ${timeStr(newStart, tz)} on ${dayLabel(newStart, tz)}.${clash ? ` ⚠️ Heads up — it now overlaps "${clash.title}".` : ' No double booking.'}`;
++}
++
++/* "remove the inbox triage" — drop the matching event(s) from the plan/calendar. */
++async function removeEvent(what, tz) {
++  const db = dbm.load();
++  const words = String(what || '').toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length > 2 && !/^(the|and|for|with|my|our|from)$/i.test(w));
++  if (!words.length) return null;
++  const matches = (db.events || []).filter(e => {
++    const title = String(e.title || '').toLowerCase();
++    const hit = words.every(w => title.includes(w)) || (words.length === 1 && title.includes(words[0]));
++    return hit && e.start >= Date.now() - 24 * 3600000;
++  });
++  if (!matches.length) return null;
++  const removed = matches.slice();
++  db.events = (db.events || []).filter(e => !removed.includes(e));
++  brain.buildIndex();
++  await dbm.saveNow();
++  const names = [...new Set(removed.map(e => `"${e.title}"`))].slice(0, 3).join(', ');
++  return `🗑️ **Removed:** ${names} from your schedule. ${removed[0].source === 'planner' ? 'The rest of the plan still stands — say "confirm the plan" to lock it in.' : ''}`.trim();
++}
++
++/* ════════════════════════════════════════════════════════════════════════
++   5. SPEECH DISCRETION — TTS-safe twin of every reply
++   ════════════════════════════════════════════════════════════════════════ */
++
++/* Redact secrets, PINs, card/account numbers, emails & phone numbers.
++   Applied ONLY to the spoken twin — the on-screen reply keeps the full detail. */
++function redactSensitive(text) {
++  return String(text || '')
++    .replace(/\b(?:sk|pk|rk|gh|gl|npm)[-_](?:live|test|pub)?[-_]?[A-Za-z0-9_-]{8,}\b/gi, 'a secret key')
++    .replace(/\b(?:api[_-]?key|apikey|access[_-]?token|auth[_-]?token|token|secret|password|passwd|pwd)\b(?:\s+is|:|=)?\s*[\w.+-]{4,}/gi, (m, w) => `${w} redacted`)
++    .replace(/\bm[-\s]?pesa\s+pin\b(?:\s+is|:|=)?\s*\d{4,5}/gi, 'your M-Pesa PIN, redacted')
++    .replace(/\bpin\b(?:\s+is|:|=)?\s*(\d{4,5})\b/gi, 'a PIN, redacted')
++    .replace(/\b(?:\d[ -]?){13,16}\b/g, 'a card number')
++    .replace(/\b(?:\+?254|0)(?:[ -]?\d){8,9}\b/g, 'a phone number')
++    .replace(/\b[\w.+-]+@(?:[\w-]+\.)+[a-z]{2,}\b/gi, 'an email address')
++    .replace(/\b\d{8,14}\b/g, 'a long account number');
++}
++
++/* Discretion mode: never read full inboxes or long lists aloud — summarise instead. */
++function applyDiscretion(text) {
++  const t = String(text || '');
++  const lines = t.split('\n');
++  const items = lines.filter(l => /^\s*[-*•]\s+/.test(l));
++  const head = (lines.find(l => l.trim() && !/^\s*[-*•]\s+/.test(l)) || '').replace(/\*\*/g, '').trim();
++  const tail = lines.slice((() => { let last = -1; lines.forEach((l, i) => { if (/^\s*[-*•]\s+/.test(l)) last = i; }); return last + 1; })())
++    .filter(l => l.trim()).join(' ').replace(/\*\*/g, '').trim();
++
++  /* Full email contents are never spoken — a count plus a nudge to the app instead. */
++  if (/unread\s*(?:inbox|emails?)|inbox.*unread/i.test(head)) {
++    const n = (head.match(/\((\d+)\)/) || [])[1] || items.length || 'some';
++    return `You have ${n} unread — check the app for the details.`;
++  }
++
++  /* Long lists: "you have 15 open tasks — the top 3 are …". */
++  if (items.length > 5) {
++    const top3 = items.slice(0, 3).map(i => i.replace(/^\s*[-*•]\s+/, '').replace(/\*\*/g, '').replace(/\[(.*?)\]\(.*?\)/g, '$1').trim()).join('; ');
++    const extra = items.length - 3;
++    return `${head ? head + ' ' : ''}You have ${items.length} open items — the top 3 are: ${top3}. Plus ${extra} more on your screen.${tail ? ' ' + tail : ''}`;
++  }
++  return t;
++}
++
++/**
++ * Compose the TTS-safe twin of a reply. Order: profanity out → markdown out →
++ * secrets redacted → discretion summaries. Emojis are KEPT here so the client's
++ * speech engine can translate them into natural words (📅 → "calendar").
++ */
++function toSpeechText(reply, opts = {}) {
++  let t = cleanProfanity(String(reply || ''));
++  t = t
++    .replace(/```[\s\S]*?```/g, ' I sent the code to your screen instead of reading it. ')
++    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
++    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
++    .replace(/^#{1,6}\s+/gm, '')
++    .replace(/(\*\*|__)([\s\S]*?)\1/g, '$2')
++    .replace(/(\*|_)([^*_\n]+)\1/g, '$2')
++    .replace(/~~([^~]+)~~/g, '$1')
++    .replace(/`([^`]*)`/g, '$1')
++    .replace(/^\s*>\s?/gm, '')
++    .replace(/\b(?:https?|ftp):\/\/\S+/gi, 'link')
++    .replace(/\bwww\.\S+/gi, 'link')
++    .replace(/[~^|]+/g, ' ')
++    .replace(/\s+\n/g, '\n')
++    .trim();
++  const hadSecret = /\b(?:pin|password|passwd|pwd|token|secret|api\s*key|apikey|cvv|mpesa|card|otp)\b/i.test(String(reply || ''));
++  t = redactSensitive(t);
++  if (hadSecret) t = t.replace(/\b\d{4,8}\b/g, 'a number');   // no secret value survives, even echoed back
++  if (opts.discretion !== false) t = applyDiscretion(t);
++  return t.replace(/\n{2,}/g, '. ').replace(/\s{2,}/g, ' ').trim();
++}
++
++/* ════════════════════════════════════════════════════════════════════════
++   6. OFFLINE ENGINE (heuristic answers when no LLM is reachable)
++   ════════════════════════════════════════════════════════════════════════ */
++
++/* Which calendar day is the user asking about? "…tomorrow", "…friday", "next week", today. */
++function parseQueryDay(text, tz) {
++  const m = String(text || '').toLowerCase();
++  const todayKey = dayKey(Date.now(), tz);
++  const days = { sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6 };
++  if (/\byesterday\b/.test(m)) return { key: dayKeyAdd(todayKey, -1), label: 'yesterday' };
++  if (/\btomorrow\b/.test(m)) return { key: dayKeyAdd(todayKey, 1), label: 'tomorrow' };
++  const wd = m.match(/\b(?:on|this|next\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/);
++  if (wd) {
++    const todayDow = dayKeyDow(todayKey);
++    const delta = (days[wd[1]] - todayDow + 7) % 7 || 7;
++    return { key: dayKeyAdd(todayKey, delta), label: wd[1].charAt(0).toUpperCase() + wd[1].slice(1) };
+   }
++  return { key: todayKey, label: 'today' };
+ }
+ 
+-/* ---------- Asynchronous Heuristic Offline Engine with Automatic Web Search ---------- */
+ async function offlineEngine(msg, context, engineStatus) {
+   const db = dbm.load();
+   const cfg = cfgm.load();
+@@ -264,23 +800,25 @@ async function offlineEngine(msg, context, engineStatus) {
+     return `Hello ${(cfg.owner && cfg.owner.name) || 'there'}! I'm ARIA. Ask me anything about your day, work, or ask me to search the web for any topic.`;
+   }
+ 
+-  if (/\b(schedule|calendar|day look|agenda|meetings|what('s| is) on today)\b/.test(m)) {
+-    const today = dayKey(Date.now(), tz);
+-    const events = (db.events || []).filter(e => dayKey(e.start, tz) === today).sort((a, b) => a.start - b.start);
+-    if (!events.length) return "You have no events scheduled for today. Your calendar is clear!";
+-    return `**Today's Schedule (${today})**:\n` + events.map(e => `- ${timeStr(e.start, tz)}: ${e.title} (${e.source || 'calendar'})`).join('\n');
++  if (/\b(schedule|calendar|day look|agenda|meetings|what('s| is) on|my day|free|busy)\b/.test(m)) {
++    const day = parseQueryDay(m, tz);
++    const events = (db.events || []).filter(e => dayKey(e.start, tz) === day.key).sort((a, b) => a.start - b.start);
++    if (!events.length) return `You have no events scheduled for ${day.label}. Your calendar is clear!`;
++    return `**Schedule for ${day.label} (${day.key})**:\n` + events.map(e => `- ${timeStr(e.start, tz)}: ${e.title} (${e.source || 'calendar'})`).join('\n');
+   }
+ 
+   if (/\b(priorit|urgent|important|to do|tasks|focus)\b/.test(m)) {
+-    const items = (db.inbox || []).filter(i => !i.done).slice(0, 5);
++    const open = (db.inbox || []).filter(i => !i.done);
++    const items = open.slice(0, 5);
+     if (!items.length) return "No urgent priorities right now. All tasks are clear!";
+-    return `**Top Priorities**:\n` + items.map(i => `- [${i.priority || 'medium'}] ${i.title}`).join('\n');
++    return `**Top Priorities** (${open.length} open):\n` + items.map(i => `- [${i.priority || 'medium'}] ${i.title}`).join('\n');
+   }
+ 
+   if (/\b(inbox|email|emails|unread|messages)\b/.test(m)) {
+-    const emails = (db.emails || []).filter(e => !e.read).slice(0, 5);
+-    if (!emails.length) return "Your inbox is clear — no unread emails.";
+-    return `**Unread Inbox** (${emails.length}):\n` + emails.map(e => `- **${e.fromName || e.from}**: ${e.subject}`).join('\n');
++    const unreadEmails = (db.emails || []).filter(e => !e.read);
++    const top = unreadEmails.slice(0, 3);
++    if (!unreadEmails.length) return "Your inbox is clear — no unread emails.";
++    return `**Unread Inbox** (${unreadEmails.length}):\n` + top.map(e => `- **${e.fromName || e.from}**: ${e.subject}`).join('\n');
+   }
+ 
+   if (/\b(slack|whatsapp|chat)\b/.test(m)) {
+@@ -292,7 +830,6 @@ async function offlineEngine(msg, context, engineStatus) {
+   if (/\b(business|orders|suppliers|money|revenue|sales)\b/.test(m)) {
+     const bizEvents = (db.events || []).filter(e => e.context === 'business');
+     const bizEmails = (db.emails || []).filter(e => e.context === 'business');
+-    const bizMsgs = (db.messages || []).filter(e => e.context === 'business');
+     return `**Business snapshot** 🏪\n\n*Upcoming events*` + (bizEvents.map(e => `\n- ${e.title}`).join('') || '\n- None') + `\n\n*Emails*` + (bizEmails.map(e => `\n- ${e.subject}`).join('') || '\n- None');
+   }
+ 
+@@ -307,7 +844,7 @@ async function offlineEngine(msg, context, engineStatus) {
+ 
+   // 2. AUTOMATIC LIVE WEB SEARCH — if brain has no high-confidence match, search the internet
+   try {
+-    const webHits = await websearch.searchWeb(msg, 3);
++    const webHits = (await websearch.searchWeb(msg, 3)).map(h => ({ ...h, title: cleanProfanity(h.title), snippet: cleanProfanity(h.snippet) }));
+     if (webHits && webHits.length > 0) {
+       // Ingest top result into Supabase in background
+       if (webHits[0].url && webHits[0].url.startsWith('http')) {
+@@ -331,4 +868,48 @@ async function offlineEngine(msg, context, engineStatus) {
+   return 'I could not find information about that in your brain or on the web. You can teach me by saying "remember that ...", or try "search for ..." to search the web!';
+ }
+ 
+-module.exports = { respond, offlineEngine, isWebSearchQuery, isPersonalQuery };
++async function setName(name) {
++  name = String(name).trim().replace(/\s+/g, ' ').slice(0, 40);
++  await cfgm.save({ owner: { name } });
++  brain.ingestNote({ title: 'My name is ' + name, content: 'My name is ' + name + '. Please call me ' + name + ' from now on.', source: 'assistant', tags: ['identity'] });
++  brain.buildIndex();
++  await dbm.saveNow();
++  return `Got it — I'll call you **${name}** from now on. I saved it in Settings and wrote it into my brain.`;
++}
++
++function identityReply() {
++  const cfg = cfgm.load();
++  const name = (cfg.owner && cfg.owner.name) || 'Boss';
++  const where = cfg.owner && cfg.owner.location && cfg.owner.location.label ? `${cfg.owner.location.label}, ${cfg.owner.timezone}` : (cfg.owner ? cfg.owner.timezone : 'Africa/Nairobi');
++  const hits = brain.search(name, 3).filter(h => !/^day log/i.test(h.title));
++  let out = `Your name is **${name}** — stored in Settings → Rhythm and remembered in my brain. You're in ${where}.\n\n`;
++  if (hits.length) out += `What I know about you so far:\n` + hits.map(h => `- **${h.title}** _[${h.kind}]_ — ${snippet(h.snippet, 140)}`).join('\n');
++  return out;
++}
++
++async function rememberReply(content) {
++  const note = brain.ingestNote({ title: snippet(content, 80), content, source: 'assistant', tags: ['memory'] });
++  brain.buildIndex();
++  await dbm.saveNow();
++  const topic = extractTopics(content, 1)[0] || 'that';
++  return `🧠 Remembered: "${snippet(content, 160)}" — saved to brain. Ask me "what do you know about ${topic}?" anytime.`;
++}
++
++async function learnReply(url) {
++  try {
++    const note = await weblearn.learnFromUrl(url);
++    return `📚 Done — I read **${note.title}**\n\n${snippet(note.content, 280)}`;
++  } catch (e) {
++    return `⚠️ Could not read page: ${e.message}`;
++  }
++}
++
++module.exports = {
++  respond, offlineEngine, isWebSearchQuery, isPersonalQuery,
++  /* conversation memory */
++  resolveFollowUp, recentHistory, buildMemory, convState, classifyQuery,
++  /* autonomous scheduler */
++  isPlannerRequest, planTargetDays, generateSchedule, confirmPlan, cancelPlan, moveEvent, removeEvent, findEventByWords,
++  /* speech discretion */
++  toSpeechText, redactSensitive, applyDiscretion, parseQueryDay
++};
+diff --git a/server/config.js b/server/config.js
+index c347ef7..523f4d5 100644
+--- a/server/config.js
++++ b/server/config.js
+@@ -13,6 +13,9 @@ const DEFAULTS = {
+   wakeTime: '06:00',
+   rhythm: { wakeHour: 6, workStartHour: 8, workEndHour: 17, sleepHour: 22 },
+   llm: { provider: 'auto', ollamaUrl: 'http://127.0.0.1:11434', model: 'llama3.1' },
++  /* Discretion mode: TTS output skips full email contents, long lists and sensitive strings
++     (passwords, PINs, tokens, card numbers, addresses). Display text stays complete. */
++  discretion: true,
+   smtp: { host: '', port: 587, secure: false, user: '', pass: '', to: '' },
+   brief: { email: false },
+   telegram: { enabled: false, token: '', allowedChatId: '' },
+@@ -52,6 +55,7 @@ function normalize(cfg) {
+   out.smtp = merge(clone(DEFAULTS.smtp), out.smtp || {});
+   out.brief = merge(clone(DEFAULTS.brief), out.brief || {});
+   out.rhythm = merge(clone(DEFAULTS.rhythm), out.rhythm || {});
++  out.discretion = out.discretion !== false;   // default ON — never leak secrets to TTS
+   out.telegram = merge(clone(DEFAULTS.telegram), out.telegram || {});
+   out.connectors = merge(clone(DEFAULTS.connectors), out.connectors || {});
+   for (const key of Object.keys(DEFAULTS.connectors)) {
+diff --git a/server/llm.js b/server/llm.js
+index ccc0673..7adf049 100644
+--- a/server/llm.js
++++ b/server/llm.js
+@@ -17,16 +17,23 @@ async function checkOllama() {
+   return ollamaState.ok;
+ }
+ 
+-async function llmChat(system, user) {
++async function llmChat(system, user, history) {
+   const cfg = cfgm.load();
+   const want = cfg.llm.provider === 'ollama' || (cfg.llm.provider === 'auto' && (await checkOllama()));
+   if (!want) return { text: null, engine: 'offline' };
+   try {
+     const model = cfg.llm.model && ollamaState.models.some(m => m.startsWith(cfg.llm.model)) ? cfg.llm.model
+       : (ollamaState.models[0] || cfg.llm.model);
++    /* Multi-turn conversation memory: the caller passes prior turns ({role, content}) so
++       the model can resolve follow-ups like "what about tomorrow?". */
++    const messages = [{ role: 'system', content: system }];
++    for (const h of (Array.isArray(history) ? history : []).slice(-10)) {
++      if (h && h.content) messages.push({ role: h.role === 'assistant' ? 'assistant' : 'user', content: String(h.content).slice(0, 4000) });
++    }
++    messages.push({ role: 'user', content: user });
+     const res = await fetch(`${cfg.llm.ollamaUrl.replace(/\/$/, '')}/api/chat`, {
+       method: 'POST', headers: { 'Content-Type': 'application/json' },
+-      body: JSON.stringify({ model, stream: false, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] })
++      body: JSON.stringify({ model, stream: false, messages })
+     });
+     if (!res.ok) throw new Error(`ollama ${res.status}`);
+     const json = await res.json();
+diff --git a/server/util.js b/server/util.js
+index 3186f04..18a1ea8 100644
+--- a/server/util.js
++++ b/server/util.js
+@@ -57,7 +57,7 @@ function classifyContext(item) {
+ const STOP = new Set(('a,an,the,and,or,but,if,then,else,for,to,of,in,on,at,by,with,from,as,is,are,was,were,be,been,being,it,its,this,that,these,those,i,you,he,she,we,they,them,his,her,their,our,your,my,me,not,no,yes,do,does,did,done,have,has,had,will,would,can,could,should,shall,may,might,must,about,into,over,after,before,under,up,down,out,off,again,further,once,here,there,when,where,why,how,all,any,both,each,few,more,most,other,some,such,only,own,same,so,than,too,very,just,also,get,got,please,thanks,thank,hi,hello,hey,dear,regards,best,kind,cheers,am,pm,today,tomorrow,yesterday,week,next,last,new,one,two,still,need,want,good,morning,afternoon,evening').split(','));
+ 
+ function tokenize(text) {
+-  return String(text || '').toLowerCase().replace(/[^a-z0-9\s'-]/g, ' ').split(/\s+/).filter(t => t.length > 2 && !STOP.has(t));
++  return String(text || '').toLowerCase().replace(/[^a-z0-9\s'-]/g, ' ').split(/\s+/).filter(t => t.length > 2 && !/^\d+$/.test(t) && !STOP.has(t));
+ }
+ 
+ function extractTopics(text, n = 5) {
+@@ -76,8 +76,50 @@ function snippet(text, len = 180) {
+   return s.length > len ? s.slice(0, len) + '…' : s;
+ }
+ 
++/* ---- Timezone-aware wall-clock helpers (used by the autonomous planner) ----
++   The owner's rhythm (wake 06:00, work 08:00–17:00) is expressed in their timezone,
++   which is usually NOT the server's. These helpers convert "wall time in tz" → UTC ms. */
++function tzOffsetMin(timezone, ts) {
++  const p = tzDate(ts, timezone);
++  const asUTC = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute);
++  return Math.round((asUTC - Math.floor(ts / 60000) * 60000) / 60000);
++}
++
++/* UTC ms for `hour`:`minute` on the calendar day `key` (YYYY-MM-DD) in `timezone`. */
++function zonedTime(key, hour, minute, timezone) {
++  const [y, m, d] = String(key).split('-').map(Number);
++  const guess = Date.UTC(y, (m || 1) - 1, d || 1, hour || 0, minute || 0);
++  const off = tzOffsetMin(timezone, guess);
++  let t = guess - off * 60000;
++  const off2 = tzOffsetMin(timezone, t);
++  if (off2 !== off) t = guess - off2 * 60000;   // DST boundary
++  return t;
++}
++
++function dayKeyAdd(key, days) {
++  const [y, m, d] = String(key).split('-').map(Number);
++  const dt = new Date(Date.UTC(y, m - 1, d + days));
++  return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`;
++}
++
++function dayKeyDow(key) { return new Date(String(key) + 'T12:00:00Z').getUTCDay(); }
++
++/* ---- Basic profanity filter (web results + swarm outputs never ship raw profanity) ---- */
++const PROFANITY_WORDS = [
++  'fuck', 'fucking', 'fucker', 'motherfucker', 'shit', 'shitty', 'bullshit', 'bitch',
++  'ass', 'asshole', 'bastard', 'bollocks', 'bugger', 'crap', 'crappy', 'damn', 'dammit', 'goddamn',
++  'dick', 'dickhead', 'piss', 'pissed', 'prick', 'cunt', 'twat', 'wanker', 'slut', 'whore',
++  'dumbass', 'jackass', 'arse', 'arsehole', 'bloody hell'
++];
++const PROFANITY_RE = new RegExp(`\\b(${PROFANITY_WORDS.join('|')})\\b`, 'gi');
++
++/* Mask profanity, keeping the first letter so context stays readable ("s**t"). */
++function cleanProfanity(text) {
++  return String(text || '').replace(PROFANITY_RE, (m) => m[0] + '*'.repeat(Math.max(1, m.length - 1)));
++}
++
+ function escapeHtml(s) {
+   return String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+ }
+ 
+-module.exports = { uid, slug, tzDate, dayKey, timeStr, dayLabel, minutesOfDay, scorePriority, priorityOf, classifyContext, tokenize, extractTopics, extractEntities, snippet, escapeHtml };
++module.exports = { uid, slug, tzDate, dayKey, timeStr, dayLabel, minutesOfDay, scorePriority, priorityOf, classifyContext, tokenize, extractTopics, extractEntities, snippet, escapeHtml, tzOffsetMin, zonedTime, dayKeyAdd, dayKeyDow, cleanProfanity, PROFANITY_WORDS };
