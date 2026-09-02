@@ -1,13 +1,13 @@
 'use strict';
 /**
- * ARIA Assistant — deterministic intent routing + LLM fallback (Ollama or built-in offline engine).
+ * ARIA Assistant — deterministic intent routing + actions + LLM fallback
  */
 const dbm = require('./db');
 const brain = require('./brain');
 const cfgm = require('./config');
 const weblearn = require('./weblearn');
 const { llmChat, llmStatus } = require('./llm');
-const { dayKey, timeStr, dayLabel, snippet, minutesOfDay, extractTopics } = require('./util');
+const { dayKey, timeStr, dayLabel, snippet, extractTopics } = require('./util');
 
 const SYSTEM_PROMPT = `You are ARIA, the user's private executive assistant inside ARIA OS.
 You manage their day job and their business. You are concise, proactive, well-organized.
@@ -22,8 +22,7 @@ async function respond(message) {
   // Record user message
   db.upsert('chats', { id: `chat-${Date.now()}-u`, role: 'user', content: message, ts: Date.now() });
 
-  // Deterministic "teach me" intents run FIRST, for every engine (Ollama included), so
-  // identity, memories and website-learning behave identically everywhere.
+  // Deterministic "teach me" and ACTION intents run FIRST
   const pre = await routeIntent(String(message || ''));
   let reply, source;
   if (pre) {
@@ -49,15 +48,21 @@ async function respond(message) {
   return { reply, engine: source, llm: engine };
 }
 
-/* ---------- Deterministic intents: identity, memory, website learning ---------- */
+/* ---------- Intent and Action Routing ---------- */
+const CALL_ME_BLOCK = /^(later|tomorrow|now|soon|when|if|after|before|back|again|next|first|sometime|once)$/i;
+
+async function routeIntent(msg) {
+  const m = String(msg || '').trim();
+  if (!m) return null;
+  const db = dbm.load();
+  const cfg = cfgm.load();
+  const tz = cfg.owner.timezone || 'Africa/Nairobi';
 
   // --- ACTION: Schedule / Add Event ---
   let mm = m.match(/^(?:schedule|add event|create meeting|meeting with)\s+(.+)$/i);
   if (mm) {
     const details = mm[1].trim();
     const eventId = `event-${Date.now()}`;
-    const cfg = cfgm.load();
-    const tz = cfg.owner.timezone || 'Africa/Nairobi';
     const tomorrow = /tomorrow/i.test(details);
     const start = Date.now() + (tomorrow ? 86400000 : 3600000);
     const newEvent = {
@@ -94,26 +99,6 @@ async function respond(message) {
     return `✅ **Task Added:** "${taskTitle}" (Priority: ${isHigh ? '🔥 High' : '⚡ Normal'})`;
   }
 
-  // --- ACTION: Draft Email ---
-  mm = m.match(/^(?:draft email to|send email to|email)\s+([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}|[a-z]+)\s+(?:about|saying|subject)\s+(.+)$/i);
-  if (mm) {
-    const to = mm[1];
-    const rest = mm[2];
-    db.emails = db.emails || [];
-    const draft = {
-      id: `draft-${Date.now()}`,
-      to,
-      subject: snippet(rest, 50),
-      body: rest,
-      from: cfgm.load().owner.name || 'ARIA User',
-      draft: true,
-      ts: Date.now()
-    };
-    db.emails.unshift(draft);
-    await dbm.saveNow();
-    return `✉️ **Email Draft Created** to **${to}**:\n*Subject:* ${draft.subject}\n*Body:* ${draft.body}`;
-  }
-
   // --- ACTION: Complete Task ---
   mm = m.match(/^(?:complete task|mark done|finish task|done with)\s+(.+)$/i);
   if (mm) {
@@ -126,30 +111,45 @@ async function respond(message) {
     }
   }
 
-const CALL_ME_BLOCK = /^(later|tomorrow|now|soon|when|if|after|before|back|again|next|first|sometime|once)$/i;
+  // --- ACTION: Draft Email ---
+  mm = m.match(/^(?:draft email to|send email to|email)\s+([^\s]+)\s+(?:about|saying|subject)\s+(.+)$/i);
+  if (mm) {
+    const to = mm[1];
+    const rest = mm[2];
+    db.emails = db.emails || [];
+    const draft = {
+      id: `draft-${Date.now()}`,
+      to,
+      subject: snippet(rest, 50),
+      body: rest,
+      from: cfg.owner.name || 'ARIA User',
+      draft: true,
+      ts: Date.now()
+    };
+    db.emails.unshift(draft);
+    await dbm.saveNow();
+    return `✉️ **Email Draft Created** to **${to}**:\n*Subject:* ${draft.subject}\n*Body:* ${draft.body}`;
+  }
 
-async function routeIntent(msg) {
-  const m = String(msg || '').trim();
-  if (!m) return null;
-
-  // "my name is X" / "call me X" → save the name into Settings AND the brain
-  let mm = m.match(/^my name is\s+(.{2,60}?)\s*$/i);
+  // "my name is X" / "call me X"
+  mm = m.match(/^my name is\s+(.{2,60}?)\s*$/i);
   if (mm) return await setName(mm[1].replace(/[.!?]+$/, '').trim());
   mm = m.match(/^(?:please\s+)?call me\s+([a-z]+(?:[ -][a-z]+){0,2})\s*[.!?]*$/i);
   if (mm && !CALL_ME_BLOCK.test(mm[1].split(/[\s-]+/)[0].trim())) return await setName(mm[1].trim());
 
-  // "what is my name" / "who am i" / "what do you know about me"
+  // "what is my name" / "who am i"
   if (/^(what(?:'s| is) my name|who am i|do you know (?:my name|who i am)|what do you know about me)\??$/i.test(m)) return identityReply();
 
-  // "remember that …" / "note that …" → permanent memory
+  // "remember that …" / "note that …"
   mm = m.match(/^(?:remember|note)(?:\s+that|\s+this)?\s+(.{3,2000})/i);
   if (mm) return await rememberReply(mm[1].trim());
 
-  // "read this website https://…" / "learn from https://…" / bare URL
-  const urlMatch = m.match(/https?:\/\/[^\s"'<>)\]]+/i);
+  // "read this website https://…" / URLs
+  const urlMatch = m.match(/https?:\/\/[^\s"'<>\]]+/i);
   if (urlMatch && (/\b(read|learn|summaris[ez]|fetch|get|open|check|ingest)\b/i.test(m) || m === urlMatch[0])) {
     return await learnReply(urlMatch[0].replace(/[.,;!?]+$/, ''));
   }
+
   return null;
 }
 
@@ -193,20 +193,18 @@ async function learnReply(url) {
   }
 }
 
-/* ---------- Offline engine: intent routing over real data ---------- */
+/* ---------- Built-in Offline Engine ---------- */
 function offlineEngine(msg, context, engineStatus) {
   const db = dbm.load();
   const cfg = cfgm.load();
   const tz = cfg.owner.timezone;
   const m = String(msg || '').toLowerCase();
 
-  // Greetings / status
-  if (/^(hi|hello|hey|good morning|good afternoon|good evening|sup|yo)\b/.test(m)) {
+  if (/^(hi|hello|hey|good morning|good afternoon|good evening|sup|yo)/.test(m)) {
     const name = cfg.owner.name || 'there';
     return `Hello ${name}! I'm ARIA, running locally. Ask me what your day looks like, what your priorities are, or search your brain.`;
   }
 
-  // Schedule / Day look
   if (/\b(schedule|calendar|day look|agenda|meetings|what('s| is) on today)\b/.test(m)) {
     const today = dayKey(Date.now(), tz);
     const events = (db.events || []).filter(e => dayKey(e.start, tz) === today).sort((a, b) => a.start - b.start);
@@ -214,28 +212,24 @@ function offlineEngine(msg, context, engineStatus) {
     return `**Today's Schedule (${today})**:\n` + events.map(e => `- ${timeStr(e.start, tz)}: ${e.title} (${e.account || e.source || 'calendar'})`).join('\n');
   }
 
-  // Priorities
   if (/\b(priorit|urgent|important|to do|tasks|focus)\b/.test(m)) {
     const items = (db.inbox || []).filter(i => !i.done).slice(0, 5);
     if (!items.length) return "No urgent priority items flagged right now.";
     return `**Top Priorities**:\n` + items.map(i => `- [${i.priority || 'medium'}] ${i.title || i.subject || i.text}`).join('\n');
   }
 
-  // Inbox / Emails
   if (/\b(inbox|email|emails|unread|messages)\b/.test(m)) {
     const emails = (db.emails || []).filter(e => !e.read).slice(0, 5);
     if (!emails.length) return "Your inbox is clear — no unread emails.";
     return `**Unread Inbox** (${emails.length}):\n` + emails.map(e => `- **${e.fromName || e.from}**: ${e.subject}`).join('\n');
   }
 
-  // Slack / WhatsApp
   if (/\b(slack|whatsapp|chat)\b/.test(m)) {
     const chats = (db.messages || []).slice(-5);
     if (!chats.length) return "No recent chat messages found.";
     return `**Recent Messages**:\n` + chats.map(c => `- [${c.channel || c.source}] **${c.from}**: ${snippet(c.text, 60)}`).join('\n');
   }
 
-  // Business snapshot
   if (/\b(business|orders|suppliers|money|revenue|sales)\b/.test(m)) {
     const bizEvents = (db.events || []).filter(e => e.context === 'business');
     const bizEmails = (db.emails || []).filter(e => e.context === 'business');
@@ -243,12 +237,10 @@ function offlineEngine(msg, context, engineStatus) {
     return `**Business snapshot** 🏪\n\n*Upcoming business events*\n${bizEvents.map(e => `- ${dayKey(e.start, tz)} ${timeStr(e.start, tz)} — ${e.title}`).join('\n') || '- none' }\n\n*Business emails*\n${bizEmails.map(e => `- ${e.subject} — ${e.fromName}`).join('\n') || '- none'}\n\n*Business chats*\n${bizMsgs.map(x => `- [${x.channel}] ${x.from}: ${snippet(x.text, 80)}`).join('\n') || '- none'}`;
   }
 
-  // Help / capabilities
   if (/\b(help|what can you do|capabilit)/.test(m)) {
-    return `I'm ARIA — your executive assistant. Things you can ask me:\n\n- **"What does my day look like?"** — schedule across every calendar\n- **"What are my priorities?"** — ranked by urgency\n- **"How's my inbox?"** — unread, split day-job vs business\n- **"What's happening in Slack/WhatsApp?"**\n- **"What do I know about ___?"** — search your second brain\n- **"Show me the business picture"** — orders, suppliers, money\n- **"Remember that …"** — teach me something permanently\n- **"My name is …"** — I'll remember who you are\n- **"Read this website https://…"** — pull a page into the brain\n\nI reason over your real data. ${engineStatus.activeEngine === 'ollama' ? `Running locally on Ollama (${engineStatus.model}) — fully private. 🟢` : 'Currently on the **built-in offline engine**. Install [Ollama](https://ollama.com), pull a model (e.g. `ollama pull llama3.1`), and I\'ll upgrade myself automatically in Settings → AI. 🔌'}`;
+    return `I'm ARIA — your executive assistant. Things you can ask me:\n\n- **"Schedule meeting with Kamau tomorrow at 3pm"**\n- **"Add task: Review Q3 supplier prices"**\n- **"Draft email to user@domain.com saying hello"**\n- **"What does my day look like?"** — schedule across every calendar\n- **"What are my priorities?"** — ranked by urgency\n- **"How's my inbox?"** — unread, split day-job vs business\n- **"Remember that …"** — teach me something permanently\n- **"My name is …"** — I'll remember who you are\n- **"Read this website https://…"** — pull a page into the brain\n\nI reason over your real data.`;
   }
 
-  // Default: retrieval over the brain + fallback
   const hits = brain.search(msg, 3);
   if (hits.length) {
     return `Here is what I found in your brain:\n\n` + hits.map(h => `- **${h.title}**: ${snippet(h.snippet, 180)}`).join('\n\n');
