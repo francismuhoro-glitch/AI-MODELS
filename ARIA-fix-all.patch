@@ -1,0 +1,1681 @@
+diff --git a/api/index.js b/api/index.js
+index e66c360..a347511 100644
+--- a/api/index.js
++++ b/api/index.js
+@@ -1,3 +1,10 @@
+ 'use strict';
++/* Vercel serverless entry.
++   vercel.json rewrites /api/* here; the express app dual-mounts its routes at both
++   "/" and "/api" and normalizes /api/index.js paths, so every shape resolves. */
+ const app = require('../server/app');
+-module.exports = app;
++
++module.exports = async (req, res) => {
++  try { await app.init(); } catch (_) { /* boot best-effort — handlers have their own fallbacks */ }
++  return app(req, res);
++};
+diff --git a/package.json b/package.json
+index e9a4b58..c6b3a94 100644
+--- a/package.json
++++ b/package.json
+@@ -1,12 +1,14 @@
+ {
+   "name": "aria-os",
+   "version": "1.0.0",
+-  "description": "ARIA OS — personal AI operating system: morning briefs, second brain, executive assistant",
++  "description": "ARIA OS \u2014 personal AI operating system: morning briefs, second brain, executive assistant",
+   "main": "server/index.js",
+   "scripts": {
+     "start": "node server/index.js",
+     "dev": "node --watch server/index.js",
+-    "oauth:google": "node scripts/oauth-google.js"
++    "oauth:google": "node scripts/oauth-google.js",
++    "test": "node scripts/test-app.js",
++    "verify": "node scripts/test-app.js"
+   },
+   "engines": {
+     "node": ">=18"
+@@ -17,5 +19,8 @@
+     "node-cron": "^4.6.0",
+     "nodemailer": "^9.1.0",
+     "web-push": "^3.6.7"
++  },
++  "devDependencies": {
++    "jsdom": "^30.0.1"
+   }
+ }
+diff --git a/public/js/app.js b/public/js/app.js
+index e05518c..9965ec3 100644
+--- a/public/js/app.js
++++ b/public/js/app.js
+@@ -420,7 +420,10 @@ const Installer = {
+     window.addEventListener('appinstalled', () => { this.deferred = null; this.render(); toast('📱 ARIA OS installed — check your home screen'); });
+     this.render();
+   },
+-  standalone() { return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true; },
++  standalone() {
++    try { if (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) return true; } catch (_) {}
++    return window.navigator.standalone === true;
++  },
+   async prompt() {
+     if (this.deferred) {
+       this.deferred.prompt();
+@@ -476,22 +479,96 @@ const PushClient = {
+ let STATE = null; let SETTINGS = null; let CONNECTORS = [];
+ 
+ let lastHighSeen = null;
++
++/* Every consumer of STATE reads through these guards, so a partial payload (cold serverless
++   start, offline cache, a connector still syncing) degrades to an empty view instead of a
++   "Cannot read properties of undefined" crash. */
++const A = (v) => (Array.isArray(v) ? v : []);
++const EMPTY_STATE = {
++  ok: false, cfg: {}, owner: { name: 'there', timezone: 'Africa/Nairobi', location: {} },
++  rhythm: {}, timezone: 'Africa/Nairobi', wakeTime: '06:00',
++  engine: { activeEngine: 'offline' }, llm: { activeEngine: 'offline' }, activeEngine: 'offline',
++  unread: 0, events: [], allEvents: [], emails: [], inbox: [], tasks: [], messages: [],
++  notes: [], chats: [], briefs: [], brief: null,
++  stats: { engine: 'offline', lastSync: null, notes: 0, briefs: 0, emails: 0, messages: 0, events: 0, tasks: 0 },
++  counts: { events: 0, emails: 0, inbox: 0, notes: 0, messages: 0 }
++};
++
++function normalizeState(raw) {
++  const s = raw && typeof raw === 'object' ? raw : {};
++  const owner = { ...EMPTY_STATE.owner, ...(s.owner || s.cfg?.owner || {}) };
++  const engine = s.engine || s.llm || { activeEngine: s.activeEngine || 'offline' };
++  const tasks = A(s.tasks).length ? A(s.tasks) : A(s.inbox).filter(x => x && 'done' in x);
++  const emails = A(s.emails);
++  return {
++    ...EMPTY_STATE, ...s,
++    cfg: s.cfg || {},
++    owner,
++    rhythm: s.rhythm || s.cfg?.rhythm || {},
++    timezone: s.timezone || owner.timezone || 'Africa/Nairobi',
++    wakeTime: s.wakeTime || s.cfg?.wakeTime || '06:00',
++    engine, llm: s.llm || engine,
++    activeEngine: engine.activeEngine || 'offline',
++    events: A(s.events), allEvents: A(s.allEvents).length ? A(s.allEvents) : A(s.events),
++    emails,
++    inbox: A(s.inbox).length ? A(s.inbox) : emails,
++    tasks,
++    messages: A(s.messages), notes: A(s.notes), chats: A(s.chats), briefs: A(s.briefs),
++    brief: s.brief || A(s.briefs)[0] || null,
++    unread: typeof s.unread === 'number' ? s.unread : emails.filter(e => !e.read).length,
++    stats: { ...EMPTY_STATE.stats, ...(s.stats || {}), engine: (s.stats && s.stats.engine) || engine.activeEngine || 'offline' },
++    counts: { ...EMPTY_STATE.counts, ...(s.counts || {}) }
++  };
++}
++
++const TZ = () => (STATE && STATE.timezone) || (STATE && STATE.owner && STATE.owner.timezone) || 'Africa/Nairobi';
++
++/* Settings view reads deep paths (s.owner.location.lat, s.llm.provider, s.smtp.host, …) —
++   fill every one of them so an older/partial settings document cannot blank the form. */
++function normalizeSettings(raw) {
++  const s = raw && typeof raw === 'object' ? raw : {};
++  return {
++    ...s,
++    owner: { name: '', timezone: 'Africa/Nairobi', ...(s.owner || {}), location: { label: '', lat: '', lon: '', ...((s.owner || {}).location || {}) } },
++    wakeTime: s.wakeTime || '06:00',
++    llm: { provider: 'auto', ollamaUrl: '', model: '', ...(s.llm || {}) },
++    smtp: { host: '', port: 587, user: '', pass: '', to: '', ...(s.smtp || {}) },
++    brief: { email: false, ...(s.brief || {}) },
++    connectors: s.connectors || {}
++  };
++}
++
+ async function refreshState() {
+-  STATE = await api('/api/state');
+-  const high = STATE.inbox.filter(e => e.priority === 'high' && !e.read).length + STATE.messages.filter(m => m.priority === 'high' && !m.read).length;
++  try {
++    STATE = normalizeState(await api('/api/state'));
++  } catch (e) {
++    STATE = STATE || normalizeState(null);
++    throw e;
++  }
++  const high = A(STATE.inbox).filter(e => e && e.priority === 'high' && !e.read).length
++    + A(STATE.messages).filter(m => m && m.priority === 'high' && !m.read).length;
+   if (lastHighSeen !== null && high > lastHighSeen) Sound.priorityAlert();
+   lastHighSeen = high;
+   return STATE;
+ }
+ 
+ function updateSidebar() {
+-  if (!STATE) return;
++  const s = STATE || EMPTY_STATE;
++  const stats = s.stats || {};
++  const activeEngine = stats.engine || s.engine?.activeEngine || s.activeEngine || 'offline';
++  const unread = typeof s.unread === 'number' ? s.unread : (s.counts?.emails || 0);
++
+   const b = $('#nav-unread');
+-  if (STATE.unread > 0) { b.hidden = false; b.textContent = STATE.unread; } else b.hidden = true;
++  if (b) { if (unread > 0) { b.hidden = false; b.textContent = unread; } else b.hidden = true; }
++
+   const eng = $('#engine-chip');
+-  const dot = STATE.stats.engine === 'ollama' ? '<span class="dot on"></span>' : '<span class="dot off"></span>';
+-  eng.innerHTML = `${dot}${STATE.stats.engine === 'ollama' ? 'local LLM · ollama' : 'offline engine'}`;
+-  $('#sync-chip').textContent = STATE.stats.lastSync ? `synced ${fmtAgo(STATE.stats.lastSync)} ago` : 'never synced';
++  if (eng) {
++    const dot = activeEngine === 'ollama' ? '<span class="dot on"></span>' : '<span class="dot off"></span>';
++    eng.innerHTML = `${dot}${activeEngine === 'ollama' ? 'local LLM · ollama' : 'offline engine'}`;
++  }
++  const sync = $('#sync-chip');
++  if (sync) sync.textContent = stats.lastSync ? `synced ${fmtAgo(stats.lastSync)} ago` : 'never synced';
++
+   Sound.renderChip(); Installer.render();
+ }
+ 
+@@ -515,11 +592,11 @@ async function route() {
+ 
+ /* ===== HUB ===== */
+ async function viewHub(main) {
+-  await refreshState();
+-  const s = STATE;
++  try { await refreshState(); } catch (_) { STATE = STATE || normalizeState(null); }
++  const s = normalizeState(STATE);
+   const hour = +fmtTime(Date.now(), s.timezone).split(':')[0];
+   const greetWord = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
+-  const nowLine = nowLineHtml(s.events, s.timezone);
++  const nowLine = nowLineHtml(A(s.events), s.timezone);
+ 
+   main.innerHTML = `
+     <div class="greet">
+@@ -558,10 +635,10 @@ async function viewHub(main) {
+ 
+     <div class="grid c2" style="margin-top:16px">
+       <div class="card"><h3>Priority inbox <span class="right"><a href="#/inbox" style="color:var(--accent);text-decoration:none">open inbox →</a></span></h3>
+-        ${s.inbox.slice(0, 6).map(emailRow).join('') || '<div class="empty">Inbox zero ✨</div>'}
++        ${A(s.inbox).slice(0, 6).map(emailRow).join('') || '<div class="empty">Inbox zero ✨</div>'}
+       </div>
+       <div class="card"><h3>Latest messages <span class="right"><a href="#/messages" style="color:var(--accent);text-decoration:none">open messages →</a></span></h3>
+-        ${s.messages.slice(0, 7).map(msgRow).join('') || '<div class="empty">No messages.</div>'}
++        ${A(s.messages).slice(0, 7).map(msgRow).join('') || '<div class="empty">No messages.</div>'}
+       </div>
+     </div>`;
+ 
+@@ -587,7 +664,7 @@ function nowLineHtml(events, tz) {
+ function tlItem(e) {
+   const cal = (e.calendar || 'Work').toLowerCase();
+   return `<div class="tl-item ${new Date(e.end) < Date.now() ? 'past' : ''}">
+-    <div class="tl-time">${fmtTime(e.start, STATE.timezone)}</div>
++    <div class="tl-time">${fmtTime(e.start, TZ())}</div>
+     <div class="tl-bar ${cal}"></div>
+     <div><div class="tl-title">${esc(e.title)} ${demoChip(e)}</div>
+     <div class="tl-meta">${esc(e.calendar)}${e.location ? ' · ' + esc(e.location) : ''}${(e.attendees || []).length ? ' · ' + e.attendees.length + ' att.' : ''}</div></div>
+@@ -596,7 +673,7 @@ function tlItem(e) {
+ 
+ function renderBriefCard(brief) {
+   const el = $('#brief-card'); if (!el) return;
+-  if (!brief) { el.innerHTML = `<h3>☀️ Morning Brief</h3><div class="empty">No brief yet. Hit <strong>Generate brief</strong> — or wait for ${esc(STATE.wakeTime)} tomorrow morning.</div>`; return; }
++  if (!brief) { el.innerHTML = `<h3>☀️ Morning Brief</h3><div class="empty">No brief yet. Hit <strong>Generate brief</strong> — or wait for ${esc((STATE && STATE.wakeTime) || '06:00')} tomorrow morning.</div>`; return; }
+   const briefMd = md(brief.markdown).replace('<h2>⚡ The one thing</h2>', '').replace(/<p>The one thing<\/p>/, '');
+   el.innerHTML = `<div class="brief-head"><h3 style="margin:0">☀️ Morning Brief <span class="right">${esc(brief.date)} · ${esc(brief.trigger || 'manual')}</span></h3>
+     <span style="display:flex;gap:7px"><button class="btn small" id="btn-hear" title="Play ARIA's voice greeting">🔊 hear it</button>
+@@ -607,7 +684,7 @@ function renderBriefCard(brief) {
+ 
+ /* ===== BRIEFS ===== */
+ async function viewBriefs(main) {
+-  const briefs = await api('/api/briefs');
++  const briefs = A(await api('/api/briefs'));
+   main.innerHTML = `<div class="view-head"><div><h1>Morning Briefs</h1><div class="sub">Every day at ${esc((await api('/api/settings')).wakeTime)} · dashboard + email</div></div>
+     <button class="btn primary" id="btn-brief2">✦ Generate now</button>
+     <button class="btn" id="btn-hear2" title="Play ARIA's voice greeting">🔊</button></div>
+@@ -634,8 +711,8 @@ window.closeModal = closeModal;
+ 
+ /* ===== CALENDAR ===== */
+ async function viewCalendar(main) {
+-  const events = await api('/api/events?days=8');
+-  const tz = STATE.timezone;
++  const events = A(await api('/api/events?days=8'));
++  const tz = (STATE && STATE.timezone) || 'Africa/Nairobi';
+   const byDay = {};
+   for (const e of events) { const k = fmtDay(e.start, tz); (byDay[k] = byDay[k] || []).push(e); }
+   main.innerHTML = `<div class="view-head"><div><h1>Calendar</h1><div class="sub">Every calendar, one timeline — work, business, personal</div></div><button class="btn" id="btn-sync2">↻ Sync</button></div>
+@@ -647,7 +724,7 @@ async function viewCalendar(main) {
+ /* ===== INBOX ===== */
+ let inboxFilter = 'all';
+ async function viewInbox(main) {
+-  const emails = await api('/api/emails');
++  const emails = A(await api('/api/emails'));
+   const filtered = emails.filter(e => inboxFilter === 'all' || e.source === inboxFilter || (inboxFilter === 'urgent' && e.priority === 'high'));
+   main.innerHTML = `<div class="view-head"><div><h1>Inbox</h1><div class="sub">${emails.filter(e => !e.read).length} unread of ${emails.length} — Gmail + Outlook unified</div></div>
+     <div class="head-actions">${['all', 'gmail', 'outlook', 'urgent'].map(f => `<button class="btn small ${inboxFilter === f ? 'primary' : ''}" data-f="${f}">${f}</button>`).join('')}</div></div>
+@@ -664,12 +741,12 @@ function emailRow(e) {
+ }
+ 
+ async function openEmail(id, refreshMain) {
+-  const emails = await api('/api/emails'); const e = emails.find(x => x.id === id); if (!e) return;
++  const emails = A(await api('/api/emails')); const e = emails.find(x => x.id === id); if (!e) return;
+   if (!e.read) { await POST(`/api/emails/${e.id}/read`); }
+   openModal(`<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:6px">
+     <h2 style="font-size:17px;line-height:1.35">${esc(e.subject)}</h2>
+     <button class="btn small" onclick="closeModal()">✕</button></div>
+-    <div style="color:var(--dim);font-size:12.5px;margin-bottom:12px">${demoChip(e)}${esc(e.fromName || '')} &lt;${esc(e.from)}&gt; · ${esc(e.source)} · ${fmtDay(e.receivedAt, STATE.timezone)} ${fmtTime(e.receivedAt, STATE.timezone)} · ${ctxChip(e.context)} ${e.priority === 'high' ? '<span class="chip red">urgent</span>' : ''}</div>
++    <div style="color:var(--dim);font-size:12.5px;margin-bottom:12px">${demoChip(e)}${esc(e.fromName || '')} &lt;${esc(e.from)}&gt; · ${esc(e.source)} · ${fmtDay(e.receivedAt, TZ())} ${fmtTime(e.receivedAt, TZ())} · ${ctxChip(e.context)} ${e.priority === 'high' ? '<span class="chip red">urgent</span>' : ''}</div>
+     <div style="white-space:pre-wrap;font-size:13.5px;color:var(--text)">${esc(e.body)}</div>
+     <div style="margin-top:16px;display:flex;gap:8px"><button class="btn primary small" id="em-ask">✦ Ask ARIA to draft a reply</button></div><div id="em-draft" class="md" style="margin-top:10px"></div>`);
+   $('#em-ask').onclick = async (ev) => {
+@@ -683,7 +760,7 @@ async function openEmail(id, refreshMain) {
+ 
+ /* ===== MESSAGES ===== */
+ async function viewMessages(main) {
+-  const msgs = await api('/api/messages');
++  const msgs = A(await api('/api/messages'));
+   main.innerHTML = `<div class="view-head"><div><h1>Messages</h1><div class="sub">Slack + WhatsApp, unified feed</div></div><button class="btn" id="btn-sync3">↻ Sync</button></div>
+     <div class="card">${msgs.map(msgRow).join('') || '<div class="empty">No messages.</div>'}</div>`;
+   $('#btn-sync3').onclick = async () => { await POST('/api/sync'); route(); toast('Synced'); };
+@@ -699,7 +776,7 @@ function msgRow(m) {
+ 
+ /* ===== BRAIN ===== */
+ async function viewBrain(main) {
+-  const notes = await api('/api/notes');
++  const notes = A(await api('/api/notes'));
+   main.innerHTML = `<div class="view-head"><div><h1>Second Brain</h1><div class="sub">${notes.length} notes · grows automatically from briefs, emails & messages</div></div></div>
+     <div class="card capture-box"><h3>⚡ Capture — teach your brain anything</h3>
+       <div class="form-grid" style="grid-template-columns:1fr 2fr auto;align-items:end">
+@@ -794,8 +871,8 @@ async function openNote(n) {
+ 
+ /* ===== ASSISTANT ===== */
+ async function viewAssistant(main) {
+-  const history = await api('/api/assistant/history');
+-  const ai = await api('/api/ai/status');
++  const history = A(await api('/api/assistant/history'));
++  const ai = (await api('/api/ai/status')) || { activeEngine: 'offline' };
+   const hasMic = Speech.supported(), isSecure = Speech.secure();
+   main.innerHTML = `<div class="view-head"><div><h1>Executive Assistant</h1><div class="sub">Reasons over your real calendar, inbox, messages & brain</div></div>
+     <span class="chip ${ai.activeEngine === 'ollama' ? 'green' : 'yellow'}">${ai.activeEngine === 'ollama' ? `🟢 local LLM · ${esc(ai.model || '')}` : '🟡 built-in offline engine'}</span></div>
+@@ -874,7 +951,9 @@ function welcomeMsg(ai) {
+ 
+ /* ===== SETTINGS ===== */
+ async function viewSettings(main) {
+-  const [s, conns] = await Promise.all([api('/api/settings'), api('/api/connectors')]);
++  const [rawSettings, rawConns] = await Promise.all([api('/api/settings'), api('/api/connectors')]);
++  const s = normalizeSettings(rawSettings);
++  const conns = A(rawConns);
+   SETTINGS = s; CONNECTORS = conns;
+   const connMeta = {
+     demo: ['🧪', 'Demo data', 'Sample day, clearly marked DEMO (first-boot seeding is opt-in via ARIA_DEMO=1). Turning it off asks whether to purge the fake data.'],
+@@ -1001,7 +1080,7 @@ function taskRow(t) {
+   return `<div class="task ${t.done ? 'done' : ''}" data-task="${esc(t.id)}">
+     <input type="checkbox" ${t.done ? 'checked' : ''}>
+     <span class="t-title">${esc(t.title)}</span>
+-    ${t.due ? `<span class="chip yellow">due ${fmtDay(t.due, STATE.timezone)}</span>` : ''}
++    ${t.due ? `<span class="chip yellow">due ${fmtDay(t.due, TZ())}</span>` : ''}
+     <span class="t-src">${esc(t.source)}</span></div>`;
+ }
+ function bindTaskToggles(sel) {
+@@ -1031,57 +1110,118 @@ function bindTaskToggles(sel) {
+ 
+ 
+ 
+-/* --- Coordinated Hands-Free & Mic Voice Engine --- */
+-let wakeRecognizer = null;
+-let isAssistantListening = false;
+-
+-function initWakeWord() {
+-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+-  if (!SpeechRecognition) return;
+-
+-  wakeRecognizer = new SpeechRecognition();
+-  wakeRecognizer.continuous = true;
+-  wakeRecognizer.interimResults = false;
+-  wakeRecognizer.lang = 'en-US';
+-
+-  wakeRecognizer.onresult = (event) => {
+-    if (isAssistantListening) return;
+-    const last = event.results[event.results.length - 1];
+-    if (last && last[0]) {
+-      const text = last[0].transcript.trim().toLowerCase();
+-      if (text.includes('aria') || text.includes('hey aria')) {
+-        // Pause wake recognizer to let assistant mic capture
+-        try { wakeRecognizer.stop(); } catch (_) {}
+-        toast('🎙️ ARIA activated!');
+-        
+-        // Switch tab
+-        route('#asst');
+-        setTimeout(() => {
+-          const micBtn = $('#asst-mic');
+-          if (micBtn) {
+-            isAssistantListening = true;
+-            micBtn.click();
+-          }
+-        }, 200);
+-      }
+-    }
+-  };
++/* --- Coordinated Hands-Free & Mic Voice Engine ---------------------------------------
++   Only ONE SpeechRecognition instance may hold the microphone at a time. The background
++   wake-word listener therefore:
++     • never restarts while the assistant mic (Speech) is listening or speaking,
++     • fully releases the mic (abort + drop the instance) before handing over,
++     • re-arms only after the assistant mic has gone idle.
++   Without this hand-off the wake listener keeps the device busy and the assistant mic
++   fails with "not-allowed" / "aborted" the moment you tap it. */
++const WakeWord = {
++  rec: null,
++  wanted: false,     // should the wake listener be running?
++  handingOver: false,
++
++  supported() { return !!(window.SpeechRecognition || window.webkitSpeechRecognition); },
++  busy() { return !!(Speech && (Speech.listening || Speech._speaking)); },
++
++  enabled() {
++    try { return localStorage.getItem('aria.wake') === '1'; } catch (_) { return false; }
++  },
+ 
+-  wakeRecognizer.onend = () => {
+-    if (!isAssistantListening) {
+-      try { wakeRecognizer.start(); } catch (_) {}
++  create() {
++    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
++    const r = new SR();
++    r.continuous = true;
++    r.interimResults = false;
++    r.lang = navigator.language || 'en-US';
++    r.onresult = (event) => {
++      if (this.busy() || this.handingOver) return;
++      const last = event.results[event.results.length - 1];
++      const text = last && last[0] ? String(last[0].transcript || '').trim().toLowerCase() : '';
++      if (/\baria\b/.test(text)) this.handOver();
++    };
++    r.onerror = (e) => {
++      const err = (e && e.error) || '';
++      // Permission problems are terminal — stop retrying so we never fight for the mic.
++      if (err === 'not-allowed' || err === 'service-not-allowed' || err === 'audio-capture') this.disable();
++    };
++    r.onend = () => {
++      this.rec = null;
++      if (this.wanted && !this.handingOver && !this.busy()) setTimeout(() => this.start(), 800);
++    };
++    return r;
++  },
++
++  start() {
++    if (!this.supported() || !this.wanted || this.rec || this.busy() || this.handingOver) return;
++    try { this.rec = this.create(); this.rec.start(); }
++    catch (_) { this.rec = null; }
++  },
++
++  /* Release the microphone immediately (abort, not stop — stop can keep the device open
++     until the final result is delivered). */
++  release() {
++    this.handingOver = true;
++    const r = this.rec;
++    this.rec = null;
++    if (r) {
++      r.onend = r.onresult = r.onerror = null;
++      try { r.abort(); } catch (_) { try { r.stop(); } catch (_) {} }
+     }
+-  };
++  },
+ 
+-  try { wakeRecognizer.start(); } catch (_) {}
+-}
++  disable() { this.wanted = false; this.release(); this.handingOver = false; },
++
++  enable() {
++    if (!this.supported()) return;
++    this.wanted = true;
++    this.handingOver = false;
++    this.start();
++  },
++
++  /* Wake word heard → free the mic, open the Assistant, then start its mic. */
++  handOver() {
++    this.release();
++    toast('🎙️ ARIA activated');
++    if (location.hash !== '#/assistant') location.hash = '#/assistant';
++    setTimeout(() => {
++      const mic = $('#chat-mic');
++      if (mic) mic.click(); else Speech.startMic();
++      this.handingOver = false;
++    }, 400);
++  },
++
++  /* Re-arm once the assistant mic is idle again. */
++  rearm() {
++    this.handingOver = false;
++    if (!this.wanted) return;
++    setTimeout(() => { if (!this.busy()) this.start(); }, 1000);
++  }
++};
++
++/* The assistant mic ALWAYS wins: hook Speech.startMic / stopMic so the wake listener
++   releases the device before recognition starts and re-arms after it ends. */
++(function coordinateMic() {
++  const origStart = Speech.startMic.bind(Speech);
++  const origStop = Speech.stopMic.bind(Speech);
++  Speech.startMic = function () {
++    WakeWord.release();          // hard release — no two recognizers at once
++    return origStart();
++  };
++  Speech.stopMic = function () {
++    const out = origStop();
++    WakeWord.rearm();
++    return out;
++  };
++  const origLeave = Speech.leave.bind(Speech);
++  Speech.leave = function () { const out = origLeave(); WakeWord.rearm(); return out; };
++})();
+ 
+-// Re-arm wake word when assistant finishes
+-window.addEventListener('asst-mic-done', () => {
+-  isAssistantListening = false;
+-  setTimeout(() => {
+-    try { if (wakeRecognizer) wakeRecognizer.start(); } catch (_) {}
+-  }, 1000);
+-});
++window.addEventListener('asst-mic-done', () => WakeWord.rearm());
++window.AriaWakeWord = WakeWord;
+ 
+-setTimeout(initWakeWord, 1500);
++/* Opt-in only (localStorage aria.wake = '1'). Enabling it unprompted would hold the
++   microphone permanently and lock out the assistant mic button. */
++if (WakeWord.enabled()) setTimeout(() => WakeWord.enable(), 1500);
+diff --git a/scripts/test-app.js b/scripts/test-app.js
+new file mode 100644
+index 0000000..9f1669c
+--- /dev/null
++++ b/scripts/test-app.js
+@@ -0,0 +1,126 @@
++'use strict';
++/* ARIA verification suite — no test framework, just node scripts/test-app.js
++   1. API contract: every endpoint answers 200 with the expected JSON shape.
++   2. Frontend: boots public/index.html + public/js/app.js in jsdom against the real
++      server and renders every tab, failing on ANY console error or unhandled rejection. */
++const http = require('http');
++const fs = require('fs');
++const path = require('path');
++const { JSDOM, VirtualConsole } = require('jsdom');
++
++process.env.ARIA_DATA_DIR = fs.mkdtempSync(path.join(require('os').tmpdir(), 'aria-test-'));
++
++const app = require('../server/app');
++
++let pass = 0; const failures = [];
++function check(name, cond, detail) {
++  if (cond) { pass++; console.log('  ✓ ' + name); }
++  else { failures.push(name + (detail ? ' — ' + detail : '')); console.log('  ✗ ' + name + (detail ? ' — ' + detail : '')); }
++}
++
++(async () => {
++  await app.init();
++  const server = http.createServer(app);
++  await new Promise(r => server.listen(0, '127.0.0.1', r));
++  const base = `http://127.0.0.1:${server.address().port}`;
++
++  const get = async (p) => { const r = await fetch(base + p); let j = null; try { j = await r.json(); } catch (_) {} return { status: r.status, json: j }; };
++  const post = async (p, body) => {
++    const r = await fetch(base + p, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
++    let j = null; try { j = await r.json(); } catch (_) {}
++    return { status: r.status, json: j };
++  };
++
++  console.log('\n[1] API contract');
++  const state = await get('/api/state');
++  check('GET /api/state → 200', state.status === 200, 'got ' + state.status);
++  const s = state.json || {};
++  for (const k of ['engine', 'owner', 'rhythm', 'cfg', 'stats', 'counts']) {
++    check(`/api/state has object "${k}"`, s[k] && typeof s[k] === 'object');
++  }
++  check('/api/state.engine.activeEngine is a string', typeof (s.engine || {}).activeEngine === 'string');
++  check('/api/state.stats.engine is a string', typeof (s.stats || {}).engine === 'string');
++  for (const k of ['events', 'emails', 'inbox', 'messages', 'notes', 'chats', 'tasks', 'briefs']) {
++    check(`/api/state.${k} is an array`, Array.isArray(s[k]), typeof s[k]);
++  }
++  check('/api/state.timezone present', typeof s.timezone === 'string' && s.timezone.length > 0);
++
++  for (const p of ['/api/emails', '/api/events', '/api/inbox', '/api/tasks', '/api/messages', '/api/notes', '/api/briefs', '/api/connectors', '/api/assistant/history', '/api/search?q=aria']) {
++    const r = await get(p);
++    check(`GET ${p} → 200 array`, r.status === 200 && Array.isArray(r.json), `status ${r.status}, type ${Array.isArray(r.json) ? 'array' : typeof r.json}`);
++  }
++  for (const p of ['/api/settings', '/api/config', '/api/ai/status', '/api/health', '/api/push/key']) {
++    const r = await get(p);
++    check(`GET ${p} → 200 object`, r.status === 200 && r.json && typeof r.json === 'object', 'status ' + r.status);
++  }
++
++  // Dual mount: the same routes must resolve WITHOUT the /api prefix (Vercel rewrite shape).
++  for (const p of ['/state', '/emails', '/events', '/inbox']) {
++    const r = await get(p);
++    check(`GET ${p} (unprefixed) → 200`, r.status === 200 && r.json !== null, 'status ' + r.status);
++  }
++
++  console.log('\n[2] Mutations');
++  const task = await post('/api/inbox', { title: 'Verification task', priority: 'high' });
++  check('POST /api/inbox → 200 with id', task.status === 200 && !!(task.json || {}).id);
++  const afterTask = await get('/api/inbox');
++  check('new task visible in /api/inbox', (afterTask.json || []).some(t => t.id === task.json.id));
++  const ev = await post('/api/events', { title: 'Verification event', start: Date.now() + 3600000 });
++  check('POST /api/events → 200 with id', ev.status === 200 && !!(ev.json || {}).id);
++  const asst = await post('/api/assistant', { message: 'what are my priorities?' });
++  check('POST /api/assistant → 200 with reply', asst.status === 200 && typeof (asst.json || {}).reply === 'string');
++  const hist = await get('/api/assistant/history');
++  check('assistant history is an array', Array.isArray(hist.json) && hist.json.length >= 2);
++  const note = await post('/api/notes', { title: 'Verification note', content: 'ARIA remembers this.' });
++  check('POST /api/notes → 200 with id', note.status === 200 && !!(note.json || {}).id);
++
++  console.log('\n[3] Frontend render (jsdom)');
++  const errors = [];
++  const vc = new VirtualConsole();
++  vc.on('jsdomError', (e) => errors.push('jsdomError: ' + e.message));
++  vc.on('error', (...a) => errors.push('console.error: ' + a.join(' ')));
++
++  const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
++  const dom = new JSDOM(html, {
++    url: base + '/',
++    runScripts: 'dangerously',
++    pretendToBeVisual: true,
++    virtualConsole: vc,
++    resources: undefined
++  });
++  const w = dom.window;
++  w.fetch = (input, init) => fetch(typeof input === 'string' && input.startsWith('/') ? base + input : input, init);
++  w.addEventListener('unhandledrejection', (e) => errors.push('unhandledrejection: ' + (e.reason && e.reason.message || e.reason)));
++  w.HTMLMediaElement.prototype.play = () => Promise.resolve();
++  w.scrollTo = () => {};
++  if (!w.matchMedia) w.matchMedia = () => ({ matches: false, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {} });
++  if (!w.Notification) w.Notification = { permission: 'default', requestPermission: () => Promise.resolve('denied') };
++
++  const appJs = fs.readFileSync(path.join(__dirname, '..', 'public', 'js', 'app.js'), 'utf8');
++  try { w.eval(appJs); } catch (e) { errors.push('app.js threw: ' + e.message); }
++
++  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
++  await sleep(600);
++
++  const views = ['hub', 'briefs', 'calendar', 'inbox', 'messages', 'brain', 'assistant', 'settings'];
++  for (const v of views) {
++    w.location.hash = '#/' + v;
++    w.dispatchEvent(new w.HashChangeEvent('hashchange'));
++    await sleep(450);
++    const main = w.document.getElementById('main');
++    const txt = (main && main.innerHTML) || '';
++    const rendered = txt.length > 0 && !txt.includes('loading…') && !txt.includes('⚠️');
++    check(`view "${v}" renders`, rendered, txt.slice(0, 120).replace(/\s+/g, ' '));
++  }
++  const chip = w.document.getElementById('engine-chip');
++  check('sidebar engine chip updated', /engine|LLM/i.test((chip && chip.textContent) || ''), (chip && chip.textContent) || '');
++  check('no console errors during render', errors.length === 0, errors.slice(0, 5).join(' | '));
++
++  dom.window.close();
++  server.close();
++
++  console.log(`\n${pass} passed, ${failures.length} failed`);
++  if (failures.length) { failures.forEach(f => console.log(' FAIL: ' + f)); process.exit(1); }
++  console.log('All checks passed ✅');
++  process.exit(0);
++})().catch(e => { console.error(e); process.exit(1); });
+diff --git a/server/app.js b/server/app.js
+index f465e2d..3d9219b 100644
+--- a/server/app.js
++++ b/server/app.js
+@@ -1,229 +1,488 @@
+ 'use strict';
++/* ARIA OS — HTTP layer.
++   Exported as an express app that works BOTH as a long-lived server (server/index.js)
++   and as a Vercel serverless function (api/index.js).
++
++   Two contract rules everything below obeys:
++     1. Every collection endpoint answers with an ARRAY (never undefined/null).
++     2. /api/state answers with the COMPLETE object the frontend renders from —
++        engine, owner, rhythm, cfg, timezone, stats, counts and every collection. */
+ const express = require('express');
+ const path = require('path');
++
+ const dbm = require('./db');
+ const cfgm = require('./config');
+ const brain = require('./brain');
+ const assistant = require('./assistant');
+ const weblearn = require('./weblearn');
+ const doclearn = require('./doclearn');
+-const { llmStatus } = require('./llm');
++const briefGen = require('./brief');
++const connectors = require('./connectors');
++const push = require('./push');
++const { llmStatus, checkOllama } = require('./llm');
+ 
+ const app = express();
+ 
++app.disable('x-powered-by');
+ app.use(express.json({ limit: '15mb' }));
+ app.use(express.urlencoded({ extended: true, limit: '15mb' }));
+ 
+ app.use((req, res, next) => {
+   res.header('Access-Control-Allow-Origin', '*');
+-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
++  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
++  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-ARIA-Key');
+   if (req.method === 'OPTIONS') return res.sendStatus(200);
+   next();
+ });
+ 
++/* --- Vercel path normalization ---------------------------------------------------------
++   The rewrite in vercel.json sends /api/<route> to api/index.js. Depending on the runtime
++   the function may see the original path (/api/emails) OR the rewritten one (/emails, or
++   even /api/index.js?path=…). Normalizing here means the router below matches in all cases,
++   and the routes are ALSO dual-mounted at "/" and "/api" further down. */
++app.use((req, res, next) => {
++  if (req.url.startsWith('/api/index.js')) {
++    const q = req.url.indexOf('?');
++    req.url = '/api' + (q >= 0 ? req.url.slice(q) : '');
++  }
++  next();
++});
++
+ app.use(express.static(path.join(__dirname, '..', 'public')));
+ 
+-const apiRouter = express.Router();
++const arr = (v) => (Array.isArray(v) ? v : []);
++const ok = (res, value) => res.status(200).json(value);
++const fail = (res, e, fallback) => {
++  console.error('[api]', (e && e.stack) || e);
++  if (fallback !== undefined) return res.status(200).json(fallback);
++  return res.status(500).json({ error: (e && e.message) || 'internal error' });
++};
++
++const api = express.Router();
++
++/* ---------------- health ---------------- */
++api.get('/health', (req, res) => ok(res, { ok: true, ts: Date.now(), serverless: !!process.env.VERCEL }));
++
++/* ---------------- state (the frontend's single source of truth) ---------------- */
++function buildState() {
++  const db = dbm.load();
++  const cfg = cfgm.load();
++
++  let engine;
++  try { engine = llmStatus(); } catch (_) { engine = null; }
++  engine = engine || { provider: 'offline', activeEngine: 'offline', model: '', ollamaReachable: false, models: [] };
++
++  const events = arr(db.events).slice().sort((a, b) => (a.start || 0) - (b.start || 0));
++  const emails = arr(db.emails).slice().sort((a, b) => (b.receivedAt || b.ts || 0) - (a.receivedAt || a.ts || 0));
++  const messages = arr(db.messages).slice().sort((a, b) => (b.sentAt || b.ts || 0) - (a.sentAt || a.ts || 0));
++  const tasks = arr(db.tasks).filter(t => !t.done);
++  const notes = arr(db.notes);
++  const chats = arr(db.chats);
++  const briefs = arr(db.briefs).slice().sort((a, b) => (b.generatedAt || 0) - (a.generatedAt || 0));
++  const unread = emails.filter(e => !e.read).length;
+ 
+-/* --- 1. Comprehensive /api/state for Hub, Sidebar & Tabs --- */
+-apiRouter.get('/state', (req, res) => {
++  const tz = (cfg.owner && cfg.owner.timezone) || 'Africa/Nairobi';
++  const todayEvents = events.filter(e => sameDay(e.start, tz));
++
++  return {
++    ok: true,
++    cfg,
++    owner: cfg.owner,
++    rhythm: cfg.rhythm,
++    timezone: tz,
++    wakeTime: cfg.wakeTime,
++    engine,
++    llm: engine,
++    activeEngine: engine.activeEngine || 'offline',
++    unread,
++    /* Collections — always arrays. */
++    events: todayEvents.length ? todayEvents : events.slice(0, 12),
++    allEvents: events,
++    emails,
++    inbox: emails.filter(e => !e.read).length ? emails.filter(e => !e.read) : emails,
++    tasks,
++    messages,
++    notes,
++    chats,
++    briefs,
++    brief: briefs[0] || null,
++    stats: {
++      engine: engine.activeEngine || 'offline',
++      lastSync: (db.meta && db.meta.lastSync) || null,
++      notes: notes.length,
++      briefs: briefs.length,
++      emails: emails.length,
++      messages: messages.length,
++      events: events.length,
++      tasks: tasks.length
++    },
++    counts: {
++      events: events.length,
++      emails: unread,
++      inbox: tasks.length,
++      notes: notes.length,
++      messages: messages.length,
++      chats: chats.length,
++      briefs: briefs.length
++    }
++  };
++}
++
++function sameDay(ts, tz) {
++  if (!ts) return false;
+   try {
+-    const db = dbm.load();
+-    const cfg = cfgm.load();
+-    let engine = { activeEngine: 'offline-engine', model: 'none', label: 'Built-in Engine', ready: true };
+-    try { engine = llmStatus(); } catch (_) {}
+-
+-    res.json({
+-      ok: true,
+-      cfg,
+-      owner: cfg.owner || { name: 'Francis Muhoro', timezone: 'Africa/Nairobi' },
+-      rhythm: cfg.rhythm || { wakeHour: 6, workStartHour: 8, workEndHour: 17, sleepHour: 22 },
+-      engine: engine || { activeEngine: 'offline-engine', model: 'none' },
+-      llm: engine || { activeEngine: 'offline-engine', model: 'none' },
+-      activeEngine: (engine && engine.activeEngine) || 'offline-engine',
+-      events: db.events || [],
+-      emails: db.emails || [],
+-      inbox: db.inbox || [],
+-      notes: db.notes || [],
+-      messages: db.messages || [],
+-      chats: db.chats || [],
+-      counts: {
+-        events: (db.events || []).length,
+-        emails: (db.emails || []).filter(e => !e.read).length,
+-        inbox: (db.inbox || []).filter(i => !i.done).length,
+-        notes: (db.notes || []).length,
+-        messages: (db.messages || []).length
+-      }
+-    });
++    const f = (d) => new Intl.DateTimeFormat('en-GB', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
++    return f(new Date(ts)) === f(new Date());
++  } catch (_) { return false; }
++}
++
++api.get('/state', (req, res) => {
++  try {
++    checkOllama().catch(() => {});   // refresh engine status in the background
++    ok(res, buildState());
+   } catch (e) {
+-    res.json({
+-      ok: true,
+-      cfg: {},
+-      owner: { name: 'Francis Muhoro', timezone: 'Africa/Nairobi' },
+-      engine: { activeEngine: 'offline-engine', model: 'none' },
+-      llm: { activeEngine: 'offline-engine', model: 'none' },
+-      events: [],
+-      emails: [],
+-      inbox: [],
+-      notes: [],
+-      messages: [],
+-      chats: [],
+-      counts: { events: 0, emails: 0, inbox: 0, notes: 0, messages: 0 }
++    /* Never let the hub go blank: answer with an empty-but-complete payload. */
++    const cfg = (() => { try { return cfgm.load(); } catch (_) { return cfgm.DEFAULTS; } })();
++    fail(res, e, {
++      ok: true, cfg, owner: cfg.owner, rhythm: cfg.rhythm,
++      timezone: cfg.owner.timezone, wakeTime: cfg.wakeTime,
++      engine: { activeEngine: 'offline', model: '' }, llm: { activeEngine: 'offline', model: '' },
++      activeEngine: 'offline', unread: 0,
++      events: [], allEvents: [], emails: [], inbox: [], tasks: [], messages: [], notes: [], chats: [], briefs: [], brief: null,
++      stats: { engine: 'offline', lastSync: null, notes: 0, briefs: 0, emails: 0, messages: 0, events: 0, tasks: 0 },
++      counts: { events: 0, emails: 0, inbox: 0, notes: 0, messages: 0, chats: 0, briefs: 0 }
+     });
+   }
+ });
+ 
+-/* --- 2. Collection Routes (Inbox, Events, Emails, Messages) --- */
+-apiRouter.get('/inbox', (req, res) => {
+-  const db = dbm.load();
+-  res.json(db.inbox || []);
+-});
++/* ---------------- settings & config ---------------- */
++api.get('/settings', (req, res) => { try { ok(res, cfgm.load()); } catch (e) { fail(res, e, cfgm.DEFAULTS); } });
++api.get('/config', (req, res) => { try { ok(res, cfgm.load()); } catch (e) { fail(res, e, cfgm.DEFAULTS); } });
+ 
+-apiRouter.post('/inbox', async (req, res) => {
+-  const db = dbm.load();
+-  const item = { id: 'task-' + Date.now(), done: false, ts: Date.now(), ...req.body };
+-  db.inbox = db.inbox || [];
+-  db.inbox.unshift(item);
+-  await dbm.saveNow();
+-  res.json(item);
++async function saveSettings(req, res) {
++  try {
++    const updated = await cfgm.save(req.body || {});
++    const rearm = req.app.get('rearm');
++    if (typeof rearm === 'function') { try { rearm(); } catch (_) {} }
++    ok(res, updated);
++  } catch (e) { fail(res, e); }
++}
++api.post('/settings', saveSettings);
++api.post('/config', saveSettings);
++
++/* ---------------- events / calendar ---------------- */
++api.get('/events', (req, res) => {
++  try {
++    const db = dbm.load();
++    const days = Number(req.query.days);
++    let events = arr(db.events).slice().sort((a, b) => (a.start || 0) - (b.start || 0));
++    if (Number.isFinite(days) && days > 0) {
++      const until = Date.now() + days * 864e5;
++      const from = Date.now() - 864e5;
++      events = events.filter(e => (e.start || 0) >= from && (e.start || 0) <= until);
++    }
++    ok(res, events);
++  } catch (e) { fail(res, e, []); }
+ });
+ 
+-apiRouter.put('/inbox/:id', async (req, res) => {
+-  const db = dbm.load();
+-  const item = (db.inbox || []).find(i => i.id === req.params.id);
+-  if (item) {
+-    Object.assign(item, req.body);
++api.post('/events', async (req, res) => {
++  try {
++    const body = req.body || {};
++    const ev = {
++      id: body.id || 'ev-' + Date.now(),
++      title: body.title || 'Event',
++      start: body.start || Date.now(),
++      end: body.end || (body.start || Date.now()) + 36e5,
++      calendar: body.calendar || 'Work',
++      location: body.location || '',
++      attendees: arr(body.attendees),
++      source: body.source || 'manual',
++      context: body.context || 'day-job'
++    };
++    dbm.upsert('events', ev);
+     await dbm.saveNow();
+-    return res.json(item);
+-  }
+-  res.status(404).json({ error: 'not found' });
++    try { brain.buildIndex(); } catch (_) {}
++    ok(res, ev);
++  } catch (e) { fail(res, e); }
+ });
+ 
+-apiRouter.delete('/inbox/:id', async (req, res) => {
+-  const db = dbm.load();
+-  db.inbox = (db.inbox || []).filter(i => i.id !== req.params.id);
+-  await dbm.saveNow();
+-  res.json({ ok: true });
++api.delete('/events/:id', async (req, res) => {
++  try { dbm.remove('events', e => e.id === req.params.id); await dbm.saveNow(); ok(res, { ok: true }); }
++  catch (e) { fail(res, e); }
+ });
+ 
+-apiRouter.get('/events', (req, res) => {
+-  const db = dbm.load();
+-  res.json(db.events || []);
++/* ---------------- emails ---------------- */
++api.get('/emails', (req, res) => {
++  try {
++    const db = dbm.load();
++    ok(res, arr(db.emails).slice().sort((a, b) => (b.receivedAt || b.ts || 0) - (a.receivedAt || a.ts || 0)));
++  } catch (e) { fail(res, e, []); }
+ });
+ 
+-apiRouter.post('/events', async (req, res) => {
+-  const db = dbm.load();
+-  const ev = { id: 'ev-' + Date.now(), ...req.body };
+-  db.events = db.events || [];
+-  db.events.push(ev);
+-  await dbm.saveNow();
+-  brain.buildIndex();
+-  res.json(ev);
++api.get('/emails/:id', (req, res) => {
++  try { ok(res, dbm.load().one('emails', e => e.id === req.params.id) || null); }
++  catch (e) { fail(res, e, null); }
+ });
+ 
+-apiRouter.get('/emails', (req, res) => {
+-  const db = dbm.load();
+-  res.json(db.emails || []);
++api.post('/emails/:id/read', async (req, res) => {
++  try {
++    const em = dbm.load().one('emails', e => e.id === req.params.id);
++    if (!em) return res.status(404).json({ error: 'not found' });
++    em.read = true;
++    dbm.upsert('emails', em);
++    await dbm.saveNow();
++    ok(res, em);
++  } catch (e) { fail(res, e); }
+ });
+ 
+-apiRouter.get('/messages', (req, res) => {
+-  const db = dbm.load();
+-  res.json(db.messages || []);
++/* ---------------- messages ---------------- */
++api.get('/messages', (req, res) => {
++  try {
++    const db = dbm.load();
++    ok(res, arr(db.messages).slice().sort((a, b) => (b.sentAt || b.ts || 0) - (a.sentAt || a.ts || 0)));
++  } catch (e) { fail(res, e, []); }
+ });
+ 
+-/* --- 3. Second Brain & Document Routes --- */
+-apiRouter.get('/notes', (req, res) => {
+-  const db = dbm.load();
+-  res.json(db.notes || []);
++/* ---------------- inbox / tasks (same collection, two names) ---------------- */
++api.get('/inbox', (req, res) => { try { ok(res, arr(dbm.load().tasks)); } catch (e) { fail(res, e, []); } });
++api.get('/tasks', (req, res) => { try { ok(res, arr(dbm.load().tasks)); } catch (e) { fail(res, e, []); } });
++
++async function addTask(req, res) {
++  try {
++    const body = req.body || {};
++    const item = {
++      id: body.id || 'task-' + Date.now(),
++      title: body.title || 'Untitled task',
++      priority: body.priority || 'medium',
++      context: body.context || 'day-job',
++      source: body.source || 'manual',
++      due: body.due || null,
++      done: false,
++      createdAt: Date.now(),
++      ts: Date.now()
++    };
++    dbm.upsert('tasks', item);
++    await dbm.saveNow();
++    ok(res, item);
++  } catch (e) { fail(res, e); }
++}
++api.post('/inbox', addTask);
++api.post('/tasks', addTask);
++
++async function updateTask(req, res) {
++  try {
++    const item = dbm.load().one('tasks', t => t.id === req.params.id);
++    if (!item) return res.status(404).json({ error: 'not found' });
++    Object.assign(item, req.body || {});
++    dbm.upsert('tasks', item);
++    await dbm.saveNow();
++    ok(res, item);
++  } catch (e) { fail(res, e); }
++}
++api.put('/inbox/:id', updateTask);
++api.put('/tasks/:id', updateTask);
++
++async function toggleTask(req, res) {
++  try {
++    const item = dbm.load().one('tasks', t => t.id === req.params.id);
++    if (!item) return res.status(404).json({ error: 'not found' });
++    item.done = !item.done;
++    dbm.upsert('tasks', item);
++    await dbm.saveNow();
++    ok(res, item);
++  } catch (e) { fail(res, e); }
++}
++api.post('/inbox/:id/toggle', toggleTask);
++api.post('/tasks/:id/toggle', toggleTask);
++
++async function deleteTask(req, res) {
++  try { dbm.remove('tasks', t => t.id === req.params.id); await dbm.saveNow(); ok(res, { ok: true }); }
++  catch (e) { fail(res, e); }
++}
++api.delete('/inbox/:id', deleteTask);
++api.delete('/tasks/:id', deleteTask);
++
++/* ---------------- second brain ---------------- */
++api.get('/notes', (req, res) => {
++  try {
++    ok(res, arr(dbm.load().notes).slice().sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)));
++  } catch (e) { fail(res, e, []); }
+ });
+ 
+-apiRouter.post('/notes', async (req, res) => {
++api.post('/notes', async (req, res) => {
+   try {
+     const { title, content, tags } = req.body || {};
+-    const note = brain.ingestNote({ title: title || 'Quick Note', content: content || '', source: 'user', tags: tags || [] });
++    const note = brain.ingestNote({ title: title || 'Quick Note', content: content || '', source: 'user', tags: arr(tags) });
+     brain.buildIndex();
+     await dbm.saveNow();
+-    res.json(note);
+-  } catch (e) {
+-    res.status(500).json({ error: e.message });
+-  }
++    ok(res, note);
++  } catch (e) { fail(res, e); }
+ });
+ 
+-apiRouter.post('/notes/from-url', async (req, res) => {
++api.post('/notes/from-url', async (req, res) => {
+   try {
+     const { url } = req.body || {};
+     if (!url) return res.status(400).json({ error: 'url required' });
+     const note = await weblearn.learnFromUrl(url);
+-    res.json({ ok: true, note });
+-  } catch (e) {
+-    res.status(502).json({ error: e.message || 'could not read page' });
+-  }
++    ok(res, { ok: true, note });
++  } catch (e) { res.status(502).json({ error: e.message || 'could not read page' }); }
+ });
+ 
+-apiRouter.post('/notes/upload', async (req, res) => {
++api.post('/notes/upload', async (req, res) => {
+   try {
+     const { filename, content, base64, mimeType } = req.body || {};
+     const buffer = base64 ? Buffer.from(base64, 'base64') : Buffer.from(content || '', 'utf8');
+     const note = await doclearn.ingestDocument(filename || 'Document', buffer, mimeType);
+-    res.json({ ok: true, note });
+-  } catch (e) {
+-    res.status(500).json({ error: e.message });
+-  }
++    ok(res, { ok: true, note });
++  } catch (e) { fail(res, e); }
+ });
+ 
+-apiRouter.delete('/notes/:id', async (req, res) => {
++api.delete('/notes/:id', async (req, res) => {
+   try {
+-    const db = dbm.load();
+-    db.notes = (db.notes || []).filter(n => n.id !== req.params.id);
++    dbm.remove('notes', n => n.id === req.params.id);
+     await dbm.saveNow();
+-    brain.buildIndex();
+-    res.json({ ok: true });
+-  } catch (e) {
+-    res.status(500).json({ error: e.message });
+-  }
++    try { brain.buildIndex(); } catch (_) {}
++    ok(res, { ok: true });
++  } catch (e) { fail(res, e); }
+ });
+ 
+-apiRouter.get('/search', (req, res) => {
++api.get('/search', (req, res) => {
++  try { ok(res, arr(brain.search(req.query.q || '', 10))); }
++  catch (e) { fail(res, e, []); }
++});
++
++/* ---------------- briefs ---------------- */
++api.get('/briefs', (req, res) => {
++  try { ok(res, arr(dbm.load().briefs).slice().sort((a, b) => (b.generatedAt || 0) - (a.generatedAt || 0))); }
++  catch (e) { fail(res, e, []); }
++});
++
++api.get('/briefs/:id', (req, res) => {
+   try {
+-    const q = req.query.q || '';
+-    const hits = brain.search(q, 10);
+-    res.json(hits);
+-  } catch (e) {
+-    res.json([]);
+-  }
++    const b = dbm.load().one('briefs', x => x.id === req.params.id);
++    if (!b) return res.status(404).json({ error: 'not found' });
++    ok(res, b);
++  } catch (e) { fail(res, e); }
+ });
+ 
+-/* --- 4. Assistant & Config Routes --- */
+-apiRouter.post('/assistant', async (req, res) => {
++api.post('/brief/generate', async (req, res) => {
++  try { ok(res, await briefGen.generate({ trigger: 'manual' })); }
++  catch (e) { fail(res, e); }
++});
++
++/* ---------------- connectors & sync ---------------- */
++api.get('/connectors', (req, res) => { try { ok(res, arr(connectors.status())); } catch (e) { fail(res, e, []); } });
++
++api.post('/connectors/:id', async (req, res) => {
++  try {
++    const { enabled, config } = req.body || {};
++    const patch = { connectors: { [req.params.id]: { enabled: !!enabled, ...(config || {}) } } };
++    ok(res, await cfgm.save(patch));
++  } catch (e) { fail(res, e); }
++});
++
++api.post('/sync', async (req, res) => {
++  try { ok(res, await connectors.syncAll()); }
++  catch (e) { fail(res, e, { ok: false, results: {}, lastSync: null }); }
++});
++
++api.post('/demo/purge', async (req, res) => {
++  try {
++    const removed = {};
++    for (const col of ['emails', 'messages', 'events', 'notes', 'tasks']) {
++      removed[col] = dbm.remove(col, x => x && (x.demo === true || String(x.id || '').startsWith('demo-')));
++    }
++    await dbm.saveNow();
++    try { brain.buildIndex(); } catch (_) {}
++    ok(res, { ok: true, removed });
++  } catch (e) { fail(res, e); }
++});
++
++/* ---------------- assistant ---------------- */
++api.post('/assistant', async (req, res) => {
+   try {
+     const { message } = req.body || {};
+     const result = await assistant.respond(message || '');
+-    res.json(result);
++    ok(res, result || { reply: '', engine: 'offline-engine' });
+   } catch (e) {
+-    res.json({ reply: 'Sorry, I encountered an error: ' + e.message, engine: 'offline-engine' });
++    console.error('[assistant]', (e && e.stack) || e);
++    ok(res, { reply: 'Sorry, I hit an error: ' + ((e && e.message) || 'unknown'), engine: 'offline-engine' });
+   }
+ });
+ 
+-apiRouter.get('/assistant/history', (req, res) => {
+-  const db = dbm.load();
+-  res.json(db.chats || []);
++api.get('/assistant/history', (req, res) => {
++  try { ok(res, arr(dbm.load().chats)); }
++  catch (e) { fail(res, e, []); }
+ });
+ 
+-apiRouter.get('/config', (req, res) => {
+-  res.json(cfgm.load());
++api.delete('/assistant/history', async (req, res) => {
++  try { dbm.remove('chats', () => true); await dbm.saveNow(); ok(res, { ok: true }); }
++  catch (e) { fail(res, e); }
+ });
+ 
+-apiRouter.post('/config', async (req, res) => {
++api.get('/ai/status', async (req, res) => {
+   try {
+-    const updated = await cfgm.save(req.body || {});
+-    res.json(updated);
+-  } catch (e) {
+-    res.status(500).json({ error: e.message });
+-  }
++    await checkOllama().catch(() => {});
++    ok(res, llmStatus());
++  } catch (e) { fail(res, e, { provider: 'offline', activeEngine: 'offline', model: '', ollamaReachable: false, models: [] }); }
++});
++
++/* ---------------- push ---------------- */
++api.get('/push/key', async (req, res) => {
++  try { const v = await push.vapid(); ok(res, { publicKey: (v && v.publicKey) || null }); }
++  catch (e) { fail(res, e, { publicKey: null }); }
+ });
+ 
+-app.use('/api', apiRouter);
+-app.use(apiRouter);
++api.post('/push/subscribe', async (req, res) => {
++  try {
++    const sub = req.body || {};
++    if (!sub.endpoint) return res.status(400).json({ error: 'endpoint required' });
++    const db = dbm.load();
++    db.subscriptions = arr(db.subscriptions).filter(s => s.endpoint !== sub.endpoint).concat([sub]);
++    await dbm.saveNow();
++    ok(res, { ok: true, count: db.subscriptions.length });
++  } catch (e) { fail(res, e); }
++});
++
++api.post('/push/test', async (req, res) => {
++  try { ok(res, await push.pushAll({ title: 'ARIA OS', body: 'Test notification — your morning brief will arrive like this.', url: '/#/hub' })); }
++  catch (e) { fail(res, e, { skipped: 'push unavailable' }); }
++});
++
++/* --- Dual mount: /api/<route> AND /<route> both resolve (Vercel rewrite safety net). --- */
++app.use('/api', api);
++app.use(api);
++
++/* SPA fallback for hash routes / deep links (never swallows /api or static assets). */
++app.get(/^\/(?!api\/).*/, (req, res, next) => {
++  if (req.method !== 'GET' || (req.headers.accept || '').indexOf('html') === -1) return next();
++  res.sendFile(path.join(__dirname, '..', 'public', 'index.html'), (err) => { if (err) next(); });
++});
++
++app.use('/api', (req, res) => res.status(404).json({ error: 'unknown endpoint: ' + req.originalUrl }));
++
++// eslint-disable-next-line no-unused-vars
++app.use((err, req, res, next) => {
++  console.error('[unhandled]', (err && err.stack) || err);
++  res.status(500).json({ error: (err && err.message) || 'internal error' });
++});
++
++/* Boot the async stores. Safe to call repeatedly; serverless calls it lazily per cold start. */
++let initPromise = null;
++async function init() {
++  if (!initPromise) {
++    initPromise = (async () => {
++      await cfgm.init();
++      await dbm.init();
++      try { brain.buildIndex(); } catch (_) {}
++    })().catch((e) => { console.error('[init]', e.message); });
++  }
++  return initPromise;
++}
++init();
+ 
++app.init = init;
+ module.exports = app;
++module.exports.app = app;
++module.exports.init = init;
++module.exports.buildState = buildState;
+diff --git a/server/assistant.js b/server/assistant.js
+index d476d5b..b87077a 100644
+--- a/server/assistant.js
++++ b/server/assistant.js
+@@ -15,7 +15,8 @@ async function respond(message) {
+   const db = dbm.load();
+   const engine = llmStatus();
+ 
+-  db.upsert('chats', { id: 'chat-' + Date.now() + '-u', role: 'user', content: message, ts: Date.now() });
++  db.chats = Array.isArray(db.chats) ? db.chats : [];
++  db.chats.push({ id: 'chat-' + Date.now() + '-u', role: 'user', content: message, ts: Date.now() });
+ 
+   const pre = await routeIntent(String(message || ''));
+   let reply, source;
+@@ -37,7 +38,7 @@ async function respond(message) {
+     }
+   }
+ 
+-  db.upsert('chats', { id: 'chat-' + Date.now() + '-a', role: 'assistant', content: reply, ts: Date.now(), engine: source });
++  db.chats.push({ id: 'chat-' + Date.now() + '-a', role: 'assistant', content: reply, ts: Date.now(), engine: source });
+   await dbm.saveNow();
+   return { reply, engine: source, llm: engine };
+ }
+@@ -85,6 +86,7 @@ async function routeIntent(msg) {
+       context: /client|order|supplier|money|biz|pay/i.test(raw) ? 'business' : 'day-job',
+       source: 'assistant'
+     };
++    db.events = Array.isArray(db.events) ? db.events : [];
+     db.events.push(newEvent);
+     await dbm.saveNow();
+     brain.buildIndex();
+@@ -96,7 +98,8 @@ async function routeIntent(msg) {
+   if (mm) {
+     const taskTitle = mm[1].trim();
+     const isHigh = /urgent|important|asap|critical|now/i.test(taskTitle);
+-    db.inbox.unshift({
++    db.tasks = Array.isArray(db.tasks) ? db.tasks : [];
++    db.tasks.unshift({
+       id: 'task-' + Date.now(),
+       title: taskTitle.replace(/urgent|asap|critical/gi, '').trim(),
+       priority: isHigh ? 'high' : 'medium',
+@@ -104,15 +107,16 @@ async function routeIntent(msg) {
+       ts: Date.now(),
+       context: /client|invoice|sale|biz/i.test(taskTitle) ? 'business' : 'day-job'
+     });
++    db.inbox = db.tasks;
+     await dbm.saveNow();
+-    return `✅ **Task Added:** "${db.inbox[0].title}" (Priority: ${isHigh ? '🔥 High' : '⚡ Normal'})`;
++    return `✅ **Task Added:** "${db.tasks[0].title}" (Priority: ${isHigh ? '🔥 High' : '⚡ Normal'})`;
+   }
+ 
+   // Complete Task
+   mm = m.match(/^(?:complete task|mark done|finish task|done with)\s+(.+)$/i);
+   if (mm) {
+     const q = mm[1].toLowerCase().trim();
+-    const item = db.inbox.find(t => !t.done && (t.title || '').toLowerCase().includes(q));
++    const item = (db.tasks || []).find(t => !t.done && (t.title || '').toLowerCase().includes(q));
+     if (item) {
+       item.done = true;
+       await dbm.saveNow();
+@@ -195,7 +199,7 @@ function offlineEngine(msg, context, engineStatus) {
+   }
+ 
+   if (/\b(priorit|urgent|important|to do|tasks|focus)\b/.test(m)) {
+-    const items = (db.inbox || []).filter(i => !i.done).slice(0, 5);
++    const items = (db.tasks || db.inbox || []).filter(i => !i.done).slice(0, 5);
+     if (!items.length) return "No urgent priority items flagged right now.";
+     return `**Top Priorities**:\n` + items.map(i => `- [${i.priority || 'medium'}] ${i.title}`).join('\n');
+   }
+diff --git a/server/config.js b/server/config.js
+index 2e46564..c347ef7 100644
+--- a/server/config.js
++++ b/server/config.js
+@@ -1,43 +1,94 @@
+ 'use strict';
+-const fs = require('fs');
+-const path = require('path');
++/* Settings — one JSON document ("settings") in the backing store.
++   Serverless-safe: store.js writes to /tmp (or Supabase) when running on Vercel, and every
++   write is wrapped so a read-only filesystem (EROFS) can never crash a request. */
++const store = require('./store');
+ 
+-const IS_VERCEL = !!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+-const DATA_DIR = IS_VERCEL ? '/tmp' : path.join(__dirname, '..', 'data');
+-const CFG_FILE = path.join(DATA_DIR, 'config.json');
+-
+-const DEFAULT_CONFIG = {
+-  owner: { name: 'Francis Muhoro', timezone: 'Africa/Nairobi', location: { label: 'Nairobi, Kenya' } },
++const DEFAULTS = {
++  owner: {
++    name: 'Francis Muhoro',
++    timezone: 'Africa/Nairobi',
++    location: { label: 'Nairobi, Kenya', lat: -1.2921, lon: 36.8219 }
++  },
++  wakeTime: '06:00',
+   rhythm: { wakeHour: 6, workStartHour: 8, workEndHour: 17, sleepHour: 22 },
+-  ollama: { host: 'http://127.0.0.1:11434', model: 'llama3.1' },
+-  telegram: { enabled: false, token: '', allowedChatId: '' }
++  llm: { provider: 'auto', ollamaUrl: 'http://127.0.0.1:11434', model: 'llama3.1' },
++  smtp: { host: '', port: 587, secure: false, user: '', pass: '', to: '' },
++  brief: { email: false },
++  telegram: { enabled: false, token: '', allowedChatId: '' },
++  connectors: {
++    demo: { enabled: false, config: {} },
++    google: { enabled: false },
++    microsoft: { enabled: false },
++    slack: { enabled: false },
++    whatsapp: { enabled: false }
++  }
+ };
+ 
+-let memCfg = null;
++const clone = (o) => JSON.parse(JSON.stringify(o));
++
++/* Deep-merge `patch` into `base`, arrays replaced wholesale. */
++function merge(base, patch) {
++  const out = Array.isArray(base) ? base.slice() : { ...base };
++  for (const [k, v] of Object.entries(patch || {})) {
++    if (v && typeof v === 'object' && !Array.isArray(v)) out[k] = merge(base && base[k] ? base[k] : {}, v);
++    else if (v !== undefined) out[k] = v;
++  }
++  return out;
++}
++
++/* Fill in anything a stored (older / partial) settings document is missing so that
++   every consumer — brief, scheduler, connectors, llm — can rely on the full shape. */
++function normalize(cfg) {
++  const out = merge(clone(DEFAULTS), cfg || {});
++  out.owner = merge(clone(DEFAULTS.owner), out.owner || {});
++  out.owner.location = merge(clone(DEFAULTS.owner.location), out.owner.location || {});
++  out.llm = merge(clone(DEFAULTS.llm), out.llm || {});
++  // Back-compat: an older build stored { ollama: { host, model } }
++  if (cfg && cfg.ollama) {
++    if (cfg.ollama.host) out.llm.ollamaUrl = cfg.ollama.host;
++    if (cfg.ollama.model) out.llm.model = cfg.ollama.model;
++  }
++  out.smtp = merge(clone(DEFAULTS.smtp), out.smtp || {});
++  out.brief = merge(clone(DEFAULTS.brief), out.brief || {});
++  out.rhythm = merge(clone(DEFAULTS.rhythm), out.rhythm || {});
++  out.telegram = merge(clone(DEFAULTS.telegram), out.telegram || {});
++  out.connectors = merge(clone(DEFAULTS.connectors), out.connectors || {});
++  for (const key of Object.keys(DEFAULTS.connectors)) {
++    out.connectors[key] = out.connectors[key] || { enabled: false };
++    out.connectors[key].enabled = !!out.connectors[key].enabled;
++  }
++  if (!/^\d{2}:\d{2}$/.test(String(out.wakeTime || ''))) out.wakeTime = DEFAULTS.wakeTime;
++  return out;
++}
+ 
++let cache = null;
++
++/* Async load — used by init() at boot so a remote (Supabase) document is honoured. */
++async function init() {
++  if (cache) return cache;
++  let doc = null;
++  try { doc = await store.docGet('settings'); } catch (_) { doc = null; }
++  cache = normalize(doc);
++  return cache;
++}
++
++/* Sync load — every request handler uses this. Falls back to the local file (never throws). */
+ function load() {
+-  if (memCfg) return memCfg;
+-  try {
+-    if (fs.existsSync(CFG_FILE)) {
+-      memCfg = JSON.parse(fs.readFileSync(CFG_FILE, 'utf8'));
+-    }
+-  } catch (_) {}
+-  if (!memCfg) memCfg = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+-  memCfg.owner = memCfg.owner || DEFAULT_CONFIG.owner;
+-  return memCfg;
++  if (cache) return cache;
++  let doc = null;
++  try { doc = store.docGetSync('settings'); } catch (_) { doc = null; }
++  cache = normalize(doc);
++  return cache;
+ }
+ 
+ async function save(patch) {
+-  const cfg = load();
+-  if (patch.owner) cfg.owner = { ...cfg.owner, ...patch.owner };
+-  if (patch.rhythm) cfg.rhythm = { ...cfg.rhythm, ...patch.rhythm };
+-  if (patch.ollama) cfg.ollama = { ...cfg.ollama, ...patch.ollama };
+-  if (patch.telegram) cfg.telegram = { ...cfg.telegram, ...patch.telegram };
+-  try {
+-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+-    fs.writeFileSync(CFG_FILE, JSON.stringify(cfg, null, 2), 'utf8');
+-  } catch (_) {}
+-  return cfg;
++  cache = normalize(merge(load(), patch || {}));
++  try { await store.docSet('settings', cache); } catch (_) { /* read-only fs / offline store: keep in memory */ }
++  return cache;
+ }
+ 
+-module.exports = { load, save };
++/* Test helper — drops the in-memory cache so the next load() re-reads the store. */
++function _reset() { cache = null; }
++
++module.exports = { init, load, save, normalize, DEFAULTS, _reset };
+diff --git a/server/db.js b/server/db.js
+index bd7f298..41a6ff9 100644
+--- a/server/db.js
++++ b/server/db.js
+@@ -1,74 +1,125 @@
+ 'use strict';
+-const fs = require('fs');
+-const path = require('path');
+-
+-const IS_VERCEL = !!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+-const DATA_DIR = IS_VERCEL ? '/tmp' : path.join(__dirname, '..', 'data');
+-const DB_FILE = path.join(DATA_DIR, 'db.json');
+-
+-const INITIAL_DB = {
+-  events: [
+-    { id: 'ev-1', title: 'Strategy & Growth Sync', start: Date.now() + 3600000, end: Date.now() + 7200000, context: 'business', source: 'calendar' },
+-    { id: 'ev-2', title: 'Team Standup', start: Date.now() + 10800000, end: Date.now() + 12600000, context: 'day-job', source: 'calendar' }
+-  ],
+-  emails: [
+-    { id: 'em-1', from: 'finance@client.com', fromName: 'Client Finance', subject: 'Payment confirmation for Invoice #1042', snippet: 'Funds transferred via M-Pesa.', read: false, context: 'business', ts: Date.now() - 3600000 },
+-    { id: 'em-2', from: 'hr@company.com', fromName: 'HR Team', subject: 'Quarterly Review Schedule', snippet: 'Please book your time slot.', read: true, context: 'day-job', ts: Date.now() - 7200000 }
+-  ],
+-  inbox: [
+-    { id: 'task-1', title: 'Review supplier price updates', priority: 'high', done: false, context: 'business', ts: Date.now() },
+-    { id: 'task-2', title: 'Prepare monthly KPI summary', priority: 'medium', done: false, context: 'day-job', ts: Date.now() }
+-  ],
+-  notes: [
+-    { id: 'note-1', title: 'Welcome to ARIA', content: 'ARIA is your personal AI executive assistant with local intelligence and persistent memory.', source: 'system', tags: ['welcome', 'guide'], ts: Date.now() }
+-  ],
+-  messages: [
+-    { id: 'msg-1', channel: 'WhatsApp', from: 'Kamau', text: 'Invoice terms agreed. Proceed with order.', context: 'business', ts: Date.now() - 1800000 }
+-  ],
+-  chats: []
+-};
+-
+-let memDb = null;
+-
+-function ensureDir() {
+-  try {
+-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+-  } catch (_) {}
++/* Database — one JSON document ("state") held in memory and persisted through store.js.
++   Two hard requirements this module has to satisfy:
++     1. Serverless safety: on Vercel the filesystem is read-only outside /tmp, so every write is
++        best-effort and a failure (EROFS) degrades to pure in-memory state instead of a 500.
++     2. A stable shape: every collection ALWAYS exists as an array, so callers can do
++        db.events.filter(...) / res.json(db.emails) without ever seeing `undefined`. */
++const store = require('./store');
++
++const COLLECTIONS = ['events', 'emails', 'messages', 'tasks', 'notes', 'briefs', 'chats', 'inbox', 'subscriptions'];
++
++const seedTs = Date.now();
++
++function seed() {
++  return {
++    events: [
++      { id: 'ev-1', title: 'Strategy & Growth Sync', start: seedTs + 3600000, end: seedTs + 7200000, calendar: 'Business', context: 'business', source: 'seed', location: 'Google Meet', attendees: [] },
++      { id: 'ev-2', title: 'Team Standup', start: seedTs + 10800000, end: seedTs + 12600000, calendar: 'Work', context: 'day-job', source: 'seed', location: 'Zoom', attendees: [] }
++    ],
++    emails: [
++      { id: 'em-1', from: 'finance@client.com', fromName: 'Client Finance', subject: 'Payment confirmation for Invoice #1042', body: 'Funds transferred via M-Pesa.', snippet: 'Funds transferred via M-Pesa.', read: false, context: 'business', priority: 'medium', source: 'seed', receivedAt: seedTs - 3600000, ts: seedTs - 3600000 },
++      { id: 'em-2', from: 'hr@company.com', fromName: 'HR Team', subject: 'Quarterly Review Schedule', body: 'Please book your time slot.', snippet: 'Please book your time slot.', read: true, context: 'day-job', priority: 'low', source: 'seed', receivedAt: seedTs - 7200000, ts: seedTs - 7200000 }
++    ],
++    messages: [
++      { id: 'msg-1', channel: 'WhatsApp', from: 'Kamau', text: 'Invoice terms agreed. Proceed with order.', context: 'business', priority: 'medium', source: 'seed', sentAt: seedTs - 1800000, ts: seedTs - 1800000 }
++    ],
++    tasks: [
++      { id: 'task-1', title: 'Review supplier price updates', priority: 'high', done: false, context: 'business', source: 'seed', due: null, createdAt: seedTs, ts: seedTs },
++      { id: 'task-2', title: 'Prepare monthly KPI summary', priority: 'medium', done: false, context: 'day-job', source: 'seed', due: null, createdAt: seedTs, ts: seedTs }
++    ],
++    notes: [
++      { id: 'note-1', title: 'Welcome to ARIA', content: 'ARIA is your personal AI executive assistant with local intelligence and persistent memory.', source: 'system', kind: 'note', tags: ['welcome', 'guide'], topics: ['aria', 'assistant'], entities: [], createdAt: seedTs, updatedAt: seedTs }
++    ],
++    briefs: [],
++    chats: [],
++    subscriptions: [],
++    meta: { lastSync: null, lastBriefDate: null, createdAt: seedTs }
++  };
++}
++
++let state = null;
++
++/* Guarantee the full shape (and the helper methods) on any document we load. */
++function hydrate(doc) {
++  const base = doc && typeof doc === 'object' ? doc : seed();
++  for (const c of COLLECTIONS) if (!Array.isArray(base[c])) base[c] = [];
++  base.meta = base.meta || {};
++  if (base.meta.lastSync === undefined) base.meta.lastSync = null;
++  if (base.meta.lastBriefDate === undefined) base.meta.lastBriefDate = null;
++
++  /* `inbox` is the app's action-item list; historically the same data lived under `tasks`.
++     Keep them as ONE array under two names so both the API and the brain agree. */
++  if (base.inbox.length && !base.tasks.length) base.tasks = base.inbox;
++  base.inbox = base.tasks;
++
++  Object.defineProperties(base, {
++    find: { value: (col, pred) => (Array.isArray(base[col]) ? base[col] : []).filter(pred || (() => true)), enumerable: false, configurable: true },
++    one: { value: (col, pred) => (Array.isArray(base[col]) ? base[col] : []).find(pred) || null, enumerable: false, configurable: true },
++    upsert: { value: (col, item) => upsert(col, item), enumerable: false, configurable: true },
++    remove: { value: (col, pred) => remove(col, pred), enumerable: false, configurable: true }
++  });
++  return base;
+ }
+ 
++/* Async load — used at boot (honours a remote Supabase document). */
++async function init() {
++  if (state) return state;
++  let doc = null;
++  try { doc = await store.docGet('state'); } catch (_) { doc = null; }
++  state = hydrate(doc);
++  return state;
++}
++
++/* Sync load — used by every request handler. Never throws, never returns undefined. */
+ function load() {
+-  if (memDb) return memDb;
+-  ensureDir();
+-  try {
+-    if (fs.existsSync(DB_FILE)) {
+-      memDb = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+-    }
+-  } catch (_) {}
+-  if (!memDb) memDb = JSON.parse(JSON.stringify(INITIAL_DB));
+-  
+-  memDb.events = memDb.events || [];
+-  memDb.emails = memDb.emails || [];
+-  memDb.inbox = memDb.inbox || [];
+-  memDb.notes = memDb.notes || [];
+-  memDb.messages = memDb.messages || [];
+-  memDb.chats = memDb.chats || [];
+-  return memDb;
++  if (state) return state;
++  let doc = null;
++  try { doc = store.docGetSync('state'); } catch (_) { doc = null; }
++  state = hydrate(doc);
++  return state;
+ }
+ 
+-async function saveNow() {
+-  if (!memDb) return;
+-  ensureDir();
+-  try {
+-    fs.writeFileSync(DB_FILE, JSON.stringify(memDb, null, 2), 'utf8');
+-  } catch (_) {}
++function collection(name) {
++  const db = load();
++  if (!Array.isArray(db[name])) db[name] = [];
++  return db[name];
++}
++
++function upsert(col, item) {
++  const list = collection(col);
++  const idx = item && item.id != null ? list.findIndex(x => x && x.id === item.id) : -1;
++  if (idx >= 0) list[idx] = { ...list[idx], ...item };
++  else list.unshift(item);
++  if (col === 'tasks' || col === 'inbox') load().inbox = load().tasks;
++  return item;
++}
++
++function remove(col, pred) {
++  const db = load();
++  const list = collection(col);
++  const before = list.length;
++  db[col] = list.filter(x => !pred(x));
++  if (col === 'tasks' || col === 'inbox') { db.tasks = db[col]; db.inbox = db.tasks; }
++  return before - db[col].length;
+ }
+ 
+-function upsert(collection, item) {
++/* Persist. Best-effort by design: on a read-only filesystem this is a no-op instead of a crash. */
++async function saveNow() {
+   const db = load();
+-  if (!db[collection]) db[collection] = [];
+-  const idx = db[collection].findIndex(x => x.id === item.id);
+-  if (idx >= 0) db[collection][idx] = item;
+-  else db[collection].unshift(item);
++  try {
++    const plain = {};
++    for (const [k, v] of Object.entries(db)) plain[k] = v;
++    await store.docSet('state', plain);
++    return { saved: true };
++  } catch (e) {
++    return { saved: false, reason: e && e.message ? e.message : 'store unavailable' };
++  }
+ }
+ 
+-module.exports = { load, saveNow, upsert };
++/* Fire-and-forget variant (brain.autoGrow calls it synchronously). */
++function save() { saveNow().catch(() => {}); }
++
++function _reset() { state = null; }
++
++module.exports = { init, load, save, saveNow, upsert, remove, collection, COLLECTIONS, seed, _reset };
+diff --git a/server/index.js b/server/index.js
+index 12ce9e6..f62a90a 100644
+--- a/server/index.js
++++ b/server/index.js
+@@ -1,18 +1,21 @@
+ 'use strict';
+ /* Long-lived server entry — run this on a PC, VPS, Raspberry Pi or home server.
+    (Serverless/Vercel uses api/index.js + vercel.json instead.) */
+-const { app, init } = require('./app');
++const app = require('./app');
+ const scheduler = require('./scheduler');
+ const cfgm = require('./config');
+ 
+ const PORT = process.env.PORT || 3000;
+ 
+ (async () => {
+-  await init();
++  await app.init();
++  const cfg = cfgm.load();
+   // In-process schedules: morning brief + 30-min sync heartbeat. Re-armed when settings change.
+-  scheduler.start();
+-  app.set('rearm', () => scheduler.start());
++  try {
++    scheduler.start();
++    app.set('rearm', () => { try { scheduler.start(); } catch (e) { console.error('[scheduler]', e.message); } });
++  } catch (e) { console.error('[scheduler] disabled:', e.message); }
+   app.listen(PORT, '0.0.0.0', () => {
+-    console.log(`ARIA OS running → http://0.0.0.0:${PORT}  (brief daily at ${cfgm.load().wakeTime} ${cfgm.load().owner.timezone})`);
++    console.log(`ARIA OS running → http://0.0.0.0:${PORT}  (brief daily at ${cfg.wakeTime} ${cfg.owner.timezone})`);
+   });
+ })();
+diff --git a/vercel.json b/vercel.json
+index e7c14dd..c8ebd31 100644
+--- a/vercel.json
++++ b/vercel.json
+@@ -1,5 +1,15 @@
+ {
++  "version": 2,
++  "functions": {
++    "api/index.js": { "maxDuration": 30 }
++  },
+   "rewrites": [
+     { "source": "/api/(.*)", "destination": "/api/index.js" }
++  ],
++  "headers": [
++    {
++      "source": "/api/(.*)",
++      "headers": [{ "key": "Cache-Control", "value": "no-store, max-age=0" }]
++    }
+   ]
+ }

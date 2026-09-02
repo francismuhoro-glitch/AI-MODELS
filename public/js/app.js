@@ -420,7 +420,10 @@ const Installer = {
     window.addEventListener('appinstalled', () => { this.deferred = null; this.render(); toast('📱 ARIA OS installed — check your home screen'); });
     this.render();
   },
-  standalone() { return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true; },
+  standalone() {
+    try { if (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) return true; } catch (_) {}
+    return window.navigator.standalone === true;
+  },
   async prompt() {
     if (this.deferred) {
       this.deferred.prompt();
@@ -476,22 +479,96 @@ const PushClient = {
 let STATE = null; let SETTINGS = null; let CONNECTORS = [];
 
 let lastHighSeen = null;
+
+/* Every consumer of STATE reads through these guards, so a partial payload (cold serverless
+   start, offline cache, a connector still syncing) degrades to an empty view instead of a
+   "Cannot read properties of undefined" crash. */
+const A = (v) => (Array.isArray(v) ? v : []);
+const EMPTY_STATE = {
+  ok: false, cfg: {}, owner: { name: 'there', timezone: 'Africa/Nairobi', location: {} },
+  rhythm: {}, timezone: 'Africa/Nairobi', wakeTime: '06:00',
+  engine: { activeEngine: 'offline' }, llm: { activeEngine: 'offline' }, activeEngine: 'offline',
+  unread: 0, events: [], allEvents: [], emails: [], inbox: [], tasks: [], messages: [],
+  notes: [], chats: [], briefs: [], brief: null,
+  stats: { engine: 'offline', lastSync: null, notes: 0, briefs: 0, emails: 0, messages: 0, events: 0, tasks: 0 },
+  counts: { events: 0, emails: 0, inbox: 0, notes: 0, messages: 0 }
+};
+
+function normalizeState(raw) {
+  const s = raw && typeof raw === 'object' ? raw : {};
+  const owner = { ...EMPTY_STATE.owner, ...(s.owner || s.cfg?.owner || {}) };
+  const engine = s.engine || s.llm || { activeEngine: s.activeEngine || 'offline' };
+  const tasks = A(s.tasks).length ? A(s.tasks) : A(s.inbox).filter(x => x && 'done' in x);
+  const emails = A(s.emails);
+  return {
+    ...EMPTY_STATE, ...s,
+    cfg: s.cfg || {},
+    owner,
+    rhythm: s.rhythm || s.cfg?.rhythm || {},
+    timezone: s.timezone || owner.timezone || 'Africa/Nairobi',
+    wakeTime: s.wakeTime || s.cfg?.wakeTime || '06:00',
+    engine, llm: s.llm || engine,
+    activeEngine: engine.activeEngine || 'offline',
+    events: A(s.events), allEvents: A(s.allEvents).length ? A(s.allEvents) : A(s.events),
+    emails,
+    inbox: A(s.inbox).length ? A(s.inbox) : emails,
+    tasks,
+    messages: A(s.messages), notes: A(s.notes), chats: A(s.chats), briefs: A(s.briefs),
+    brief: s.brief || A(s.briefs)[0] || null,
+    unread: typeof s.unread === 'number' ? s.unread : emails.filter(e => !e.read).length,
+    stats: { ...EMPTY_STATE.stats, ...(s.stats || {}), engine: (s.stats && s.stats.engine) || engine.activeEngine || 'offline' },
+    counts: { ...EMPTY_STATE.counts, ...(s.counts || {}) }
+  };
+}
+
+const TZ = () => (STATE && STATE.timezone) || (STATE && STATE.owner && STATE.owner.timezone) || 'Africa/Nairobi';
+
+/* Settings view reads deep paths (s.owner.location.lat, s.llm.provider, s.smtp.host, …) —
+   fill every one of them so an older/partial settings document cannot blank the form. */
+function normalizeSettings(raw) {
+  const s = raw && typeof raw === 'object' ? raw : {};
+  return {
+    ...s,
+    owner: { name: '', timezone: 'Africa/Nairobi', ...(s.owner || {}), location: { label: '', lat: '', lon: '', ...((s.owner || {}).location || {}) } },
+    wakeTime: s.wakeTime || '06:00',
+    llm: { provider: 'auto', ollamaUrl: '', model: '', ...(s.llm || {}) },
+    smtp: { host: '', port: 587, user: '', pass: '', to: '', ...(s.smtp || {}) },
+    brief: { email: false, ...(s.brief || {}) },
+    connectors: s.connectors || {}
+  };
+}
+
 async function refreshState() {
-  STATE = await api('/api/state');
-  const high = STATE.inbox.filter(e => e.priority === 'high' && !e.read).length + STATE.messages.filter(m => m.priority === 'high' && !m.read).length;
+  try {
+    STATE = normalizeState(await api('/api/state'));
+  } catch (e) {
+    STATE = STATE || normalizeState(null);
+    throw e;
+  }
+  const high = A(STATE.inbox).filter(e => e && e.priority === 'high' && !e.read).length
+    + A(STATE.messages).filter(m => m && m.priority === 'high' && !m.read).length;
   if (lastHighSeen !== null && high > lastHighSeen) Sound.priorityAlert();
   lastHighSeen = high;
   return STATE;
 }
 
 function updateSidebar() {
-  if (!STATE) return;
+  const s = STATE || EMPTY_STATE;
+  const stats = s.stats || {};
+  const activeEngine = stats.engine || s.engine?.activeEngine || s.activeEngine || 'offline';
+  const unread = typeof s.unread === 'number' ? s.unread : (s.counts?.emails || 0);
+
   const b = $('#nav-unread');
-  if (STATE.unread > 0) { b.hidden = false; b.textContent = STATE.unread; } else b.hidden = true;
+  if (b) { if (unread > 0) { b.hidden = false; b.textContent = unread; } else b.hidden = true; }
+
   const eng = $('#engine-chip');
-  const dot = STATE.stats.engine === 'ollama' ? '<span class="dot on"></span>' : '<span class="dot off"></span>';
-  eng.innerHTML = `${dot}${STATE.stats.engine === 'ollama' ? 'local LLM · ollama' : 'offline engine'}`;
-  $('#sync-chip').textContent = STATE.stats.lastSync ? `synced ${fmtAgo(STATE.stats.lastSync)} ago` : 'never synced';
+  if (eng) {
+    const dot = activeEngine === 'ollama' ? '<span class="dot on"></span>' : '<span class="dot off"></span>';
+    eng.innerHTML = `${dot}${activeEngine === 'ollama' ? 'local LLM · ollama' : 'offline engine'}`;
+  }
+  const sync = $('#sync-chip');
+  if (sync) sync.textContent = stats.lastSync ? `synced ${fmtAgo(stats.lastSync)} ago` : 'never synced';
+
   Sound.renderChip(); Installer.render();
 }
 
@@ -515,11 +592,11 @@ async function route() {
 
 /* ===== HUB ===== */
 async function viewHub(main) {
-  await refreshState();
-  const s = STATE;
+  try { await refreshState(); } catch (_) { STATE = STATE || normalizeState(null); }
+  const s = normalizeState(STATE);
   const hour = +fmtTime(Date.now(), s.timezone).split(':')[0];
   const greetWord = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
-  const nowLine = nowLineHtml(s.events, s.timezone);
+  const nowLine = nowLineHtml(A(s.events), s.timezone);
 
   main.innerHTML = `
     <div class="greet">
@@ -558,10 +635,10 @@ async function viewHub(main) {
 
     <div class="grid c2" style="margin-top:16px">
       <div class="card"><h3>Priority inbox <span class="right"><a href="#/inbox" style="color:var(--accent);text-decoration:none">open inbox →</a></span></h3>
-        ${s.inbox.slice(0, 6).map(emailRow).join('') || '<div class="empty">Inbox zero ✨</div>'}
+        ${A(s.inbox).slice(0, 6).map(emailRow).join('') || '<div class="empty">Inbox zero ✨</div>'}
       </div>
       <div class="card"><h3>Latest messages <span class="right"><a href="#/messages" style="color:var(--accent);text-decoration:none">open messages →</a></span></h3>
-        ${s.messages.slice(0, 7).map(msgRow).join('') || '<div class="empty">No messages.</div>'}
+        ${A(s.messages).slice(0, 7).map(msgRow).join('') || '<div class="empty">No messages.</div>'}
       </div>
     </div>`;
 
@@ -587,7 +664,7 @@ function nowLineHtml(events, tz) {
 function tlItem(e) {
   const cal = (e.calendar || 'Work').toLowerCase();
   return `<div class="tl-item ${new Date(e.end) < Date.now() ? 'past' : ''}">
-    <div class="tl-time">${fmtTime(e.start, STATE.timezone)}</div>
+    <div class="tl-time">${fmtTime(e.start, TZ())}</div>
     <div class="tl-bar ${cal}"></div>
     <div><div class="tl-title">${esc(e.title)} ${demoChip(e)}</div>
     <div class="tl-meta">${esc(e.calendar)}${e.location ? ' · ' + esc(e.location) : ''}${(e.attendees || []).length ? ' · ' + e.attendees.length + ' att.' : ''}</div></div>
@@ -596,7 +673,7 @@ function tlItem(e) {
 
 function renderBriefCard(brief) {
   const el = $('#brief-card'); if (!el) return;
-  if (!brief) { el.innerHTML = `<h3>☀️ Morning Brief</h3><div class="empty">No brief yet. Hit <strong>Generate brief</strong> — or wait for ${esc(STATE.wakeTime)} tomorrow morning.</div>`; return; }
+  if (!brief) { el.innerHTML = `<h3>☀️ Morning Brief</h3><div class="empty">No brief yet. Hit <strong>Generate brief</strong> — or wait for ${esc((STATE && STATE.wakeTime) || '06:00')} tomorrow morning.</div>`; return; }
   const briefMd = md(brief.markdown).replace('<h2>⚡ The one thing</h2>', '').replace(/<p>The one thing<\/p>/, '');
   el.innerHTML = `<div class="brief-head"><h3 style="margin:0">☀️ Morning Brief <span class="right">${esc(brief.date)} · ${esc(brief.trigger || 'manual')}</span></h3>
     <span style="display:flex;gap:7px"><button class="btn small" id="btn-hear" title="Play ARIA's voice greeting">🔊 hear it</button>
@@ -607,7 +684,7 @@ function renderBriefCard(brief) {
 
 /* ===== BRIEFS ===== */
 async function viewBriefs(main) {
-  const briefs = await api('/api/briefs');
+  const briefs = A(await api('/api/briefs'));
   main.innerHTML = `<div class="view-head"><div><h1>Morning Briefs</h1><div class="sub">Every day at ${esc((await api('/api/settings')).wakeTime)} · dashboard + email</div></div>
     <button class="btn primary" id="btn-brief2">✦ Generate now</button>
     <button class="btn" id="btn-hear2" title="Play ARIA's voice greeting">🔊</button></div>
@@ -634,8 +711,8 @@ window.closeModal = closeModal;
 
 /* ===== CALENDAR ===== */
 async function viewCalendar(main) {
-  const events = await api('/api/events?days=8');
-  const tz = STATE.timezone;
+  const events = A(await api('/api/events?days=8'));
+  const tz = (STATE && STATE.timezone) || 'Africa/Nairobi';
   const byDay = {};
   for (const e of events) { const k = fmtDay(e.start, tz); (byDay[k] = byDay[k] || []).push(e); }
   main.innerHTML = `<div class="view-head"><div><h1>Calendar</h1><div class="sub">Every calendar, one timeline — work, business, personal</div></div><button class="btn" id="btn-sync2">↻ Sync</button></div>
@@ -647,7 +724,7 @@ async function viewCalendar(main) {
 /* ===== INBOX ===== */
 let inboxFilter = 'all';
 async function viewInbox(main) {
-  const emails = await api('/api/emails');
+  const emails = A(await api('/api/emails'));
   const filtered = emails.filter(e => inboxFilter === 'all' || e.source === inboxFilter || (inboxFilter === 'urgent' && e.priority === 'high'));
   main.innerHTML = `<div class="view-head"><div><h1>Inbox</h1><div class="sub">${emails.filter(e => !e.read).length} unread of ${emails.length} — Gmail + Outlook unified</div></div>
     <div class="head-actions">${['all', 'gmail', 'outlook', 'urgent'].map(f => `<button class="btn small ${inboxFilter === f ? 'primary' : ''}" data-f="${f}">${f}</button>`).join('')}</div></div>
@@ -664,12 +741,12 @@ function emailRow(e) {
 }
 
 async function openEmail(id, refreshMain) {
-  const emails = await api('/api/emails'); const e = emails.find(x => x.id === id); if (!e) return;
+  const emails = A(await api('/api/emails')); const e = emails.find(x => x.id === id); if (!e) return;
   if (!e.read) { await POST(`/api/emails/${e.id}/read`); }
   openModal(`<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:6px">
     <h2 style="font-size:17px;line-height:1.35">${esc(e.subject)}</h2>
     <button class="btn small" onclick="closeModal()">✕</button></div>
-    <div style="color:var(--dim);font-size:12.5px;margin-bottom:12px">${demoChip(e)}${esc(e.fromName || '')} &lt;${esc(e.from)}&gt; · ${esc(e.source)} · ${fmtDay(e.receivedAt, STATE.timezone)} ${fmtTime(e.receivedAt, STATE.timezone)} · ${ctxChip(e.context)} ${e.priority === 'high' ? '<span class="chip red">urgent</span>' : ''}</div>
+    <div style="color:var(--dim);font-size:12.5px;margin-bottom:12px">${demoChip(e)}${esc(e.fromName || '')} &lt;${esc(e.from)}&gt; · ${esc(e.source)} · ${fmtDay(e.receivedAt, TZ())} ${fmtTime(e.receivedAt, TZ())} · ${ctxChip(e.context)} ${e.priority === 'high' ? '<span class="chip red">urgent</span>' : ''}</div>
     <div style="white-space:pre-wrap;font-size:13.5px;color:var(--text)">${esc(e.body)}</div>
     <div style="margin-top:16px;display:flex;gap:8px"><button class="btn primary small" id="em-ask">✦ Ask ARIA to draft a reply</button></div><div id="em-draft" class="md" style="margin-top:10px"></div>`);
   $('#em-ask').onclick = async (ev) => {
@@ -683,7 +760,7 @@ async function openEmail(id, refreshMain) {
 
 /* ===== MESSAGES ===== */
 async function viewMessages(main) {
-  const msgs = await api('/api/messages');
+  const msgs = A(await api('/api/messages'));
   main.innerHTML = `<div class="view-head"><div><h1>Messages</h1><div class="sub">Slack + WhatsApp, unified feed</div></div><button class="btn" id="btn-sync3">↻ Sync</button></div>
     <div class="card">${msgs.map(msgRow).join('') || '<div class="empty">No messages.</div>'}</div>`;
   $('#btn-sync3').onclick = async () => { await POST('/api/sync'); route(); toast('Synced'); };
@@ -699,7 +776,7 @@ function msgRow(m) {
 
 /* ===== BRAIN ===== */
 async function viewBrain(main) {
-  const notes = await api('/api/notes');
+  const notes = A(await api('/api/notes'));
   main.innerHTML = `<div class="view-head"><div><h1>Second Brain</h1><div class="sub">${notes.length} notes · grows automatically from briefs, emails & messages</div></div></div>
     <div class="card capture-box"><h3>⚡ Capture — teach your brain anything</h3>
       <div class="form-grid" style="grid-template-columns:1fr 2fr auto;align-items:end">
@@ -794,8 +871,8 @@ async function openNote(n) {
 
 /* ===== ASSISTANT ===== */
 async function viewAssistant(main) {
-  const history = await api('/api/assistant/history');
-  const ai = await api('/api/ai/status');
+  const history = A(await api('/api/assistant/history'));
+  const ai = (await api('/api/ai/status')) || { activeEngine: 'offline' };
   const hasMic = Speech.supported(), isSecure = Speech.secure();
   main.innerHTML = `<div class="view-head"><div><h1>Executive Assistant</h1><div class="sub">Reasons over your real calendar, inbox, messages & brain</div></div>
     <span class="chip ${ai.activeEngine === 'ollama' ? 'green' : 'yellow'}">${ai.activeEngine === 'ollama' ? `🟢 local LLM · ${esc(ai.model || '')}` : '🟡 built-in offline engine'}</span></div>
@@ -874,7 +951,9 @@ function welcomeMsg(ai) {
 
 /* ===== SETTINGS ===== */
 async function viewSettings(main) {
-  const [s, conns] = await Promise.all([api('/api/settings'), api('/api/connectors')]);
+  const [rawSettings, rawConns] = await Promise.all([api('/api/settings'), api('/api/connectors')]);
+  const s = normalizeSettings(rawSettings);
+  const conns = A(rawConns);
   SETTINGS = s; CONNECTORS = conns;
   const connMeta = {
     demo: ['🧪', 'Demo data', 'Sample day, clearly marked DEMO (first-boot seeding is opt-in via ARIA_DEMO=1). Turning it off asks whether to purge the fake data.'],
@@ -1001,7 +1080,7 @@ function taskRow(t) {
   return `<div class="task ${t.done ? 'done' : ''}" data-task="${esc(t.id)}">
     <input type="checkbox" ${t.done ? 'checked' : ''}>
     <span class="t-title">${esc(t.title)}</span>
-    ${t.due ? `<span class="chip yellow">due ${fmtDay(t.due, STATE.timezone)}</span>` : ''}
+    ${t.due ? `<span class="chip yellow">due ${fmtDay(t.due, TZ())}</span>` : ''}
     <span class="t-src">${esc(t.source)}</span></div>`;
 }
 function bindTaskToggles(sel) {
@@ -1031,57 +1110,118 @@ function bindTaskToggles(sel) {
 
 
 
-/* --- Coordinated Hands-Free & Mic Voice Engine --- */
-let wakeRecognizer = null;
-let isAssistantListening = false;
+/* --- Coordinated Hands-Free & Mic Voice Engine ---------------------------------------
+   Only ONE SpeechRecognition instance may hold the microphone at a time. The background
+   wake-word listener therefore:
+     • never restarts while the assistant mic (Speech) is listening or speaking,
+     • fully releases the mic (abort + drop the instance) before handing over,
+     • re-arms only after the assistant mic has gone idle.
+   Without this hand-off the wake listener keeps the device busy and the assistant mic
+   fails with "not-allowed" / "aborted" the moment you tap it. */
+const WakeWord = {
+  rec: null,
+  wanted: false,     // should the wake listener be running?
+  handingOver: false,
 
-function initWakeWord() {
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SpeechRecognition) return;
+  supported() { return !!(window.SpeechRecognition || window.webkitSpeechRecognition); },
+  busy() { return !!(Speech && (Speech.listening || Speech._speaking)); },
 
-  wakeRecognizer = new SpeechRecognition();
-  wakeRecognizer.continuous = true;
-  wakeRecognizer.interimResults = false;
-  wakeRecognizer.lang = 'en-US';
+  enabled() {
+    try { return localStorage.getItem('aria.wake') === '1'; } catch (_) { return false; }
+  },
 
-  wakeRecognizer.onresult = (event) => {
-    if (isAssistantListening) return;
-    const last = event.results[event.results.length - 1];
-    if (last && last[0]) {
-      const text = last[0].transcript.trim().toLowerCase();
-      if (text.includes('aria') || text.includes('hey aria')) {
-        // Pause wake recognizer to let assistant mic capture
-        try { wakeRecognizer.stop(); } catch (_) {}
-        toast('🎙️ ARIA activated!');
-        
-        // Switch tab
-        route('#asst');
-        setTimeout(() => {
-          const micBtn = $('#asst-mic');
-          if (micBtn) {
-            isAssistantListening = true;
-            micBtn.click();
-          }
-        }, 200);
-      }
+  create() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const r = new SR();
+    r.continuous = true;
+    r.interimResults = false;
+    r.lang = navigator.language || 'en-US';
+    r.onresult = (event) => {
+      if (this.busy() || this.handingOver) return;
+      const last = event.results[event.results.length - 1];
+      const text = last && last[0] ? String(last[0].transcript || '').trim().toLowerCase() : '';
+      if (/\baria\b/.test(text)) this.handOver();
+    };
+    r.onerror = (e) => {
+      const err = (e && e.error) || '';
+      // Permission problems are terminal — stop retrying so we never fight for the mic.
+      if (err === 'not-allowed' || err === 'service-not-allowed' || err === 'audio-capture') this.disable();
+    };
+    r.onend = () => {
+      this.rec = null;
+      if (this.wanted && !this.handingOver && !this.busy()) setTimeout(() => this.start(), 800);
+    };
+    return r;
+  },
+
+  start() {
+    if (!this.supported() || !this.wanted || this.rec || this.busy() || this.handingOver) return;
+    try { this.rec = this.create(); this.rec.start(); }
+    catch (_) { this.rec = null; }
+  },
+
+  /* Release the microphone immediately (abort, not stop — stop can keep the device open
+     until the final result is delivered). */
+  release() {
+    this.handingOver = true;
+    const r = this.rec;
+    this.rec = null;
+    if (r) {
+      r.onend = r.onresult = r.onerror = null;
+      try { r.abort(); } catch (_) { try { r.stop(); } catch (_) {} }
     }
+  },
+
+  disable() { this.wanted = false; this.release(); this.handingOver = false; },
+
+  enable() {
+    if (!this.supported()) return;
+    this.wanted = true;
+    this.handingOver = false;
+    this.start();
+  },
+
+  /* Wake word heard → free the mic, open the Assistant, then start its mic. */
+  handOver() {
+    this.release();
+    toast('🎙️ ARIA activated');
+    if (location.hash !== '#/assistant') location.hash = '#/assistant';
+    setTimeout(() => {
+      const mic = $('#chat-mic');
+      if (mic) mic.click(); else Speech.startMic();
+      this.handingOver = false;
+    }, 400);
+  },
+
+  /* Re-arm once the assistant mic is idle again. */
+  rearm() {
+    this.handingOver = false;
+    if (!this.wanted) return;
+    setTimeout(() => { if (!this.busy()) this.start(); }, 1000);
+  }
+};
+
+/* The assistant mic ALWAYS wins: hook Speech.startMic / stopMic so the wake listener
+   releases the device before recognition starts and re-arms after it ends. */
+(function coordinateMic() {
+  const origStart = Speech.startMic.bind(Speech);
+  const origStop = Speech.stopMic.bind(Speech);
+  Speech.startMic = function () {
+    WakeWord.release();          // hard release — no two recognizers at once
+    return origStart();
   };
-
-  wakeRecognizer.onend = () => {
-    if (!isAssistantListening) {
-      try { wakeRecognizer.start(); } catch (_) {}
-    }
+  Speech.stopMic = function () {
+    const out = origStop();
+    WakeWord.rearm();
+    return out;
   };
+  const origLeave = Speech.leave.bind(Speech);
+  Speech.leave = function () { const out = origLeave(); WakeWord.rearm(); return out; };
+})();
 
-  try { wakeRecognizer.start(); } catch (_) {}
-}
+window.addEventListener('asst-mic-done', () => WakeWord.rearm());
+window.AriaWakeWord = WakeWord;
 
-// Re-arm wake word when assistant finishes
-window.addEventListener('asst-mic-done', () => {
-  isAssistantListening = false;
-  setTimeout(() => {
-    try { if (wakeRecognizer) wakeRecognizer.start(); } catch (_) {}
-  }, 1000);
-});
-
-setTimeout(initWakeWord, 1500);
+/* Opt-in only (localStorage aria.wake = '1'). Enabling it unprompted would hold the
+   microphone permanently and lock out the assistant mic button. */
+if (WakeWord.enabled()) setTimeout(() => WakeWord.enable(), 1500);
