@@ -57,7 +57,7 @@ function classifyContext(item) {
 const STOP = new Set(('a,an,the,and,or,but,if,then,else,for,to,of,in,on,at,by,with,from,as,is,are,was,were,be,been,being,it,its,this,that,these,those,i,you,he,she,we,they,them,his,her,their,our,your,my,me,not,no,yes,do,does,did,done,have,has,had,will,would,can,could,should,shall,may,might,must,about,into,over,after,before,under,up,down,out,off,again,further,once,here,there,when,where,why,how,all,any,both,each,few,more,most,other,some,such,only,own,same,so,than,too,very,just,also,get,got,please,thanks,thank,hi,hello,hey,dear,regards,best,kind,cheers,am,pm,today,tomorrow,yesterday,week,next,last,new,one,two,still,need,want,good,morning,afternoon,evening').split(','));
 
 function tokenize(text) {
-  return String(text || '').toLowerCase().replace(/[^a-z0-9\s'-]/g, ' ').split(/\s+/).filter(t => t.length > 2 && !STOP.has(t));
+  return String(text || '').toLowerCase().replace(/[^a-z0-9\s'-]/g, ' ').split(/\s+/).filter(t => t.length > 2 && !/^\d+$/.test(t) && !STOP.has(t));
 }
 
 function extractTopics(text, n = 5) {
@@ -76,8 +76,50 @@ function snippet(text, len = 180) {
   return s.length > len ? s.slice(0, len) + '…' : s;
 }
 
+/* ---- Timezone-aware wall-clock helpers (used by the autonomous planner) ----
+   The owner's rhythm (wake 06:00, work 08:00–17:00) is expressed in their timezone,
+   which is usually NOT the server's. These helpers convert "wall time in tz" → UTC ms. */
+function tzOffsetMin(timezone, ts) {
+  const p = tzDate(ts, timezone);
+  const asUTC = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute);
+  return Math.round((asUTC - Math.floor(ts / 60000) * 60000) / 60000);
+}
+
+/* UTC ms for `hour`:`minute` on the calendar day `key` (YYYY-MM-DD) in `timezone`. */
+function zonedTime(key, hour, minute, timezone) {
+  const [y, m, d] = String(key).split('-').map(Number);
+  const guess = Date.UTC(y, (m || 1) - 1, d || 1, hour || 0, minute || 0);
+  const off = tzOffsetMin(timezone, guess);
+  let t = guess - off * 60000;
+  const off2 = tzOffsetMin(timezone, t);
+  if (off2 !== off) t = guess - off2 * 60000;   // DST boundary
+  return t;
+}
+
+function dayKeyAdd(key, days) {
+  const [y, m, d] = String(key).split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d + days));
+  return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`;
+}
+
+function dayKeyDow(key) { return new Date(String(key) + 'T12:00:00Z').getUTCDay(); }
+
+/* ---- Basic profanity filter (web results + swarm outputs never ship raw profanity) ---- */
+const PROFANITY_WORDS = [
+  'fuck', 'fucking', 'fucker', 'motherfucker', 'shit', 'shitty', 'bullshit', 'bitch',
+  'ass', 'asshole', 'bastard', 'bollocks', 'bugger', 'crap', 'crappy', 'damn', 'dammit', 'goddamn',
+  'dick', 'dickhead', 'piss', 'pissed', 'prick', 'cunt', 'twat', 'wanker', 'slut', 'whore',
+  'dumbass', 'jackass', 'arse', 'arsehole', 'bloody hell'
+];
+const PROFANITY_RE = new RegExp(`\\b(${PROFANITY_WORDS.join('|')})\\b`, 'gi');
+
+/* Mask profanity, keeping the first letter so context stays readable ("s**t"). */
+function cleanProfanity(text) {
+  return String(text || '').replace(PROFANITY_RE, (m) => m[0] + '*'.repeat(Math.max(1, m.length - 1)));
+}
+
 function escapeHtml(s) {
   return String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-module.exports = { uid, slug, tzDate, dayKey, timeStr, dayLabel, minutesOfDay, scorePriority, priorityOf, classifyContext, tokenize, extractTopics, extractEntities, snippet, escapeHtml };
+module.exports = { uid, slug, tzDate, dayKey, timeStr, dayLabel, minutesOfDay, scorePriority, priorityOf, classifyContext, tokenize, extractTopics, extractEntities, snippet, escapeHtml, tzOffsetMin, zonedTime, dayKeyAdd, dayKeyDow, cleanProfanity, PROFANITY_WORDS };

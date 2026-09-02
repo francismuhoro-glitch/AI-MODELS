@@ -205,6 +205,109 @@ function check(name, cond, detail) {
     check('researcher meta contains web info (may be 0 in restricted env)', true);
   }
 
+  console.log('\n[3c] Conversational memory (multi-turn follow-ups)');
+  /* Turn 1 asks about today; turn 2 ("what about tomorrow?") must be resolved as a
+     follow-up and answer for TOMORROW — using the seeded tomorrow event as proof. */
+  const tomorrowTs = Date.now() + 864e5;
+  const evTom = await post('/api/events', { title: 'Tomorrow Memory Check', start: tomorrowTs });
+  check('seed: tomorrow event created', evTom.status === 200 && !!(evTom.json || {}).id);
+  const t1 = await post('/api/assistant', { message: 'what is my schedule today?' });
+  check('turn 1: schedule query answered', t1.status === 200 && typeof (t1.json || {}).reply === 'string' && /schedule/i.test(t1.json.reply));
+  const t2 = await post('/api/assistant', { message: 'what about tomorrow?' });
+  const t2j = t2.json || {};
+  check('turn 2: recognized as a follow-up', t2j.followUp === true, JSON.stringify({ followUp: t2j.followUp, to: t2j.resolvedTo }));
+  check('turn 2: resolved against the earlier question', /what is my schedule tomorrow/i.test(t2j.resolvedTo || ''), t2j.resolvedTo);
+  check('turn 2: answers for TOMORROW with tomorrow\u2019s events', /tomorrow/i.test(t2j.reply || '') && /Tomorrow Memory Check/i.test(t2j.reply || ''), (t2j.reply || '').slice(0, 140));
+  check('every assistant reply ships a TTS-safe speech twin', typeof t2j.speech === 'string' && t2j.speech.length > 0);
+
+  console.log('\n[3d] Entity carry-over (people persist across turns)');
+  const meet1 = await post('/api/assistant', { message: 'schedule a meeting with Kamau tomorrow at 2pm' });
+  check('first meeting with Kamau scheduled', meet1.status === 200 && /Scheduled/i.test((meet1.json || {}).reply || ''), (meet1.json || {}).reply);
+  const meet2 = await post('/api/assistant', { message: 'add another one for Friday' });
+  check('follow-up scheduling is recognized', meet2.status === 200 && /Scheduled/i.test((meet2.json || {}).reply || ''), (meet2.json || {}).reply);
+  check('follow-up carried over "Kamau" without asking again', /with Kamau/i.test((meet2.json || {}).resolvedTo || ''), (meet2.json || {}).resolvedTo);
+  const evNow = (await get('/api/events')).json || [];
+  const kamau = evNow.filter(e => /kamau/i.test(e.title || ''));
+  check('two Kamau events exist', kamau.length >= 2, JSON.stringify(kamau.map(e => e.title)));
+  const { dayKey: dk } = require('../server/util');
+  const ARIA_TZ = 'Africa/Nairobi';
+  const todayKeyStr = dk(Date.now(), ARIA_TZ);
+  const [yy, mm2, dd2] = todayKeyStr.split('-').map(Number);
+  let friKey = null;
+  for (let i = 1; i <= 7 && !friKey; i++) {
+    const dt = new Date(Date.UTC(yy, mm2 - 1, dd2 + i));
+    if (dt.getUTCDay() === 5) friKey = `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`;
+  }
+  check('the carried-over meeting lands on Friday', kamau.some(e => dk(e.start, ARIA_TZ) === friKey), String(kamau.map(e => dk(e.start, ARIA_TZ))));
+
+  console.log('\n[3e] Autonomous multi-step scheduling');
+  const planResp = await post('/api/assistant', { message: 'plan my day tomorrow' });
+  const planReply = (planResp.json || {}).reply || '';
+  check('planner request returns an executive summary', planResp.status === 200 && planReply.length > 150, planReply.slice(0, 80));
+  check('summary ends with a confirmation prompt', /shall i lock this plan in|confirm the plan/i.test(planReply), planReply.slice(-120));
+  const stPlan = (await get('/api/state')).json || {};
+  const planEvents = (stPlan.allEvents || []).filter(e => e.source === 'planner' && !e.confirmed);
+  const planTomorrowKey = dk(Date.now() + 864e5, ARIA_TZ);
+  check('plan created multiple calendar blocks', planEvents.length >= 4, String(planEvents.length));
+  check('plan targets tomorrow', planEvents.every(e => dk(e.start, ARIA_TZ) === planTomorrowKey), String([...new Set(planEvents.map(e => dk(e.start, ARIA_TZ)))]));
+  const rhythm = stPlan.rhythm || { wakeHour: 6, sleepHour: 22 };
+  const wallH = (ts) => +new Intl.DateTimeFormat('en-GB', { timeZone: ARIA_TZ, hour: '2-digit', hour12: false }).format(new Date(ts));
+  check('plan respects the rhythm config (wake \u2192 sleep)', planEvents.every(e => wallH(e.start) >= rhythm.wakeHour && wallH(e.start) <= rhythm.sleepHour), JSON.stringify({ rhythm }));
+  check('plan includes a wake-up brief', planEvents.some(e => /wake-up brief/i.test(e.title)));
+  check('plan includes focus blocks for prioritised tasks', planEvents.some(e => /deep work/i.test(e.title)));
+  check('plan includes inbox triage windows', planEvents.filter(e => /triage/i.test(e.title)).length >= 1);
+  check('plan includes a meeting slot', planEvents.some(e => /meeting/i.test(e.title)));
+  const sorted = planEvents.slice().sort((a, b) => a.start - b.start);
+  const overlaps = sorted.some((e, i) => i > 0 && e.start < sorted[i - 1].end);
+  check('no double booking inside the plan', !overlaps, JSON.stringify(sorted.map(e => [e.start, e.end])));
+  const allTomorrow = (stPlan.allEvents || []).filter(e => dk(e.start, ARIA_TZ) === planTomorrowKey).sort((a, b) => a.start - b.start);
+  const allOverlaps = allTomorrow.some((e, i) => i > 0 && e.start < allTomorrow[i - 1].end);
+  check('no double booking with existing calendar entries', !allOverlaps);
+
+  /* Iterative refinement: remove a block, then move an existing meeting. */
+  const rmResp = await post('/api/assistant', { message: 'remove the inbox triage' });
+  check('refinement: "remove the inbox triage" acknowledged', rmResp.status === 200 && /Removed/i.test((rmResp.json || {}).reply || ''), (rmResp.json || {}).reply);
+  const stRm = (await get('/api/state')).json || {};
+  check('refinement: triage blocks are gone', !((stRm.allEvents || []).some(e => e.source === 'planner' && /triage/i.test(e.title))));
+  const mvResp = await post('/api/assistant', { message: 'move the standup to 10am' });
+  check('refinement: "move the standup to 10am" acknowledged', mvResp.status === 200 && /Moved/i.test((mvResp.json || {}).reply || ''), (mvResp.json || {}).reply);
+  const stMv = (await get('/api/state')).json || {};
+  const standup = (stMv.allEvents || []).find(e => /standup/i.test(e.title || ''));
+  const wallTime = (ts) => new Intl.DateTimeFormat('en-GB', { timeZone: ARIA_TZ, hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(ts));
+  check('refinement: the standup now starts at 10:00', standup && wallTime(standup.start) === '10:00', standup && wallTime(standup.start));
+
+  console.log('\n[3f] Discretion mode, sensitive-data filter & profanity');
+  const secretResp = await post('/api/assistant', { message: 'remember that my M-Pesa PIN is 4821 and my api key is sk-live-abcdef1234567890' });
+  const secretReply = (secretResp.json || {}).reply || '';
+  const secretSpeech = (secretResp.json || {}).speech || '';
+  check('sensitive details stay readable on screen (text only)', /4821/.test(secretReply) && /sk-live/i.test(secretReply), secretReply.slice(0, 100));
+  check('TTS output never contains the M-Pesa PIN', !/4821/.test(secretSpeech), secretSpeech.slice(0, 140));
+  check('TTS output never contains the API key', !/sk-live/i.test(secretSpeech) && !/abcdef1234567890/.test(secretSpeech), secretSpeech.slice(0, 140));
+  const inboxQ = await post('/api/assistant', { message: 'how is my inbox?' });
+  const inboxReply = (inboxQ.json || {}).reply || '';
+  const inboxSpeech = (inboxQ.json || {}).speech || '';
+  check('"how is my inbox?" is personal (never a web search)', inboxReply.length > 0 && !/web search results/i.test(inboxReply), inboxReply.slice(0, 80));
+  check('discretion summarizes the inbox instead of reading it', /unread/i.test(inboxSpeech) && /check the app/i.test(inboxSpeech), inboxSpeech.slice(0, 120));
+  check('discretion never speaks full email contents', !/Funds transferred via M-Pesa/i.test(inboxSpeech));
+  const assistantModule2 = require('../server/assistant');
+  check('redactSensitive masks tokens/emails/cards/phones', (() => {
+    const out = assistantModule2.redactSensitive('token is ghp_abc123def456ghi mail me at joe@doe.com pay to 0722 123 456 card 4111 1111 1111 1111');
+    return !/ghp_abc|joe@doe\.com|0722 123 456|4111 1111/.test(out);
+  })());
+  check('applyDiscretion caps long lists ("top 3 are")', /top 3 are/i.test(assistantModule2.applyDiscretion('Open tasks:\n- a\n- b\n- c\n- d\n- e\n- f\n- g\n- h')));
+  check('cleanProfanity masks profanity in outputs', (() => {
+    const out = require('../server/util').cleanProfanity('this vendor is shit and the whole thing sucks ass');
+    return !/\b(shit|ass)\b/i.test(out);
+  })());
+  const isPlanner = assistantModule2.isPlannerRequest;
+  check('planner detection: "plan my day tomorrow"', isPlanner('plan my day tomorrow') === true);
+  check('planner detection: "create my schedule for tomorrow"', isPlanner('create my schedule for tomorrow') === true);
+  check('planner detection: "build a weekly plan"', isPlanner('build a weekly plan') === true);
+  check('planner detection: "organize this week"', isPlanner('organize this week') === true);
+  check('planner detection rejects questions about plans', isPlanner('what is a weekly plan?') === false);
+  const follow = assistantModule2.resolveFollowUp('what about tomorrow?', { conv: { lastIntent: 'schedule-query', lastQuery: 'what is my schedule today', entities: {} } });
+  check('resolveFollowUp rewrites "what about tomorrow?"', follow.isFollowUp === true && /tomorrow/i.test(follow.message), follow.message);
+
   console.log('\n[4] Frontend render (jsdom)');
   const errors = [];
   const vc = new VirtualConsole();
@@ -263,6 +366,20 @@ function check(name, cond, detail) {
   check('spoken transcript is appended to the chat', /what are my priorities\?/i.test(chatHtml));
   check('spoken turn gets an ARIA reply in the transcript', (chatHtml.match(/msg aria/g) || []).length >= 1);
   check('reply is handed to speechSynthesis', typeof spoke === 'string' && spoke.length > 0, String(spoke).slice(0, 40));
+
+  console.log('\n[5b] Natural speech filtering (client pipeline)');
+  const cfs = (t, o) => w.AriaSpeech.cleanForSpeech(t, o || {});
+  const mixed = cfs('**Hello** boss — visit https://example.com/x for \u{1F4C5} details, `code`, ~~struck~~, # Head, [link](https://x.y) \u2705');
+  check('no markdown syntax survives into speech', !/[*_#`~]|https?:|\[|\]/.test(mixed), mixed);
+  check('raw URLs are spoken as "link"', !/https?:\/\//i.test(mixed) && /link/i.test(mixed), mixed);
+  check('emojis are translated to natural words', /calendar/i.test(mixed) && /completed/i.test(mixed), mixed);
+  check('code blocks are never read aloud', !/secret|token/.test(cfs('```js\nconst secret = "token";\n```')));
+  check('raw JSON is never read aloud', !/invoice/.test(cfs('{"invoice": 42}')));
+  const longSpeech = cfs('ARIA works through your day, one block at a time. '.repeat(30));
+  check('long replies are capped with a screen pointer', longSpeech.length < 480 && /full details on your screen/i.test(longSpeech), String(longSpeech.length));
+  check('offline replies get a conversational lead-in', /^(here's|looking|based on)/i.test(cfs('**Today Schedule**: 10:00 Team Standup', { offline: true })), cfs('**Today Schedule**: 10:00 Team Standup', { offline: true }));
+  check('secrets never reach TTS (client backstop)', !/4821|sk-live/.test(cfs('your pin is 4821 and key sk-live-abcdef123456')));
+  check('dashes & symbol runs become spoken pauses', !/\u2014|-{2,}/.test(cfs('first part — second part -- third **part**')));
 
   /* Agency view: mission → live steps → final output → read aloud. */
   w.location.hash = '#/agency';

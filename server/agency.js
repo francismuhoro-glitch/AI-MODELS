@@ -16,7 +16,7 @@ const dbm = require('./db');
 const cfgm = require('./config');
 const brain = require('./brain');
 const registry = require('./agents');
-const { snippet } = require('./util');
+const { snippet, cleanProfanity } = require('./util');
 
 const MAX_RUNS = 40;
 const MODES = ['sequential', 'parallel'];
@@ -94,9 +94,9 @@ async function run(opts = {}) {
     else for (const a of live) await runAgent(a, ctx);
   }
 
-  /* 3. ARIA signs off. */
+  /* 3. ARIA signs off. Swarm output is profanity-filtered before it reaches the user. */
   const finalStep = await runAgent(registry.director, ctx, 'synthesize');
-  const finalOutput = finalStep.result;
+  const finalOutput = cleanProfanity(finalStep.result);
   const finishedAt = Date.now();
 
   const record = {
