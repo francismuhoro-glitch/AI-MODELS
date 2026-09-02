@@ -184,7 +184,7 @@ async function learnReply(url) {
   }
 }
 
-/* ---------- Asynchronous Heuristic Offline Engine with Web Search ---------- */
+/* ---------- Asynchronous Heuristic Offline Engine with Automatic Web Search ---------- */
 async function offlineEngine(msg, context, engineStatus) {
   const db = dbm.load();
   const cfg = cfgm.load();
@@ -192,19 +192,19 @@ async function offlineEngine(msg, context, engineStatus) {
   const m = String(msg || '').toLowerCase();
 
   if (/^(hi|hello|hey|good morning|good afternoon|good evening|sup|yo)\b/.test(m)) {
-    return `Hello ${(cfg.owner && cfg.owner.name) || 'there'}! I'm ARIA, running locally. Ask me about your day, priorities, or second brain.`;
+    return `Hello ${(cfg.owner && cfg.owner.name) || 'there'}! I'm ARIA. Ask me anything about your day, work, or ask me to search the web for any topic.`;
   }
 
   if (/\b(schedule|calendar|day look|agenda|meetings|what('s| is) on today)\b/.test(m)) {
     const today = dayKey(Date.now(), tz);
     const events = (db.events || []).filter(e => dayKey(e.start, tz) === today).sort((a, b) => a.start - b.start);
-    if (!events.length) return "You have no events scheduled for today. Clear calendar!";
+    if (!events.length) return "You have no events scheduled for today. Your calendar is clear!";
     return `**Today's Schedule (${today})**:\n` + events.map(e => `- ${timeStr(e.start, tz)}: ${e.title} (${e.source || 'calendar'})`).join('\n');
   }
 
   if (/\b(priorit|urgent|important|to do|tasks|focus)\b/.test(m)) {
     const items = (db.inbox || []).filter(i => !i.done).slice(0, 5);
-    if (!items.length) return "No urgent priority items flagged right now.";
+    if (!items.length) return "No urgent priorities right now. All tasks are clear!";
     return `**Top Priorities**:\n` + items.map(i => `- [${i.priority || 'medium'}] ${i.title}`).join('\n');
   }
 
@@ -224,31 +224,29 @@ async function offlineEngine(msg, context, engineStatus) {
     const bizEvents = (db.events || []).filter(e => e.context === 'business');
     const bizEmails = (db.emails || []).filter(e => e.context === 'business');
     const bizMsgs = (db.messages || []).filter(e => e.context === 'business');
-    return `**Business snapshot** 🏪\n\n*Upcoming business events*\n${bizEvents.map(e => `- ${dayKey(e.start, tz)} ${timeStr(e.start, tz)} — ${e.title}`).join('\n') || '- none' }\n\n*Business emails*\n${bizEmails.map(e => `- ${e.subject} — ${e.fromName}`).join('\n') || '- none'}\n\n*Business chats*\n${bizMsgs.map(x => `- [${x.channel}] ${x.from}: ${snippet(x.text, 80)}`).join('\n') || '- none'}`;
+    return `**Business snapshot** 🏪\n\n*Upcoming events*` + (bizEvents.map(e => `\n- ${e.title}`).join('') || '\n- None') + `\n\n*Emails*` + (bizEmails.map(e => `\n- ${e.subject}`).join('') || '\n- None');
   }
 
-  if (/\b(help|what can you do|capabilit)/.test(m)) {
-    return `I'm ARIA — your executive assistant. Things you can ask me:\n\n- **"Schedule meeting with Kamau tomorrow at 3pm"**\n- **"Add task: Review Q3 supplier prices"**\n- **"Draft email to user@domain.com saying hello"**\n- **"What does my day look like?"** — schedule across every calendar\n- **"What are my priorities?"** — ranked by urgency\n- **"How's my inbox?"** — unread, split day-job vs business\n- **"Remember that …"** — teach me something permanently\n- **"My name is …"** — I'll remember who you are\n- **"Read this website https://…"** — pull a page into the brain\n\nI reason over your real data.`;
-  }
-
-  // 1. Check local brain
-  let hits = brain.search(msg, 3);
-
-  // 2. If nothing found in local brain, search live internet
-  if (!hits.length && !/(hi|hello|hey|schedule|calendar|day look|priorit|inbox|email|emails|slack|whatsapp|business|help)/i.test(m)) {
-    try {
-      const newNotes = await websearch.searchAndIngest(msg, 2);
-      if (newNotes && newNotes.length) hits = brain.search(msg, 3);
-    } catch (_) {}
-  }
-
+  // 1. Check local second brain
+  const hits = brain.search(msg, 3);
   if (hits && hits.length) {
-    return `Here is what I found:
-
-` + hits.map(h => `- **${h.title}**: ${snippet(h.snippet, 180)}`).join('\n\n');
+    return `Here is what I found in your brain:\n\n` + hits.map(h => `- **${h.title}**: ${snippet(h.snippet, 180)}`).join('\n\n');
   }
 
-  return "I don't have enough context in my brain to answer that specifically. Teach me with **“remember that …”** or ask me to search the web!";
+  // 2. AUTOMATIC LIVE WEB SEARCH (If not in brain, automatically search internet)
+  try {
+    const webHits = await websearch.searchDuckDuckGo(msg);
+    if (webHits && webHits.length > 0) {
+      // Ingest top result into Supabase in background
+      weblearn.learnFromUrl(webHits[0].url).catch(() => {});
+      
+      let reply = `🌐 **Live Web Search:**\n\n`;
+      reply += webHits.slice(0, 3).map(h => `- **${h.title}**\n  ${h.snippet || 'Read full source online.'}\n  🔗 _${h.url}_`).join('\n\n');
+      return reply;
+    }
+  } catch (_) {}
+
+  return "I couldn't find information about that in your brain or on the web. You can teach me by saying **“remember that …”**!";
 }
 
 module.exports = { respond, offlineEngine };
