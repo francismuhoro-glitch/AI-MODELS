@@ -39,6 +39,7 @@ Install the app, then **Settings → Enable morning notifications**. At wake tim
 | **🧠 Second Brain** | An ever-evolving library. It **automatically captures** priority emails, important messages, every brief and a rolling day-log — then indexes everything (BM25) so you can ask *"what do I know about ___?"*. Capture anything manually too. |
 | **🎯 Action items** | Asks inside emails/messages ("by Friday", "please send", invoices…) become trackable tasks automatically. |
 | **🤖 Executive Assistant** | Chat that reasons over your **real** schedule, inbox, messages and brain. Ask for your day, priorities, business snapshot, or to draft email replies. |
+| **🤖 Agency Swarm** | ARIA becomes your **Executive Chief of Staff**: hand her a complex, multi-step mission and she decomposes it and delegates to background specialists — **ResearcherAgent** (second brain + web), **AnalystAgent** (priorities, inbox, financial records), **CopywriterAgent** (emails, proposals, daily summaries) — then signs off one executive report. Every step is replayed live in the UI. |
 | **🔌 Connectors** | Opt-in **demo mode** + real adapters: **Gmail/Google Calendar**, **Outlook**, **Slack** (works with a token today), **WhatsApp Business Cloud API** + a universal `/api/ingest` endpoint (iOS Shortcuts, Zapier, n8n…). |
 
 ## 🚀 Run it
@@ -55,7 +56,29 @@ First boot starts **empty**. To seed realistic **demo data** (every item clearly
 ARIA_DEMO=1 npm start
 ```
 
-You can also talk to ARIA by voice (Assistant → 🎤) in browsers with Web Speech API support (Chrome/Edge/Safari; needs HTTPS or localhost), and she reads her replies aloud.
+You can also talk to ARIA by voice (Assistant → 🎤, or Agency Swarm → 🎤) in browsers with Web Speech API support (Chrome/Edge/Safari; needs HTTPS or localhost), and she reads her replies aloud. The loop is fully two-way and synchronized: what you say lands in the input, is posted to `/api/assistant` (or `/api/agency/run` in the swarm), appended to the transcript, and read back with `speechSynthesis` — the mic is always released while ARIA talks, and the optional wake-word listener (`localStorage.aria.wake = '1'`) re-arms only once she is idle.
+
+### 🤖 Agency Swarm — delegate a whole mission
+
+Open **🤖 Agency Swarm** in the sidebar (or the card on the Hub) and hand over something big:
+
+> *"Analyze all supplier notes and draft an executive briefing"*
+
+ARIA (DirectorAgent) splits it into sub-tasks, delegates them, and you watch each agent work in the live execution panel before the final report lands. Tick agents in the roster to force a squad, or leave them unticked and ARIA auto-delegates. Run agents one after another (`sequential`) or in concurrent waves (`parallel`).
+
+```bash
+curl -X POST http://localhost:3000/api/agency/run -H 'Content-Type: application/json' \
+  -d '{"task":"Analyze all supplier notes and draft an executive briefing","mode":"parallel"}'
+# → { "finalOutput": "## 🤖 Agency mission report …",
+#     "agentTrace": [ { "agent": "DirectorAgent", "action": "…", "result": "…" }, … ] }
+```
+
+| Endpoint | What it does |
+|---|---|
+| `GET /api/agency/agents` | The swarm roster (id, name, role, skills). |
+| `POST /api/agency/plan` | `{ task, agents? }` → the delegation plan, without executing it. |
+| `POST /api/agency/run` | `{ task, agents?, mode? }` → `{ finalOutput, agentTrace: [{ agent, action, result }] }`. |
+| `GET /api/agency/runs` | Recent missions (also written into the second brain). |
 
 Teach ARIA by talking: **“remember that …”**, **“my name is …”**, **“read this website https://…”** — or paste any URL into **Second Brain → Learn from a website** and she'll read it into her brain.
 
@@ -104,6 +127,8 @@ server/
   brief.js        morning brief composer (weather via open-meteo, fail-safe)
   brain.js        second brain: auto-capture, topics, tasks, BM25 search
   assistant.js    executive assistant (Ollama or offline engine)
+  agency.js       Agency Swarm orchestrator (sequential / parallel waves, run history)
+  agents/         director · researcher · analyst · copywriter (zero-dependency agents)
   llm.js          local-LLM adapter
   email.js        SMTP brief delivery
   db.js           tiny JSON persistence (data/state.json)

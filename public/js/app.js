@@ -217,7 +217,23 @@ const Speech = {
     return location.protocol === 'https:' || location.hostname === 'localhost' ||
       location.hostname === '127.0.0.1' || location.hostname === '[::1]' || location.hostname === '::1';
   },
-  tts() { return 'speechSynthesis' in window; },
+  tts() { return !!(window.speechSynthesis && window.SpeechSynthesisUtterance); },
+
+  /* The two-way loop is view-agnostic: whichever view is mounted exposes ONE mic button
+     (#asst-mic) and ONE text field ([data-voice-input]). Both the Assistant and the Agency
+     Swarm therefore share the exact same speak → listen → send → speak cycle.
+     #chat-mic / #chat-in stay supported so an older cached shell keeps working. */
+  micEl() { return $('#asst-mic') || $('#chat-mic'); },
+  inputEl() { return $('[data-voice-input]') || $('#chat-in') || $('#agency-task'); },
+
+  /* Broadcast every state change so the wake-word listener can hand the microphone over
+     cleanly instead of fighting speechSynthesis for the device. */
+  emit(name, detail) {
+    try { window.dispatchEvent(new CustomEvent(name, { detail: detail || {} })); } catch (_) {}
+  },
+
+  /* True while ARIA is talking OR listening — the wake listener must stay off. */
+  busy() { return !!(this.listening || this._speaking || (this.tts() && window.speechSynthesis.speaking)); },
 
   pickVoice(list) {
     const en = (list || []).filter(v => /^en/i.test(v.lang || ''));
@@ -270,7 +286,7 @@ const Speech = {
         interim += res[0].transcript;
       }
       this.interim = interim;
-      const input = $('#chat-in');
+      const input = this.inputEl();
       if (input && this.listening) input.value = interim;   // live interim transcript
     };
     r.onerror = (e) => this.onRecError(e);
@@ -307,12 +323,15 @@ const Speech = {
     }
   },
 
-  /* Final transcript → drop it in the input and go through the SAME send path as typing. */
+  /* Final transcript → drop it in the active input and go through the SAME send path as
+     typing: the message is posted (to /api/assistant or /api/agency/run, depending on the
+     mounted view), appended to the transcript, and the reply is read back aloud. */
   finalize(text) {
     if (!text) return;
-    const input = $('#chat-in');
-    if (input) { input.value = text; input.focus(); }
-    if (this._send) this._send();
+    const input = this.inputEl();
+    if (input) { input.value = text; try { input.focus(); } catch (_) {} }
+    this.emit('asst-transcript', { text });
+    if (this._send) this._send(text);
     else toast('Send is not ready yet — tap the mic again.');
   },
 
@@ -328,6 +347,7 @@ const Speech = {
       this.prime();       // iOS: unlock speechSynthesis inside this user gesture
       this.rec.start();
       this.listening = true;
+      this.emit('asst-mic-start');
     } catch (e) {
       this.listening = false;
       toast('🎤 Could not start the microphone — ' + (e.message || 'unknown error'));
@@ -339,9 +359,11 @@ const Speech = {
     if (this.rec) { try { this.rec.stop(); } catch (_) {} }
     this.listening = false;
     this.render();
+    this.emit('asst-mic-done');
   },
 
   cancelSpeak() {
+    const was = this._speaking;
     this._speaking = false;
     try {
       if (this.tts()) {
@@ -349,25 +371,47 @@ const Speech = {
         window.speechSynthesis.cancel();
       }
     } catch (_) {}
+    this.render();
+    if (was) this.emit('asst-speak-done', { cancelled: true });
   },
 
   /* Speak ARIA's reply aloud. Respects the Sound.on mute toggle + the voice preference;
      strips markdown first so it does not read asterisks and hashes out loud. */
   speak(text) {
-    if (!Sound.on || !this.on || !this.tts()) return Promise.resolve(false);
+    const body = stripMd(text);
+    if (!Sound.on || !this.on || !this.tts() || !body) {
+      /* Silent path still closes the loop so hands-free conversation never stalls. */
+      this.emit('asst-speak-done', { spoken: false });
+      return Promise.resolve(false);
+    }
+    /* Never talk over the microphone: release it first, speak, then hand it back. */
+    if (this.listening) { this._suppressRestart = true; this.stopMic(); }
     return new Promise((res) => {
+      let settled = false;
+      const done = (spoken) => {
+        if (settled) return;
+        settled = true;
+        this._speaking = false;
+        this._utterance = null;
+        this.render();
+        res(spoken);
+        this.emit('asst-speak-done', { spoken });
+        this.afterSpeak();
+      };
       try {
         const synth = window.speechSynthesis;
         synth.cancel();
-        const u = new SpeechSynthesisUtterance(stripMd(text));
+        const u = new SpeechSynthesisUtterance(body);
         if (this._voice) { u.voice = this._voice; u.lang = this._voice.lang; }
         u.rate = 1; u.pitch = 1; u.volume = 1;
-        u.onend = () => { this._speaking = false; res(true); this.afterSpeak(); };
-        u.onerror = () => { this._speaking = false; res(false); this.afterSpeak(); };
+        u.onend = () => done(true);
+        u.onerror = () => done(false);
         this._utterance = u;
         this._speaking = true;
+        this.emit('asst-speak-start', { text: body });
+        this.render();
         synth.speak(u);
-      } catch (_) { res(false); }
+      } catch (_) { done(false); }
     });
   },
 
@@ -387,7 +431,7 @@ const Speech = {
   },
 
   render() {
-    const mic = $('#chat-mic');
+    const mic = this.micEl();
     if (mic) {
       mic.hidden = !this.supported();
       mic.classList.toggle('listening', this.listening);
@@ -396,7 +440,10 @@ const Speech = {
       mic.setAttribute('aria-pressed', this.listening ? 'true' : 'false');
     }
     const st = $('#mic-status');
-    if (st) { st.textContent = this.listening ? '🎙️ listening… speak now' : ''; st.classList.toggle('live', this.listening); }
+    if (st) {
+      st.textContent = this.listening ? '🎙️ listening… speak now' : this._speaking ? '🔊 ARIA is speaking…' : '';
+      st.classList.toggle('live', this.listening || this._speaking);
+    }
     const v = $('#btn-voice');
     if (v) {
       v.textContent = this.on ? '🔊 Voice replies: on' : '🔇 Voice replies: off';
@@ -490,8 +537,9 @@ const EMPTY_STATE = {
   engine: { activeEngine: 'offline' }, llm: { activeEngine: 'offline' }, activeEngine: 'offline',
   unread: 0, events: [], allEvents: [], emails: [], inbox: [], tasks: [], messages: [],
   notes: [], chats: [], briefs: [], brief: null,
-  stats: { engine: 'offline', lastSync: null, notes: 0, briefs: 0, emails: 0, messages: 0, events: 0, tasks: 0 },
-  counts: { events: 0, emails: 0, inbox: 0, notes: 0, messages: 0 }
+  agencyRuns: [], agents: [],
+  stats: { engine: 'offline', lastSync: null, notes: 0, briefs: 0, emails: 0, messages: 0, events: 0, tasks: 0, agencyRuns: 0 },
+  counts: { events: 0, emails: 0, inbox: 0, notes: 0, messages: 0, agencyRuns: 0 }
 };
 
 function normalizeState(raw) {
@@ -514,6 +562,7 @@ function normalizeState(raw) {
     inbox: A(s.inbox).length ? A(s.inbox) : emails,
     tasks,
     messages: A(s.messages), notes: A(s.notes), chats: A(s.chats), briefs: A(s.briefs),
+    agencyRuns: A(s.agencyRuns), agents: A(s.agents),
     brief: s.brief || A(s.briefs)[0] || null,
     unread: typeof s.unread === 'number' ? s.unread : emails.filter(e => !e.read).length,
     stats: { ...EMPTY_STATE.stats, ...(s.stats || {}), engine: (s.stats && s.stats.engine) || engine.activeEngine || 'offline' },
@@ -573,7 +622,7 @@ function updateSidebar() {
 }
 
 /* ---------------- router ---------------- */
-const routes = { hub: viewHub, briefs: viewBriefs, calendar: viewCalendar, inbox: viewInbox, messages: viewMessages, brain: viewBrain, assistant: viewAssistant, settings: viewSettings };
+const routes = { hub: viewHub, briefs: viewBriefs, calendar: viewCalendar, inbox: viewInbox, messages: viewMessages, brain: viewBrain, assistant: viewAssistant, agency: viewAgency, settings: viewSettings };
 let assistantInit = false;
 
 window.addEventListener('hashchange', route);
@@ -640,6 +689,17 @@ async function viewHub(main) {
       <div class="card"><h3>Latest messages <span class="right"><a href="#/messages" style="color:var(--accent);text-decoration:none">open messages →</a></span></h3>
         ${A(s.messages).slice(0, 7).map(msgRow).join('') || '<div class="empty">No messages.</div>'}
       </div>
+    </div>
+
+    <div class="card agency-hub" style="margin-top:16px">
+      <h3>🤖 Agency Swarm <span class="right"><a href="#/agency" style="color:var(--accent);text-decoration:none">open the swarm →</a></span></h3>
+      <div class="sub" style="color:var(--dim);font-size:12.5px;margin:-4px 0 10px">Hand ARIA a complex mission — she decomposes it and delegates to the Researcher, Analyst and Copywriter agents.</div>
+      <div class="agency-actions">
+        <input id="hub-mission" class="agency-input" placeholder="Analyze all supplier notes and draft an executive briefing" autocomplete="off">
+        <button class="btn primary" id="hub-mission-run">▶ Delegate</button>
+      </div>
+      <div class="suggests" style="margin-top:10px">${['Analyze all supplier notes and draft an executive briefing', 'Scan my inbox and priorities, then write my daily summary'].map(x => `<button class="btn" data-mission="${esc(x)}">${esc(x)}</button>`).join('')}</div>
+      <div style="margin-top:10px;color:var(--faint);font-size:11.5px">${s.stats.agencyRuns || 0} mission${(s.stats.agencyRuns || 0) === 1 ? '' : 's'} run so far</div>
     </div>`;
 
   renderBriefCard(s.brief);
@@ -651,6 +711,16 @@ async function viewHub(main) {
   $('#btn-sync').onclick = async (e) => { e.target.disabled = true; e.target.textContent = '↻ syncing…'; await POST('/api/sync'); await route(); toast('Connectors synced'); Sound.pop(); };
   $('#btn-brief').onclick = async (e) => { e.target.disabled = true; e.target.textContent = '✦ composing…'; const b = await POST('/api/brief/generate'); await refreshState(); renderBriefCard(STATE.brief); e.target.disabled = false; e.target.textContent = '✦ Generate brief'; toast(b.meta ? `Brief ready — ${b.meta.hot} urgent items flagged` : 'Brief ready'); if (b.meta && b.meta.hot > 0) Sound.priorityAlert(); };
   bindTaskToggles('#hub-tasks');
+  /* Hub → Agency hand-off: stash the mission and let the swarm view run it on arrival. */
+  const launchMission = (text) => {
+    const t = String(text || '').trim();
+    if (!t) { toast('Type the mission you want the swarm to run.'); return; }
+    try { sessionStorage.setItem('aria.agency.task', t); } catch (_) {}
+    location.hash = '#/agency';
+  };
+  $('#hub-mission-run').onclick = () => launchMission($('#hub-mission').value);
+  $('#hub-mission').onkeydown = (e) => { if (e.key === 'Enter') launchMission($('#hub-mission').value); };
+  $$('.agency-hub .suggests .btn', main).forEach(b => b.onclick = () => launchMission(b.dataset.mission));
   $$('.row[data-email]', main).forEach(r => r.onclick = () => openEmail(r.dataset.email));
 }
 
@@ -875,13 +945,16 @@ async function viewAssistant(main) {
   const ai = (await api('/api/ai/status')) || { activeEngine: 'offline' };
   const hasMic = Speech.supported(), isSecure = Speech.secure();
   main.innerHTML = `<div class="view-head"><div><h1>Executive Assistant</h1><div class="sub">Reasons over your real calendar, inbox, messages & brain</div></div>
-    <span class="chip ${ai.activeEngine === 'ollama' ? 'green' : 'yellow'}">${ai.activeEngine === 'ollama' ? `🟢 local LLM · ${esc(ai.model || '')}` : '🟡 built-in offline engine'}</span></div>
+    <span style="display:flex;gap:9px;align-items:center">
+      <span class="chip ${ai.activeEngine === 'ollama' ? 'green' : 'yellow'}">${ai.activeEngine === 'ollama' ? `🟢 local LLM · ${esc(ai.model || '')}` : '🟡 built-in offline engine'}</span>
+      <button class="btn" id="btn-open-agency" title="Hand a complex, multi-step mission to the agent swarm">🤖 Agency Swarm</button>
+    </span></div>
     <div class="card chat-wrap">
       <div class="chat-scroll" id="chat-scroll">
         ${history.length ? history.map(chatMsg).join('') : welcomeMsg(ai)}
       </div>
       <div class="suggests">${['What does my day look like?', 'What are my priorities?', 'How is my inbox?', 'Business snapshot', 'What do you know about suppliers?'].map(s => `<button class="btn" data-s="${esc(s)}">${esc(s)}</button>`).join('')}</div>
-      <div class="chat-input"><input id="chat-in" placeholder="Ask ARIA anything about your day, work or business…" autocomplete="off"><button class="btn mic-btn" id="chat-mic" ${hasMic ? '' : 'hidden'} title="Talk to ARIA with your voice">🎤</button><button class="btn primary" id="chat-send">Send ⏎</button></div>
+      <div class="chat-input"><input id="chat-in" data-voice-input placeholder="Ask ARIA anything about your day, work or business…" autocomplete="off"><button class="btn mic-btn" id="asst-mic" ${hasMic ? '' : 'hidden'} title="Talk to ARIA with your voice" aria-label="Talk to ARIA with your voice">🎤</button><button class="btn primary" id="chat-send">Send ⏎</button></div>
       <div class="voice-bar">
         <button class="btn small" id="btn-voice"></button>
         <button class="btn small" id="btn-convo"></button>
@@ -908,16 +981,17 @@ async function viewAssistant(main) {
     }
     scroll.scrollTop = scroll.scrollHeight;
   };
+  $('#btn-open-agency').onclick = () => { location.hash = '#/agency'; };
   Speech.setSend(send);
   Speech.render();
   /* Prime speechSynthesis on the FIRST tap in this view — iOS Safari only speaks after
      a user gesture, so without this the first reply would be silent. */
   main.addEventListener('click', () => Speech.prime(), { once: true });
   $('#chat-send').onclick = () => { Speech.prime(); send(); };
-  $('#chat-mic').onclick = () => {
+  $('#asst-mic').onclick = () => {
     Speech.prime();
     if (Speech.listening) { Speech._suppressRestart = true; Speech.stopMic(); }
-    else Speech.startMic();
+    else { Speech.cancelSpeak(); Speech.startMic(); }   // tapping the mic always interrupts ARIA
   };
   $('#chat-in').onkeydown = (e) => { if (e.key === 'Enter') { Speech.prime(); send(); } };
   $('#btn-voice').onclick = () => {
@@ -936,6 +1010,228 @@ async function viewAssistant(main) {
     toast(Speech.convo ? 'Conversation mode on — ARIA listens again after each reply. Toggle it off (or tap the mic) to stop.' : 'Conversation mode off');
   };
   $$('.suggests .btn', main).forEach(b => b.onclick = () => { $('#chat-in').value = b.dataset.s; Speech.prime(); send(); });
+}
+
+/* ===== AGENCY SWARM (multi-agent) =====
+   ARIA is the Executive Chief of Staff: you hand over a mission, she decomposes it,
+   delegates to the background specialists and returns one signed-off executive output.
+   The panel replays the swarm step by step so you can see WHO worked and WHAT they produced.
+   The same voice loop as the Assistant is wired here: #asst-mic → mission → /api/agency/run
+   → transcript → speechSynthesis reads the executive summary back. */
+const AGENCY_EXAMPLES = [
+  'Analyze all supplier notes and draft an executive briefing',
+  'Scan my inbox and priorities, then write my daily summary',
+  'Research what we know about pricing and draft a customer proposal',
+  'Review the financial records and list the risks'
+];
+
+let AGENCY_BUSY = false;
+
+function agencyStepRow(step, state) {
+  const st = state || 'queued';
+  const chip = st === 'done' ? 'green' : st === 'working' ? 'yellow' : st === 'failed' ? 'red' : '';
+  const label = st === 'done' ? 'done' : st === 'working' ? 'working…' : st === 'failed' ? 'failed' : 'queued';
+  return `<div class="agent-step ${st}" data-step="${esc(step.key)}">
+    <div class="as-head">
+      <span class="as-emoji">${esc(step.emoji || '🤖')}</span>
+      <strong>${esc(step.agent)}</strong>
+      <span class="chip ${chip}">${label}</span>
+      <span class="as-ms">${step.ms != null ? esc(step.ms + ' ms') : ''}</span>
+    </div>
+    <div class="as-action">${esc(step.action || '')}</div>
+    ${step.result ? `<div class="as-result md">${md(step.result)}</div>` : ''}
+  </div>`;
+}
+
+/* Pull the executive paragraph out of the report — that is what ARIA reads aloud. */
+function agencySpokenSummary(markdown) {
+  const m = String(markdown || '').match(/###\s*Executive summary\s*\n([\s\S]*?)(?:\n###|$)/i);
+  const body = (m ? m[1] : String(markdown || '')).trim();
+  return stripMd(body).split('\n').filter(Boolean).slice(0, 3).join(' ').slice(0, 700);
+}
+
+async function viewAgency(main) {
+  const [roster, runs] = await Promise.all([
+    api('/api/agency/agents').catch(() => []),
+    api('/api/agency/runs').catch(() => [])
+  ]);
+  const agents = A(roster);
+  const specialists = agents.filter(a => a.id !== 'director');
+  const director = agents.find(a => a.id === 'director') || { name: 'DirectorAgent', emoji: '🎩', role: 'Executive Chief of Staff (ARIA)' };
+  const hasMic = Speech.supported();
+
+  main.innerHTML = `<div class="view-head">
+      <div><h1>🤖 Agency Swarm</h1><div class="sub">${esc(director.emoji)} ${esc(director.name)} — ${esc(director.role)} — delegates your mission to ${specialists.length} specialist agents</div></div>
+      <span class="head-actions">
+        <button class="btn js-sound" title="Toggle sound">🔊</button>
+        <button class="btn" onclick="location.hash='#/assistant'">💬 Assistant</button>
+      </span>
+    </div>
+
+    <div class="grid c3">
+      <div style="display:flex;flex-direction:column;gap:16px">
+        <div class="card">
+          <h3>Mission <span class="right" id="agency-status">idle</span></h3>
+          <textarea id="agency-task" data-voice-input class="agency-input" rows="3" placeholder="e.g. Analyze all supplier notes and draft an executive briefing"></textarea>
+          <div class="agency-actions">
+            <button class="btn mic-btn" id="asst-mic" ${hasMic ? '' : 'hidden'} title="Dictate the mission" aria-label="Dictate the mission">🎤</button>
+            <label class="agency-mode">mode
+              <select id="agency-mode">
+                <option value="sequential">sequential</option>
+                <option value="parallel">parallel</option>
+              </select>
+            </label>
+            <span class="mic-status" id="mic-status"></span>
+            <button class="btn primary" id="agency-run">▶ Run mission</button>
+          </div>
+          <div class="suggests">${AGENCY_EXAMPLES.map(x => `<button class="btn" data-mission="${esc(x)}">${esc(x)}</button>`).join('')}</div>
+        </div>
+
+        <div class="card">
+          <h3>Live execution <span class="right" id="agency-meta"></span></h3>
+          <div id="agency-trace"><div class="empty">No mission running. Describe one above — ARIA decomposes it and delegates.</div></div>
+        </div>
+
+        <div class="card" id="agency-output-card" hidden>
+          <h3>Final output <span class="right"><button class="btn small" id="agency-speak">🔊 read aloud</button></span></h3>
+          <div class="md" id="agency-output"></div>
+        </div>
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:16px">
+        <div class="card">
+          <h3>Swarm roster <span class="right">${specialists.length} delegatable</span></h3>
+          <div class="agent-card director">
+            <div class="ac-head"><span class="as-emoji">${esc(director.emoji)}</span><strong>${esc(director.name)}</strong><span class="chip purple">always on</span></div>
+            <div class="ac-desc">${esc(director.description || director.role)}</div>
+          </div>
+          ${specialists.map(a => `<label class="agent-card">
+            <div class="ac-head"><span class="as-emoji">${esc(a.emoji)}</span><strong>${esc(a.name)}</strong>
+              <input type="checkbox" class="agency-pick" data-agent="${esc(a.id)}" title="Force this agent into the squad"></div>
+            <div class="ac-desc">${esc(a.description)}</div>
+            <div class="ac-skills">${A(a.skills).map(sk => `<span class="chip">${esc(sk)}</span>`).join('')}</div>
+          </label>`).join('')}
+          <p class="ac-hint">Leave every box unticked and ARIA auto-delegates based on the mission.</p>
+        </div>
+
+        <div class="card">
+          <h3>Recent missions <span class="right">${A(runs).length}</span></h3>
+          <div id="agency-runs">${A(runs).length ? A(runs).slice(0, 8).map(r => `<div class="row" data-run="${esc(r.id)}">
+            <div class="r-main"><div class="r-title">${esc(r.task)}</div>
+            <div class="r-sub">${A(r.agents).map(x => `<span class="chip">${esc(x)}</span>`).join(' ')} · ${esc(r.mode || 'sequential')} · ${r.durationMs != null ? esc(r.durationMs + ' ms') : ''}</div></div>
+            <div class="r-time">${r.startedAt ? esc(fmtAgo(r.startedAt)) : ''}</div></div>`).join('') : '<div class="empty">No missions yet.</div>'}</div>
+        </div>
+      </div>
+    </div>`;
+
+  const taskEl = $('#agency-task');
+  const statusEl = $('#agency-status');
+  const traceEl = $('#agency-trace');
+  const metaEl = $('#agency-meta');
+  const outCard = $('#agency-output-card');
+  const outEl = $('#agency-output');
+  const runBtn = $('#agency-run');
+  let lastOutput = '';
+
+  const pickedAgents = () => $$('.agency-pick').filter(c => c.checked).map(c => c.dataset.agent);
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+  async function runMission(spokenText) {
+    if (AGENCY_BUSY) { toast('The swarm is still working on the previous mission…'); return; }
+    const task = String(spokenText || taskEl.value || '').trim();
+    if (!task) { toast('Describe the mission first — e.g. “Analyze all supplier notes and draft an executive briefing”.'); return; }
+    taskEl.value = task;
+    AGENCY_BUSY = true;
+    runBtn.disabled = true; runBtn.textContent = '◌ swarm working…';
+    statusEl.textContent = 'planning…';
+    outCard.hidden = true;
+    Sound.pop();
+
+    /* 1. Ask ARIA for the delegation plan so the queue is on screen before work starts. */
+    let plan = null;
+    try { plan = await POST('/api/agency/plan', { task, agents: pickedAgents() }); } catch (_) { plan = null; }
+    const queue = [{ key: 'director-plan', agent: 'DirectorAgent', emoji: '🎩', action: 'Parse the mission and delegate' }]
+      .concat(A(plan && plan.assignments).map(a => ({ key: a.id, agent: a.name, emoji: a.emoji, action: a.action })))
+      .concat([{ key: 'director-final', agent: 'DirectorAgent', emoji: '🎩', action: 'Synthesise the executive output' }]);
+    traceEl.innerHTML = queue.map((q, i) => agencyStepRow(q, i === 0 ? 'working' : 'queued')).join('');
+    metaEl.textContent = `${queue.length} steps · ${$('#agency-mode').value}`;
+    statusEl.textContent = 'swarm working…';
+
+    /* 2. Execute, then replay the real trace step by step. */
+    try {
+      const res = await POST('/api/agency/run', { task, agents: pickedAgents(), mode: $('#agency-mode').value });
+      const trace = A(res.agentTrace);
+      for (let i = 0; i < trace.length; i++) {
+        const t = trace[i];
+        const rows = $$('.agent-step', traceEl);
+        const html = agencyStepRow({ key: t.agentId + '-' + i, agent: t.agent, emoji: t.emoji, action: t.action, result: t.result, ms: t.ms }, t.ok === false ? 'failed' : 'done');
+        if (rows[i]) rows[i].outerHTML = html; else traceEl.insertAdjacentHTML('beforeend', html);
+        const next = $$('.agent-step', traceEl)[i + 1];
+        if (next && i + 1 < trace.length) next.className = 'agent-step working';
+        traceEl.scrollTop = traceEl.scrollHeight;
+        await sleep(160);
+      }
+      $$('.agent-step.queued, .agent-step.working', traceEl).forEach(r => r.remove());
+      lastOutput = res.finalOutput || '';
+      outEl.innerHTML = md(lastOutput);
+      outCard.hidden = false;
+      metaEl.textContent = `${trace.length} steps · ${res.mode || 'sequential'} · ${res.durationMs != null ? res.durationMs + ' ms' : ''}`;
+      statusEl.textContent = 'mission complete';
+      toast(`🤖 Mission complete — ${trace.length} agent steps`);
+      Sound.chirp();
+      /* Voice loop: read the executive summary back, exactly like the Assistant does. */
+      Speech.speak(agencySpokenSummary(lastOutput));
+      api('/api/agency/runs').then((rs) => {
+        const box = $('#agency-runs');
+        if (!box) return;
+        box.innerHTML = A(rs).slice(0, 8).map(r => `<div class="row" data-run="${esc(r.id)}">
+          <div class="r-main"><div class="r-title">${esc(r.task)}</div>
+          <div class="r-sub">${A(r.agents).map(x => `<span class="chip">${esc(x)}</span>`).join(' ')} · ${esc(r.mode || 'sequential')} · ${r.durationMs != null ? esc(r.durationMs + ' ms') : ''}</div></div>
+          <div class="r-time">${r.startedAt ? esc(fmtAgo(r.startedAt)) : ''}</div></div>`).join('');
+        bindRunRows();
+      }).catch(() => {});
+    } catch (e) {
+      statusEl.textContent = 'failed';
+      traceEl.insertAdjacentHTML('beforeend', `<div class="agent-step failed"><div class="as-head"><span class="as-emoji">🎩</span><strong>DirectorAgent</strong><span class="chip red">failed</span></div><div class="as-action">${esc(e.message)}</div></div>`);
+      toast('Agency run failed — ' + e.message);
+    } finally {
+      AGENCY_BUSY = false;
+      runBtn.disabled = false; runBtn.textContent = '▶ Run mission';
+    }
+  }
+
+  function bindRunRows() {
+    $$('#agency-runs .row').forEach(row => row.onclick = async () => {
+      try {
+        const r = await api('/api/agency/runs/' + encodeURIComponent(row.dataset.run));
+        openModal(`<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:8px">
+          <h2 style="font-size:17px;line-height:1.35">🤖 ${esc(r.task)}</h2>
+          <button class="btn small" onclick="closeModal()">✕</button></div>
+          <div style="color:var(--dim);font-size:12.5px;margin-bottom:12px">${A(r.agents).map(x => `<span class="chip">${esc(x)}</span>`).join(' ')} · ${esc(r.mode || 'sequential')} · ${r.durationMs != null ? esc(r.durationMs + ' ms') : ''}</div>
+          <div class="md">${md(r.finalOutput || '')}</div>`);
+      } catch (_) { toast('Could not load that mission'); }
+    });
+  }
+
+  runBtn.onclick = () => { Speech.prime(); runMission(); };
+  taskEl.onkeydown = (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { Speech.prime(); runMission(); } };
+  $$('.suggests .btn', main).forEach(b => b.onclick = () => { taskEl.value = b.dataset.mission; Speech.prime(); runMission(); });
+  $('#agency-speak').onclick = () => { Speech.prime(); Speech.speak(agencySpokenSummary(lastOutput)); };
+  $('#asst-mic').onclick = () => {
+    Speech.prime();
+    if (Speech.listening) { Speech._suppressRestart = true; Speech.stopMic(); }
+    else { Speech.cancelSpeak(); Speech.startMic(); }
+  };
+  bindRunRows();
+  /* Dictated mission → same path as the typed one (two-way voice loop on /api/agency/run). */
+  Speech.setSend((text) => runMission(text));
+  Speech.render();
+  main.addEventListener('click', () => Speech.prime(), { once: true });
+
+  /* A mission handed over from the Hub card runs immediately. */
+  let pending = null;
+  try { pending = sessionStorage.getItem('aria.agency.task'); sessionStorage.removeItem('aria.agency.task'); } catch (_) {}
+  if (pending) { taskEl.value = pending; runMission(pending); }
 }
 
 function chatMsg(c) {
@@ -1124,7 +1420,8 @@ const WakeWord = {
   handingOver: false,
 
   supported() { return !!(window.SpeechRecognition || window.webkitSpeechRecognition); },
-  busy() { return !!(Speech && (Speech.listening || Speech._speaking)); },
+  /* Busy = the assistant mic holds the device OR speechSynthesis is talking. */
+  busy() { return !!(Speech && Speech.busy && Speech.busy()); },
 
   enabled() {
     try { return localStorage.getItem('aria.wake') === '1'; } catch (_) { return false; }
@@ -1187,7 +1484,7 @@ const WakeWord = {
     toast('🎙️ ARIA activated');
     if (location.hash !== '#/assistant') location.hash = '#/assistant';
     setTimeout(() => {
-      const mic = $('#chat-mic');
+      const mic = Speech.micEl();
       if (mic) mic.click(); else Speech.startMic();
       this.handingOver = false;
     }, 400);
@@ -1219,8 +1516,13 @@ const WakeWord = {
   Speech.leave = function () { const out = origLeave(); WakeWord.rearm(); return out; };
 })();
 
+/* Two-way loop bookkeeping: the wake listener stays off while ARIA listens OR speaks, and
+   re-arms the moment both are idle — that is what keeps #asst-mic and speechSynthesis in sync. */
 window.addEventListener('asst-mic-done', () => WakeWord.rearm());
+window.addEventListener('asst-speak-start', () => WakeWord.release());
+window.addEventListener('asst-speak-done', () => WakeWord.rearm());
 window.AriaWakeWord = WakeWord;
+window.AriaSpeech = Speech;
 
 /* Opt-in only (localStorage aria.wake = '1'). Enabling it unprompted would hold the
    microphone permanently and lock out the assistant mic button. */

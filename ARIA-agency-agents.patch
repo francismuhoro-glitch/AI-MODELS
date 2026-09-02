@@ -1,0 +1,1877 @@
+diff --git a/README.md b/README.md
+index 6a3cbca..d75affc 100644
+--- a/README.md
++++ b/README.md
+@@ -39,6 +39,7 @@ Install the app, then **Settings → Enable morning notifications**. At wake tim
+ | **🧠 Second Brain** | An ever-evolving library. It **automatically captures** priority emails, important messages, every brief and a rolling day-log — then indexes everything (BM25) so you can ask *"what do I know about ___?"*. Capture anything manually too. |
+ | **🎯 Action items** | Asks inside emails/messages ("by Friday", "please send", invoices…) become trackable tasks automatically. |
+ | **🤖 Executive Assistant** | Chat that reasons over your **real** schedule, inbox, messages and brain. Ask for your day, priorities, business snapshot, or to draft email replies. |
++| **🤖 Agency Swarm** | ARIA becomes your **Executive Chief of Staff**: hand her a complex, multi-step mission and she decomposes it and delegates to background specialists — **ResearcherAgent** (second brain + web), **AnalystAgent** (priorities, inbox, financial records), **CopywriterAgent** (emails, proposals, daily summaries) — then signs off one executive report. Every step is replayed live in the UI. |
+ | **🔌 Connectors** | Opt-in **demo mode** + real adapters: **Gmail/Google Calendar**, **Outlook**, **Slack** (works with a token today), **WhatsApp Business Cloud API** + a universal `/api/ingest` endpoint (iOS Shortcuts, Zapier, n8n…). |
+ 
+ ## 🚀 Run it
+@@ -55,7 +56,29 @@ First boot starts **empty**. To seed realistic **demo data** (every item clearly
+ ARIA_DEMO=1 npm start
+ ```
+ 
+-You can also talk to ARIA by voice (Assistant → 🎤) in browsers with Web Speech API support (Chrome/Edge/Safari; needs HTTPS or localhost), and she reads her replies aloud.
++You can also talk to ARIA by voice (Assistant → 🎤, or Agency Swarm → 🎤) in browsers with Web Speech API support (Chrome/Edge/Safari; needs HTTPS or localhost), and she reads her replies aloud. The loop is fully two-way and synchronized: what you say lands in the input, is posted to `/api/assistant` (or `/api/agency/run` in the swarm), appended to the transcript, and read back with `speechSynthesis` — the mic is always released while ARIA talks, and the optional wake-word listener (`localStorage.aria.wake = '1'`) re-arms only once she is idle.
++
++### 🤖 Agency Swarm — delegate a whole mission
++
++Open **🤖 Agency Swarm** in the sidebar (or the card on the Hub) and hand over something big:
++
++> *"Analyze all supplier notes and draft an executive briefing"*
++
++ARIA (DirectorAgent) splits it into sub-tasks, delegates them, and you watch each agent work in the live execution panel before the final report lands. Tick agents in the roster to force a squad, or leave them unticked and ARIA auto-delegates. Run agents one after another (`sequential`) or in concurrent waves (`parallel`).
++
++```bash
++curl -X POST http://localhost:3000/api/agency/run -H 'Content-Type: application/json' \
++  -d '{"task":"Analyze all supplier notes and draft an executive briefing","mode":"parallel"}'
++# → { "finalOutput": "## 🤖 Agency mission report …",
++#     "agentTrace": [ { "agent": "DirectorAgent", "action": "…", "result": "…" }, … ] }
++```
++
++| Endpoint | What it does |
++|---|---|
++| `GET /api/agency/agents` | The swarm roster (id, name, role, skills). |
++| `POST /api/agency/plan` | `{ task, agents? }` → the delegation plan, without executing it. |
++| `POST /api/agency/run` | `{ task, agents?, mode? }` → `{ finalOutput, agentTrace: [{ agent, action, result }] }`. |
++| `GET /api/agency/runs` | Recent missions (also written into the second brain). |
+ 
+ Teach ARIA by talking: **“remember that …”**, **“my name is …”**, **“read this website https://…”** — or paste any URL into **Second Brain → Learn from a website** and she'll read it into her brain.
+ 
+@@ -104,6 +127,8 @@ server/
+   brief.js        morning brief composer (weather via open-meteo, fail-safe)
+   brain.js        second brain: auto-capture, topics, tasks, BM25 search
+   assistant.js    executive assistant (Ollama or offline engine)
++  agency.js       Agency Swarm orchestrator (sequential / parallel waves, run history)
++  agents/         director · researcher · analyst · copywriter (zero-dependency agents)
+   llm.js          local-LLM adapter
+   email.js        SMTP brief delivery
+   db.js           tiny JSON persistence (data/state.json)
+diff --git a/public/css/app.css b/public/css/app.css
+index 94e0726..19d4827 100644
+--- a/public/css/app.css
++++ b/public/css/app.css
+@@ -219,3 +219,34 @@ label.field { display: flex; flex-direction: column; gap: 5px; font-size: 12px;
+   .msg { max-width: 88%; }
+   .tabbar { display: flex; }
+ }
++
++/* ---------- Agency Swarm (multi-agent) ---------- */
++.agency-input { width: 100%; background: var(--bg2); border: 1px solid var(--border2); color: var(--text); border-radius: 10px; padding: 10px 12px; font: inherit; font-size: 13.5px; outline: none; resize: vertical; }
++.agency-input:focus { border-color: var(--accent); }
++.agency-actions { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-top: 10px; }
++.agency-actions .agency-input { flex: 1; min-width: 220px; margin-top: 0; }
++.agency-actions .btn.primary { margin-left: auto; }
++.agency-mode { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--dim); }
++.agency-mode select { background: var(--bg2); border: 1px solid var(--border2); color: var(--text); border-radius: 8px; padding: 6px 8px; font: inherit; font-size: 12px; }
++
++.agent-step { border: 1px solid var(--border); border-left: 3px solid var(--border2); border-radius: 11px; padding: 11px 13px; margin-bottom: 10px; background: rgba(255,255,255,.015); }
++.agent-step.queued { opacity: .55; }
++.agent-step.working { border-left-color: var(--yellow); animation: mic-pulse 1.4s ease-out infinite; }
++.agent-step.done { border-left-color: var(--green); }
++.agent-step.failed { border-left-color: var(--red); }
++.as-head { display: flex; align-items: center; gap: 8px; font-size: 13.5px; }
++.as-emoji { font-size: 15px; }
++.as-ms { margin-left: auto; font-family: var(--mono); font-size: 10.5px; color: var(--faint); }
++.as-action { color: var(--dim); font-size: 12.5px; margin-top: 4px; }
++.as-result { margin-top: 8px; font-size: 13px; border-top: 1px dashed var(--border); padding-top: 8px; max-height: 320px; overflow: auto; }
++.as-result p { margin: 4px 0; }
++
++.agent-card { display: block; border: 1px solid var(--border); border-radius: 11px; padding: 10px 12px; margin-bottom: 9px; cursor: pointer; }
++.agent-card:hover { border-color: var(--accent); }
++.agent-card.director { background: linear-gradient(90deg, rgba(124,91,255,.12), transparent); cursor: default; }
++.ac-head { display: flex; align-items: center; gap: 8px; font-size: 13.5px; }
++.ac-head input { margin-left: auto; accent-color: var(--accent); }
++.ac-desc { color: var(--dim); font-size: 12px; margin-top: 4px; }
++.ac-skills { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
++.ac-hint { color: var(--faint); font-size: 11.5px; margin-top: 6px; }
++.agency-hub .suggests { margin-top: 8px; }
+diff --git a/public/index.html b/public/index.html
+index 0b77f7b..515eb32 100644
+--- a/public/index.html
++++ b/public/index.html
+@@ -31,6 +31,7 @@
+       <a href="#/inbox" class="nav-item" data-view="inbox"><svg viewBox="0 0 24 24"><path d="M3 5a1 1 0 0 1 1-1h16a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1zm2 2v.4l8 5 8-5V7l-8 5z"/></svg>Inbox <span class="nav-badge" id="nav-unread" hidden></span></a>
+       <a href="#/messages" class="nav-item" data-view="messages"><svg viewBox="0 0 24 24"><path d="M12 3C6.9 3 3 6.4 3 10.6c0 2.4 1.3 4.6 3.4 6L5.5 21l4.4-2.3c.7.1 1.4.2 2.1.2 5.1 0 9-3.4 9-7.6S17.1 3 12 3z"/></svg>Messages</a>
+       <a href="#/brain" class="nav-item" data-view="brain"><svg viewBox="0 0 24 24"><path d="M12 2a4 4 0 0 0-4 4 4 4 0 0 0-3 6.6A4 4 0 0 0 8 20a4 4 0 0 0 8 0 4 4 0 0 0 3-7.4A4 4 0 0 0 16 6a4 4 0 0 0-4-4z"/></svg>Second Brain</a>
++      <a href="#/agency" class="nav-item" data-view="agency"><svg viewBox="0 0 24 24"><path d="M12 2a2 2 0 0 1 1 3.7V7h3a4 4 0 0 1 4 4v2h1a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-1a4 4 0 0 1-4 4H8a4 4 0 0 1-4-4H3a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1h1v-2a4 4 0 0 1 4-4h3V5.7A2 2 0 0 1 12 2zM9 12a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3zm6 0a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3z"/></svg>Agency Swarm</a>
+       <a href="#/assistant" class="nav-item" data-view="assistant"><svg viewBox="0 0 24 24"><path d="M12 2a2 2 0 0 1 2 2v1a7 7 0 0 1 5 5h1a2 2 0 0 1 2 2v2a2 2 0 0 1-2 2h-1a7 7 0 0 1-14 0H4a2 2 0 0 1-2-2v-2a2 2 0 0 1 2-2h1a7 7 0 0 1 5-5V4a2 2 0 0 1 2-2zm-2 9a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3zm4 0a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3z"/></svg>Assistant</a>
+     </nav>
+     <div class="sidebar-foot">
+@@ -51,6 +52,7 @@
+     <a href="#/briefs" data-view="briefs">☀️<span>Brief</span></a>
+     <a href="#/inbox" data-view="inbox">📥<span>Inbox</span></a>
+     <a href="#/brain" data-view="brain">🧠<span>Brain</span></a>
++    <a href="#/agency" data-view="agency">🤖<span>Swarm</span></a>
+     <a href="#/assistant" data-view="assistant">💬<span>ARIA</span></a>
+     <a href="#/settings" data-view="settings">⚙️<span>Settings</span></a>
+   </nav>
+diff --git a/public/js/app.js b/public/js/app.js
+index 9965ec3..fd7b3f5 100644
+--- a/public/js/app.js
++++ b/public/js/app.js
+@@ -217,7 +217,23 @@ const Speech = {
+     return location.protocol === 'https:' || location.hostname === 'localhost' ||
+       location.hostname === '127.0.0.1' || location.hostname === '[::1]' || location.hostname === '::1';
+   },
+-  tts() { return 'speechSynthesis' in window; },
++  tts() { return !!(window.speechSynthesis && window.SpeechSynthesisUtterance); },
++
++  /* The two-way loop is view-agnostic: whichever view is mounted exposes ONE mic button
++     (#asst-mic) and ONE text field ([data-voice-input]). Both the Assistant and the Agency
++     Swarm therefore share the exact same speak → listen → send → speak cycle.
++     #chat-mic / #chat-in stay supported so an older cached shell keeps working. */
++  micEl() { return $('#asst-mic') || $('#chat-mic'); },
++  inputEl() { return $('[data-voice-input]') || $('#chat-in') || $('#agency-task'); },
++
++  /* Broadcast every state change so the wake-word listener can hand the microphone over
++     cleanly instead of fighting speechSynthesis for the device. */
++  emit(name, detail) {
++    try { window.dispatchEvent(new CustomEvent(name, { detail: detail || {} })); } catch (_) {}
++  },
++
++  /* True while ARIA is talking OR listening — the wake listener must stay off. */
++  busy() { return !!(this.listening || this._speaking || (this.tts() && window.speechSynthesis.speaking)); },
+ 
+   pickVoice(list) {
+     const en = (list || []).filter(v => /^en/i.test(v.lang || ''));
+@@ -270,7 +286,7 @@ const Speech = {
+         interim += res[0].transcript;
+       }
+       this.interim = interim;
+-      const input = $('#chat-in');
++      const input = this.inputEl();
+       if (input && this.listening) input.value = interim;   // live interim transcript
+     };
+     r.onerror = (e) => this.onRecError(e);
+@@ -307,12 +323,15 @@ const Speech = {
+     }
+   },
+ 
+-  /* Final transcript → drop it in the input and go through the SAME send path as typing. */
++  /* Final transcript → drop it in the active input and go through the SAME send path as
++     typing: the message is posted (to /api/assistant or /api/agency/run, depending on the
++     mounted view), appended to the transcript, and the reply is read back aloud. */
+   finalize(text) {
+     if (!text) return;
+-    const input = $('#chat-in');
+-    if (input) { input.value = text; input.focus(); }
+-    if (this._send) this._send();
++    const input = this.inputEl();
++    if (input) { input.value = text; try { input.focus(); } catch (_) {} }
++    this.emit('asst-transcript', { text });
++    if (this._send) this._send(text);
+     else toast('Send is not ready yet — tap the mic again.');
+   },
+ 
+@@ -328,6 +347,7 @@ const Speech = {
+       this.prime();       // iOS: unlock speechSynthesis inside this user gesture
+       this.rec.start();
+       this.listening = true;
++      this.emit('asst-mic-start');
+     } catch (e) {
+       this.listening = false;
+       toast('🎤 Could not start the microphone — ' + (e.message || 'unknown error'));
+@@ -339,9 +359,11 @@ const Speech = {
+     if (this.rec) { try { this.rec.stop(); } catch (_) {} }
+     this.listening = false;
+     this.render();
++    this.emit('asst-mic-done');
+   },
+ 
+   cancelSpeak() {
++    const was = this._speaking;
+     this._speaking = false;
+     try {
+       if (this.tts()) {
+@@ -349,25 +371,47 @@ const Speech = {
+         window.speechSynthesis.cancel();
+       }
+     } catch (_) {}
++    this.render();
++    if (was) this.emit('asst-speak-done', { cancelled: true });
+   },
+ 
+   /* Speak ARIA's reply aloud. Respects the Sound.on mute toggle + the voice preference;
+      strips markdown first so it does not read asterisks and hashes out loud. */
+   speak(text) {
+-    if (!Sound.on || !this.on || !this.tts()) return Promise.resolve(false);
++    const body = stripMd(text);
++    if (!Sound.on || !this.on || !this.tts() || !body) {
++      /* Silent path still closes the loop so hands-free conversation never stalls. */
++      this.emit('asst-speak-done', { spoken: false });
++      return Promise.resolve(false);
++    }
++    /* Never talk over the microphone: release it first, speak, then hand it back. */
++    if (this.listening) { this._suppressRestart = true; this.stopMic(); }
+     return new Promise((res) => {
++      let settled = false;
++      const done = (spoken) => {
++        if (settled) return;
++        settled = true;
++        this._speaking = false;
++        this._utterance = null;
++        this.render();
++        res(spoken);
++        this.emit('asst-speak-done', { spoken });
++        this.afterSpeak();
++      };
+       try {
+         const synth = window.speechSynthesis;
+         synth.cancel();
+-        const u = new SpeechSynthesisUtterance(stripMd(text));
++        const u = new SpeechSynthesisUtterance(body);
+         if (this._voice) { u.voice = this._voice; u.lang = this._voice.lang; }
+         u.rate = 1; u.pitch = 1; u.volume = 1;
+-        u.onend = () => { this._speaking = false; res(true); this.afterSpeak(); };
+-        u.onerror = () => { this._speaking = false; res(false); this.afterSpeak(); };
++        u.onend = () => done(true);
++        u.onerror = () => done(false);
+         this._utterance = u;
+         this._speaking = true;
++        this.emit('asst-speak-start', { text: body });
++        this.render();
+         synth.speak(u);
+-      } catch (_) { res(false); }
++      } catch (_) { done(false); }
+     });
+   },
+ 
+@@ -387,7 +431,7 @@ const Speech = {
+   },
+ 
+   render() {
+-    const mic = $('#chat-mic');
++    const mic = this.micEl();
+     if (mic) {
+       mic.hidden = !this.supported();
+       mic.classList.toggle('listening', this.listening);
+@@ -396,7 +440,10 @@ const Speech = {
+       mic.setAttribute('aria-pressed', this.listening ? 'true' : 'false');
+     }
+     const st = $('#mic-status');
+-    if (st) { st.textContent = this.listening ? '🎙️ listening… speak now' : ''; st.classList.toggle('live', this.listening); }
++    if (st) {
++      st.textContent = this.listening ? '🎙️ listening… speak now' : this._speaking ? '🔊 ARIA is speaking…' : '';
++      st.classList.toggle('live', this.listening || this._speaking);
++    }
+     const v = $('#btn-voice');
+     if (v) {
+       v.textContent = this.on ? '🔊 Voice replies: on' : '🔇 Voice replies: off';
+@@ -490,8 +537,9 @@ const EMPTY_STATE = {
+   engine: { activeEngine: 'offline' }, llm: { activeEngine: 'offline' }, activeEngine: 'offline',
+   unread: 0, events: [], allEvents: [], emails: [], inbox: [], tasks: [], messages: [],
+   notes: [], chats: [], briefs: [], brief: null,
+-  stats: { engine: 'offline', lastSync: null, notes: 0, briefs: 0, emails: 0, messages: 0, events: 0, tasks: 0 },
+-  counts: { events: 0, emails: 0, inbox: 0, notes: 0, messages: 0 }
++  agencyRuns: [], agents: [],
++  stats: { engine: 'offline', lastSync: null, notes: 0, briefs: 0, emails: 0, messages: 0, events: 0, tasks: 0, agencyRuns: 0 },
++  counts: { events: 0, emails: 0, inbox: 0, notes: 0, messages: 0, agencyRuns: 0 }
+ };
+ 
+ function normalizeState(raw) {
+@@ -514,6 +562,7 @@ function normalizeState(raw) {
+     inbox: A(s.inbox).length ? A(s.inbox) : emails,
+     tasks,
+     messages: A(s.messages), notes: A(s.notes), chats: A(s.chats), briefs: A(s.briefs),
++    agencyRuns: A(s.agencyRuns), agents: A(s.agents),
+     brief: s.brief || A(s.briefs)[0] || null,
+     unread: typeof s.unread === 'number' ? s.unread : emails.filter(e => !e.read).length,
+     stats: { ...EMPTY_STATE.stats, ...(s.stats || {}), engine: (s.stats && s.stats.engine) || engine.activeEngine || 'offline' },
+@@ -573,7 +622,7 @@ function updateSidebar() {
+ }
+ 
+ /* ---------------- router ---------------- */
+-const routes = { hub: viewHub, briefs: viewBriefs, calendar: viewCalendar, inbox: viewInbox, messages: viewMessages, brain: viewBrain, assistant: viewAssistant, settings: viewSettings };
++const routes = { hub: viewHub, briefs: viewBriefs, calendar: viewCalendar, inbox: viewInbox, messages: viewMessages, brain: viewBrain, assistant: viewAssistant, agency: viewAgency, settings: viewSettings };
+ let assistantInit = false;
+ 
+ window.addEventListener('hashchange', route);
+@@ -640,6 +689,17 @@ async function viewHub(main) {
+       <div class="card"><h3>Latest messages <span class="right"><a href="#/messages" style="color:var(--accent);text-decoration:none">open messages →</a></span></h3>
+         ${A(s.messages).slice(0, 7).map(msgRow).join('') || '<div class="empty">No messages.</div>'}
+       </div>
++    </div>
++
++    <div class="card agency-hub" style="margin-top:16px">
++      <h3>🤖 Agency Swarm <span class="right"><a href="#/agency" style="color:var(--accent);text-decoration:none">open the swarm →</a></span></h3>
++      <div class="sub" style="color:var(--dim);font-size:12.5px;margin:-4px 0 10px">Hand ARIA a complex mission — she decomposes it and delegates to the Researcher, Analyst and Copywriter agents.</div>
++      <div class="agency-actions">
++        <input id="hub-mission" class="agency-input" placeholder="Analyze all supplier notes and draft an executive briefing" autocomplete="off">
++        <button class="btn primary" id="hub-mission-run">▶ Delegate</button>
++      </div>
++      <div class="suggests" style="margin-top:10px">${['Analyze all supplier notes and draft an executive briefing', 'Scan my inbox and priorities, then write my daily summary'].map(x => `<button class="btn" data-mission="${esc(x)}">${esc(x)}</button>`).join('')}</div>
++      <div style="margin-top:10px;color:var(--faint);font-size:11.5px">${s.stats.agencyRuns || 0} mission${(s.stats.agencyRuns || 0) === 1 ? '' : 's'} run so far</div>
+     </div>`;
+ 
+   renderBriefCard(s.brief);
+@@ -651,6 +711,16 @@ async function viewHub(main) {
+   $('#btn-sync').onclick = async (e) => { e.target.disabled = true; e.target.textContent = '↻ syncing…'; await POST('/api/sync'); await route(); toast('Connectors synced'); Sound.pop(); };
+   $('#btn-brief').onclick = async (e) => { e.target.disabled = true; e.target.textContent = '✦ composing…'; const b = await POST('/api/brief/generate'); await refreshState(); renderBriefCard(STATE.brief); e.target.disabled = false; e.target.textContent = '✦ Generate brief'; toast(b.meta ? `Brief ready — ${b.meta.hot} urgent items flagged` : 'Brief ready'); if (b.meta && b.meta.hot > 0) Sound.priorityAlert(); };
+   bindTaskToggles('#hub-tasks');
++  /* Hub → Agency hand-off: stash the mission and let the swarm view run it on arrival. */
++  const launchMission = (text) => {
++    const t = String(text || '').trim();
++    if (!t) { toast('Type the mission you want the swarm to run.'); return; }
++    try { sessionStorage.setItem('aria.agency.task', t); } catch (_) {}
++    location.hash = '#/agency';
++  };
++  $('#hub-mission-run').onclick = () => launchMission($('#hub-mission').value);
++  $('#hub-mission').onkeydown = (e) => { if (e.key === 'Enter') launchMission($('#hub-mission').value); };
++  $$('.agency-hub .suggests .btn', main).forEach(b => b.onclick = () => launchMission(b.dataset.mission));
+   $$('.row[data-email]', main).forEach(r => r.onclick = () => openEmail(r.dataset.email));
+ }
+ 
+@@ -875,13 +945,16 @@ async function viewAssistant(main) {
+   const ai = (await api('/api/ai/status')) || { activeEngine: 'offline' };
+   const hasMic = Speech.supported(), isSecure = Speech.secure();
+   main.innerHTML = `<div class="view-head"><div><h1>Executive Assistant</h1><div class="sub">Reasons over your real calendar, inbox, messages & brain</div></div>
+-    <span class="chip ${ai.activeEngine === 'ollama' ? 'green' : 'yellow'}">${ai.activeEngine === 'ollama' ? `🟢 local LLM · ${esc(ai.model || '')}` : '🟡 built-in offline engine'}</span></div>
++    <span style="display:flex;gap:9px;align-items:center">
++      <span class="chip ${ai.activeEngine === 'ollama' ? 'green' : 'yellow'}">${ai.activeEngine === 'ollama' ? `🟢 local LLM · ${esc(ai.model || '')}` : '🟡 built-in offline engine'}</span>
++      <button class="btn" id="btn-open-agency" title="Hand a complex, multi-step mission to the agent swarm">🤖 Agency Swarm</button>
++    </span></div>
+     <div class="card chat-wrap">
+       <div class="chat-scroll" id="chat-scroll">
+         ${history.length ? history.map(chatMsg).join('') : welcomeMsg(ai)}
+       </div>
+       <div class="suggests">${['What does my day look like?', 'What are my priorities?', 'How is my inbox?', 'Business snapshot', 'What do you know about suppliers?'].map(s => `<button class="btn" data-s="${esc(s)}">${esc(s)}</button>`).join('')}</div>
+-      <div class="chat-input"><input id="chat-in" placeholder="Ask ARIA anything about your day, work or business…" autocomplete="off"><button class="btn mic-btn" id="chat-mic" ${hasMic ? '' : 'hidden'} title="Talk to ARIA with your voice">🎤</button><button class="btn primary" id="chat-send">Send ⏎</button></div>
++      <div class="chat-input"><input id="chat-in" data-voice-input placeholder="Ask ARIA anything about your day, work or business…" autocomplete="off"><button class="btn mic-btn" id="asst-mic" ${hasMic ? '' : 'hidden'} title="Talk to ARIA with your voice" aria-label="Talk to ARIA with your voice">🎤</button><button class="btn primary" id="chat-send">Send ⏎</button></div>
+       <div class="voice-bar">
+         <button class="btn small" id="btn-voice"></button>
+         <button class="btn small" id="btn-convo"></button>
+@@ -908,16 +981,17 @@ async function viewAssistant(main) {
+     }
+     scroll.scrollTop = scroll.scrollHeight;
+   };
++  $('#btn-open-agency').onclick = () => { location.hash = '#/agency'; };
+   Speech.setSend(send);
+   Speech.render();
+   /* Prime speechSynthesis on the FIRST tap in this view — iOS Safari only speaks after
+      a user gesture, so without this the first reply would be silent. */
+   main.addEventListener('click', () => Speech.prime(), { once: true });
+   $('#chat-send').onclick = () => { Speech.prime(); send(); };
+-  $('#chat-mic').onclick = () => {
++  $('#asst-mic').onclick = () => {
+     Speech.prime();
+     if (Speech.listening) { Speech._suppressRestart = true; Speech.stopMic(); }
+-    else Speech.startMic();
++    else { Speech.cancelSpeak(); Speech.startMic(); }   // tapping the mic always interrupts ARIA
+   };
+   $('#chat-in').onkeydown = (e) => { if (e.key === 'Enter') { Speech.prime(); send(); } };
+   $('#btn-voice').onclick = () => {
+@@ -938,6 +1012,228 @@ async function viewAssistant(main) {
+   $$('.suggests .btn', main).forEach(b => b.onclick = () => { $('#chat-in').value = b.dataset.s; Speech.prime(); send(); });
+ }
+ 
++/* ===== AGENCY SWARM (multi-agent) =====
++   ARIA is the Executive Chief of Staff: you hand over a mission, she decomposes it,
++   delegates to the background specialists and returns one signed-off executive output.
++   The panel replays the swarm step by step so you can see WHO worked and WHAT they produced.
++   The same voice loop as the Assistant is wired here: #asst-mic → mission → /api/agency/run
++   → transcript → speechSynthesis reads the executive summary back. */
++const AGENCY_EXAMPLES = [
++  'Analyze all supplier notes and draft an executive briefing',
++  'Scan my inbox and priorities, then write my daily summary',
++  'Research what we know about pricing and draft a customer proposal',
++  'Review the financial records and list the risks'
++];
++
++let AGENCY_BUSY = false;
++
++function agencyStepRow(step, state) {
++  const st = state || 'queued';
++  const chip = st === 'done' ? 'green' : st === 'working' ? 'yellow' : st === 'failed' ? 'red' : '';
++  const label = st === 'done' ? 'done' : st === 'working' ? 'working…' : st === 'failed' ? 'failed' : 'queued';
++  return `<div class="agent-step ${st}" data-step="${esc(step.key)}">
++    <div class="as-head">
++      <span class="as-emoji">${esc(step.emoji || '🤖')}</span>
++      <strong>${esc(step.agent)}</strong>
++      <span class="chip ${chip}">${label}</span>
++      <span class="as-ms">${step.ms != null ? esc(step.ms + ' ms') : ''}</span>
++    </div>
++    <div class="as-action">${esc(step.action || '')}</div>
++    ${step.result ? `<div class="as-result md">${md(step.result)}</div>` : ''}
++  </div>`;
++}
++
++/* Pull the executive paragraph out of the report — that is what ARIA reads aloud. */
++function agencySpokenSummary(markdown) {
++  const m = String(markdown || '').match(/###\s*Executive summary\s*\n([\s\S]*?)(?:\n###|$)/i);
++  const body = (m ? m[1] : String(markdown || '')).trim();
++  return stripMd(body).split('\n').filter(Boolean).slice(0, 3).join(' ').slice(0, 700);
++}
++
++async function viewAgency(main) {
++  const [roster, runs] = await Promise.all([
++    api('/api/agency/agents').catch(() => []),
++    api('/api/agency/runs').catch(() => [])
++  ]);
++  const agents = A(roster);
++  const specialists = agents.filter(a => a.id !== 'director');
++  const director = agents.find(a => a.id === 'director') || { name: 'DirectorAgent', emoji: '🎩', role: 'Executive Chief of Staff (ARIA)' };
++  const hasMic = Speech.supported();
++
++  main.innerHTML = `<div class="view-head">
++      <div><h1>🤖 Agency Swarm</h1><div class="sub">${esc(director.emoji)} ${esc(director.name)} — ${esc(director.role)} — delegates your mission to ${specialists.length} specialist agents</div></div>
++      <span class="head-actions">
++        <button class="btn js-sound" title="Toggle sound">🔊</button>
++        <button class="btn" onclick="location.hash='#/assistant'">💬 Assistant</button>
++      </span>
++    </div>
++
++    <div class="grid c3">
++      <div style="display:flex;flex-direction:column;gap:16px">
++        <div class="card">
++          <h3>Mission <span class="right" id="agency-status">idle</span></h3>
++          <textarea id="agency-task" data-voice-input class="agency-input" rows="3" placeholder="e.g. Analyze all supplier notes and draft an executive briefing"></textarea>
++          <div class="agency-actions">
++            <button class="btn mic-btn" id="asst-mic" ${hasMic ? '' : 'hidden'} title="Dictate the mission" aria-label="Dictate the mission">🎤</button>
++            <label class="agency-mode">mode
++              <select id="agency-mode">
++                <option value="sequential">sequential</option>
++                <option value="parallel">parallel</option>
++              </select>
++            </label>
++            <span class="mic-status" id="mic-status"></span>
++            <button class="btn primary" id="agency-run">▶ Run mission</button>
++          </div>
++          <div class="suggests">${AGENCY_EXAMPLES.map(x => `<button class="btn" data-mission="${esc(x)}">${esc(x)}</button>`).join('')}</div>
++        </div>
++
++        <div class="card">
++          <h3>Live execution <span class="right" id="agency-meta"></span></h3>
++          <div id="agency-trace"><div class="empty">No mission running. Describe one above — ARIA decomposes it and delegates.</div></div>
++        </div>
++
++        <div class="card" id="agency-output-card" hidden>
++          <h3>Final output <span class="right"><button class="btn small" id="agency-speak">🔊 read aloud</button></span></h3>
++          <div class="md" id="agency-output"></div>
++        </div>
++      </div>
++
++      <div style="display:flex;flex-direction:column;gap:16px">
++        <div class="card">
++          <h3>Swarm roster <span class="right">${specialists.length} delegatable</span></h3>
++          <div class="agent-card director">
++            <div class="ac-head"><span class="as-emoji">${esc(director.emoji)}</span><strong>${esc(director.name)}</strong><span class="chip purple">always on</span></div>
++            <div class="ac-desc">${esc(director.description || director.role)}</div>
++          </div>
++          ${specialists.map(a => `<label class="agent-card">
++            <div class="ac-head"><span class="as-emoji">${esc(a.emoji)}</span><strong>${esc(a.name)}</strong>
++              <input type="checkbox" class="agency-pick" data-agent="${esc(a.id)}" title="Force this agent into the squad"></div>
++            <div class="ac-desc">${esc(a.description)}</div>
++            <div class="ac-skills">${A(a.skills).map(sk => `<span class="chip">${esc(sk)}</span>`).join('')}</div>
++          </label>`).join('')}
++          <p class="ac-hint">Leave every box unticked and ARIA auto-delegates based on the mission.</p>
++        </div>
++
++        <div class="card">
++          <h3>Recent missions <span class="right">${A(runs).length}</span></h3>
++          <div id="agency-runs">${A(runs).length ? A(runs).slice(0, 8).map(r => `<div class="row" data-run="${esc(r.id)}">
++            <div class="r-main"><div class="r-title">${esc(r.task)}</div>
++            <div class="r-sub">${A(r.agents).map(x => `<span class="chip">${esc(x)}</span>`).join(' ')} · ${esc(r.mode || 'sequential')} · ${r.durationMs != null ? esc(r.durationMs + ' ms') : ''}</div></div>
++            <div class="r-time">${r.startedAt ? esc(fmtAgo(r.startedAt)) : ''}</div></div>`).join('') : '<div class="empty">No missions yet.</div>'}</div>
++        </div>
++      </div>
++    </div>`;
++
++  const taskEl = $('#agency-task');
++  const statusEl = $('#agency-status');
++  const traceEl = $('#agency-trace');
++  const metaEl = $('#agency-meta');
++  const outCard = $('#agency-output-card');
++  const outEl = $('#agency-output');
++  const runBtn = $('#agency-run');
++  let lastOutput = '';
++
++  const pickedAgents = () => $$('.agency-pick').filter(c => c.checked).map(c => c.dataset.agent);
++  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
++
++  async function runMission(spokenText) {
++    if (AGENCY_BUSY) { toast('The swarm is still working on the previous mission…'); return; }
++    const task = String(spokenText || taskEl.value || '').trim();
++    if (!task) { toast('Describe the mission first — e.g. “Analyze all supplier notes and draft an executive briefing”.'); return; }
++    taskEl.value = task;
++    AGENCY_BUSY = true;
++    runBtn.disabled = true; runBtn.textContent = '◌ swarm working…';
++    statusEl.textContent = 'planning…';
++    outCard.hidden = true;
++    Sound.pop();
++
++    /* 1. Ask ARIA for the delegation plan so the queue is on screen before work starts. */
++    let plan = null;
++    try { plan = await POST('/api/agency/plan', { task, agents: pickedAgents() }); } catch (_) { plan = null; }
++    const queue = [{ key: 'director-plan', agent: 'DirectorAgent', emoji: '🎩', action: 'Parse the mission and delegate' }]
++      .concat(A(plan && plan.assignments).map(a => ({ key: a.id, agent: a.name, emoji: a.emoji, action: a.action })))
++      .concat([{ key: 'director-final', agent: 'DirectorAgent', emoji: '🎩', action: 'Synthesise the executive output' }]);
++    traceEl.innerHTML = queue.map((q, i) => agencyStepRow(q, i === 0 ? 'working' : 'queued')).join('');
++    metaEl.textContent = `${queue.length} steps · ${$('#agency-mode').value}`;
++    statusEl.textContent = 'swarm working…';
++
++    /* 2. Execute, then replay the real trace step by step. */
++    try {
++      const res = await POST('/api/agency/run', { task, agents: pickedAgents(), mode: $('#agency-mode').value });
++      const trace = A(res.agentTrace);
++      for (let i = 0; i < trace.length; i++) {
++        const t = trace[i];
++        const rows = $$('.agent-step', traceEl);
++        const html = agencyStepRow({ key: t.agentId + '-' + i, agent: t.agent, emoji: t.emoji, action: t.action, result: t.result, ms: t.ms }, t.ok === false ? 'failed' : 'done');
++        if (rows[i]) rows[i].outerHTML = html; else traceEl.insertAdjacentHTML('beforeend', html);
++        const next = $$('.agent-step', traceEl)[i + 1];
++        if (next && i + 1 < trace.length) next.className = 'agent-step working';
++        traceEl.scrollTop = traceEl.scrollHeight;
++        await sleep(160);
++      }
++      $$('.agent-step.queued, .agent-step.working', traceEl).forEach(r => r.remove());
++      lastOutput = res.finalOutput || '';
++      outEl.innerHTML = md(lastOutput);
++      outCard.hidden = false;
++      metaEl.textContent = `${trace.length} steps · ${res.mode || 'sequential'} · ${res.durationMs != null ? res.durationMs + ' ms' : ''}`;
++      statusEl.textContent = 'mission complete';
++      toast(`🤖 Mission complete — ${trace.length} agent steps`);
++      Sound.chirp();
++      /* Voice loop: read the executive summary back, exactly like the Assistant does. */
++      Speech.speak(agencySpokenSummary(lastOutput));
++      api('/api/agency/runs').then((rs) => {
++        const box = $('#agency-runs');
++        if (!box) return;
++        box.innerHTML = A(rs).slice(0, 8).map(r => `<div class="row" data-run="${esc(r.id)}">
++          <div class="r-main"><div class="r-title">${esc(r.task)}</div>
++          <div class="r-sub">${A(r.agents).map(x => `<span class="chip">${esc(x)}</span>`).join(' ')} · ${esc(r.mode || 'sequential')} · ${r.durationMs != null ? esc(r.durationMs + ' ms') : ''}</div></div>
++          <div class="r-time">${r.startedAt ? esc(fmtAgo(r.startedAt)) : ''}</div></div>`).join('');
++        bindRunRows();
++      }).catch(() => {});
++    } catch (e) {
++      statusEl.textContent = 'failed';
++      traceEl.insertAdjacentHTML('beforeend', `<div class="agent-step failed"><div class="as-head"><span class="as-emoji">🎩</span><strong>DirectorAgent</strong><span class="chip red">failed</span></div><div class="as-action">${esc(e.message)}</div></div>`);
++      toast('Agency run failed — ' + e.message);
++    } finally {
++      AGENCY_BUSY = false;
++      runBtn.disabled = false; runBtn.textContent = '▶ Run mission';
++    }
++  }
++
++  function bindRunRows() {
++    $$('#agency-runs .row').forEach(row => row.onclick = async () => {
++      try {
++        const r = await api('/api/agency/runs/' + encodeURIComponent(row.dataset.run));
++        openModal(`<div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:8px">
++          <h2 style="font-size:17px;line-height:1.35">🤖 ${esc(r.task)}</h2>
++          <button class="btn small" onclick="closeModal()">✕</button></div>
++          <div style="color:var(--dim);font-size:12.5px;margin-bottom:12px">${A(r.agents).map(x => `<span class="chip">${esc(x)}</span>`).join(' ')} · ${esc(r.mode || 'sequential')} · ${r.durationMs != null ? esc(r.durationMs + ' ms') : ''}</div>
++          <div class="md">${md(r.finalOutput || '')}</div>`);
++      } catch (_) { toast('Could not load that mission'); }
++    });
++  }
++
++  runBtn.onclick = () => { Speech.prime(); runMission(); };
++  taskEl.onkeydown = (e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { Speech.prime(); runMission(); } };
++  $$('.suggests .btn', main).forEach(b => b.onclick = () => { taskEl.value = b.dataset.mission; Speech.prime(); runMission(); });
++  $('#agency-speak').onclick = () => { Speech.prime(); Speech.speak(agencySpokenSummary(lastOutput)); };
++  $('#asst-mic').onclick = () => {
++    Speech.prime();
++    if (Speech.listening) { Speech._suppressRestart = true; Speech.stopMic(); }
++    else { Speech.cancelSpeak(); Speech.startMic(); }
++  };
++  bindRunRows();
++  /* Dictated mission → same path as the typed one (two-way voice loop on /api/agency/run). */
++  Speech.setSend((text) => runMission(text));
++  Speech.render();
++  main.addEventListener('click', () => Speech.prime(), { once: true });
++
++  /* A mission handed over from the Hub card runs immediately. */
++  let pending = null;
++  try { pending = sessionStorage.getItem('aria.agency.task'); sessionStorage.removeItem('aria.agency.task'); } catch (_) {}
++  if (pending) { taskEl.value = pending; runMission(pending); }
++}
++
+ function chatMsg(c) {
+   if (c.role === 'user') return `<div class="msg user"><div class="md"><p>${esc(c.content)}</p></div></div>`;
+   return `<div class="msg aria"><div class="md">${md(c.content)}</div>${c.engine ? `<div class="engine-tag">${esc(c.engine)}</div>` : ''}</div>`;
+@@ -1124,7 +1420,8 @@ const WakeWord = {
+   handingOver: false,
+ 
+   supported() { return !!(window.SpeechRecognition || window.webkitSpeechRecognition); },
+-  busy() { return !!(Speech && (Speech.listening || Speech._speaking)); },
++  /* Busy = the assistant mic holds the device OR speechSynthesis is talking. */
++  busy() { return !!(Speech && Speech.busy && Speech.busy()); },
+ 
+   enabled() {
+     try { return localStorage.getItem('aria.wake') === '1'; } catch (_) { return false; }
+@@ -1187,7 +1484,7 @@ const WakeWord = {
+     toast('🎙️ ARIA activated');
+     if (location.hash !== '#/assistant') location.hash = '#/assistant';
+     setTimeout(() => {
+-      const mic = $('#chat-mic');
++      const mic = Speech.micEl();
+       if (mic) mic.click(); else Speech.startMic();
+       this.handingOver = false;
+     }, 400);
+@@ -1219,8 +1516,13 @@ const WakeWord = {
+   Speech.leave = function () { const out = origLeave(); WakeWord.rearm(); return out; };
+ })();
+ 
++/* Two-way loop bookkeeping: the wake listener stays off while ARIA listens OR speaks, and
++   re-arms the moment both are idle — that is what keeps #asst-mic and speechSynthesis in sync. */
+ window.addEventListener('asst-mic-done', () => WakeWord.rearm());
++window.addEventListener('asst-speak-start', () => WakeWord.release());
++window.addEventListener('asst-speak-done', () => WakeWord.rearm());
+ window.AriaWakeWord = WakeWord;
++window.AriaSpeech = Speech;
+ 
+ /* Opt-in only (localStorage aria.wake = '1'). Enabling it unprompted would hold the
+    microphone permanently and lock out the assistant mic button. */
+diff --git a/scripts/test-app.js b/scripts/test-app.js
+index 9f1669c..d0a7b75 100644
+--- a/scripts/test-app.js
++++ b/scripts/test-app.js
+@@ -40,12 +40,12 @@ function check(name, cond, detail) {
+   }
+   check('/api/state.engine.activeEngine is a string', typeof (s.engine || {}).activeEngine === 'string');
+   check('/api/state.stats.engine is a string', typeof (s.stats || {}).engine === 'string');
+-  for (const k of ['events', 'emails', 'inbox', 'messages', 'notes', 'chats', 'tasks', 'briefs']) {
++  for (const k of ['events', 'emails', 'inbox', 'messages', 'notes', 'chats', 'tasks', 'briefs', 'agencyRuns', 'agents']) {
+     check(`/api/state.${k} is an array`, Array.isArray(s[k]), typeof s[k]);
+   }
+   check('/api/state.timezone present', typeof s.timezone === 'string' && s.timezone.length > 0);
+ 
+-  for (const p of ['/api/emails', '/api/events', '/api/inbox', '/api/tasks', '/api/messages', '/api/notes', '/api/briefs', '/api/connectors', '/api/assistant/history', '/api/search?q=aria']) {
++  for (const p of ['/api/emails', '/api/events', '/api/inbox', '/api/tasks', '/api/messages', '/api/notes', '/api/briefs', '/api/connectors', '/api/assistant/history', '/api/search?q=aria', '/api/agency/agents', '/api/agency/runs']) {
+     const r = await get(p);
+     check(`GET ${p} → 200 array`, r.status === 200 && Array.isArray(r.json), `status ${r.status}, type ${Array.isArray(r.json) ? 'array' : typeof r.json}`);
+   }
+@@ -74,7 +74,57 @@ function check(name, cond, detail) {
+   const note = await post('/api/notes', { title: 'Verification note', content: 'ARIA remembers this.' });
+   check('POST /api/notes → 200 with id', note.status === 200 && !!(note.json || {}).id);
+ 
+-  console.log('\n[3] Frontend render (jsdom)');
++  console.log('\n[3] Agency swarm (multi-agent)');
++  const roster = await get('/api/agency/agents');
++  const rosterIds = (roster.json || []).map(a => a.id);
++  check('GET /api/agency/agents → 200 array', roster.status === 200 && Array.isArray(roster.json));
++  for (const id of ['director', 'researcher', 'copywriter', 'analyst']) {
++    check(`roster contains ${id}`, rosterIds.includes(id), rosterIds.join(','));
++  }
++  check('every agent card has name + role + description',
++    (roster.json || []).every(a => a && typeof a.name === 'string' && a.name && typeof a.role === 'string' && typeof a.description === 'string'));
++
++  const planned = await post('/api/agency/plan', { task: 'Analyze all supplier notes and draft an executive briefing' });
++  check('POST /api/agency/plan → 200', planned.status === 200 && !!(planned.json || {}).ok);
++  check('plan decomposes the multi-step instruction', ((planned.json || {}).subtasks || []).length >= 2, JSON.stringify((planned.json || {}).subtasks));
++  check('plan delegates to specialists', ((planned.json || {}).agents || []).length >= 1, JSON.stringify((planned.json || {}).agents));
++
++  const mission = await post('/api/agency/run', { task: 'Analyze all supplier notes and draft an executive briefing' });
++  const m = mission.json || {};
++  check('POST /api/agency/run → 200', mission.status === 200, 'got ' + mission.status);
++  check('run returns a non-empty finalOutput string', typeof m.finalOutput === 'string' && m.finalOutput.length > 80, typeof m.finalOutput);
++  check('run returns an agentTrace array', Array.isArray(m.agentTrace) && m.agentTrace.length >= 3, `len ${(m.agentTrace || []).length}`);
++  check('every trace step is { agent, action, result }',
++    (m.agentTrace || []).every(t => t && typeof t.agent === 'string' && t.agent && typeof t.action === 'string' && t.action && typeof t.result === 'string'));
++  const traceIds = (m.agentTrace || []).map(t => t.agentId);
++  check('DirectorAgent opens and closes the mission', traceIds[0] === 'director' && traceIds[traceIds.length - 1] === 'director', traceIds.join('>'));
++  for (const id of ['researcher', 'analyst', 'copywriter']) {
++    check(`${id} executed in the swarm`, traceIds.includes(id), traceIds.join('>'));
++  }
++  check('final output is the Director synthesis', /Agency mission report/i.test(m.finalOutput || ''));
++  check('final output carries the analysis + next actions', /Recommended next actions/i.test(m.finalOutput || '') && /Executive summary/i.test(m.finalOutput || ''));
++  check('every trace step reports a duration', (m.agentTrace || []).every(t => typeof t.ms === 'number' && t.ms >= 0));
++
++  const solo = await post('/api/agency/run', { task: 'Draft a customer proposal for the Kamau supplier order', agents: ['copywriter'] });
++  const soloIds = ((solo.json || {}).agentTrace || []).map(t => t.agentId);
++  check('explicit agents[] is honoured', solo.status === 200 && soloIds.includes('copywriter') && !soloIds.includes('researcher'), soloIds.join('>'));
++
++  const parallel = await post('/api/agency/run', { task: 'Scan my inbox and priorities, then write my daily summary', mode: 'parallel' });
++  check('parallel mode runs the full swarm', parallel.status === 200 && (parallel.json || {}).mode === 'parallel' && ((parallel.json || {}).agentTrace || []).length >= 4);
++
++  const bad = await post('/api/agency/run', { task: '   ' });
++  check('POST /api/agency/run with no task → 400', bad.status === 400, 'got ' + bad.status);
++
++  const runs = await get('/api/agency/runs');
++  check('GET /api/agency/runs lists the missions', Array.isArray(runs.json) && runs.json.length >= 3, `len ${(runs.json || []).length}`);
++  const oneRun = await get('/api/agency/runs/' + encodeURIComponent(m.id));
++  check('GET /api/agency/runs/:id returns the mission', oneRun.status === 200 && (oneRun.json || {}).id === m.id);
++  const stateAfter = await get('/api/state');
++  check('/api/state.agencyRuns tracks the missions', Array.isArray((stateAfter.json || {}).agencyRuns) && stateAfter.json.agencyRuns.length >= 3);
++  const brainHit = await get('/api/search?q=' + encodeURIComponent('Agency mission supplier'));
++  check('mission report is written into the second brain', Array.isArray(brainHit.json) && brainHit.json.some(h => /Agency mission/i.test(h.title || '')));
++
++  console.log('\n[4] Frontend render (jsdom)');
+   const errors = [];
+   const vc = new VirtualConsole();
+   vc.on('jsdomError', (e) => errors.push('jsdomError: ' + e.message));
+@@ -102,7 +152,7 @@ function check(name, cond, detail) {
+   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+   await sleep(600);
+ 
+-  const views = ['hub', 'briefs', 'calendar', 'inbox', 'messages', 'brain', 'assistant', 'settings'];
++  const views = ['hub', 'briefs', 'calendar', 'inbox', 'messages', 'brain', 'assistant', 'agency', 'settings'];
+   for (const v of views) {
+     w.location.hash = '#/' + v;
+     w.dispatchEvent(new w.HashChangeEvent('hashchange'));
+@@ -112,6 +162,57 @@ function check(name, cond, detail) {
+     const rendered = txt.length > 0 && !txt.includes('loading…') && !txt.includes('⚠️');
+     check(`view "${v}" renders`, rendered, txt.slice(0, 120).replace(/\s+/g, ' '));
+   }
++  console.log('\n[5] Agency Swarm UI + voice loop');
++  /* Assistant view: the two-way voice loop hangs off #asst-mic and a [data-voice-input] field. */
++  w.location.hash = '#/assistant';
++  w.dispatchEvent(new w.HashChangeEvent('hashchange'));
++  await sleep(500);
++  check('assistant exposes the #asst-mic button', !!w.document.getElementById('asst-mic'));
++  check('assistant text field is the voice input', !!w.document.querySelector('#chat-in[data-voice-input]'));
++  const speech = w.AriaSpeech;
++  check('Speech engine is exported for the voice loop', !!speech && typeof speech.speak === 'function' && typeof speech.finalize === 'function');
++  check('Speech resolves the active mic + input', !!speech && speech.micEl() === w.document.getElementById('asst-mic') && speech.inputEl() === w.document.getElementById('chat-in'));
++  check('wake-word listener is mic/speech aware', !!w.AriaWakeWord && typeof w.AriaWakeWord.busy === 'function' && w.AriaWakeWord.busy() === false);
++  /* A spoken transcript must land in the chat and post to the assistant, exactly like typing. */
++  let spoke = null;
++  speech.speak = (t) => { spoke = t; return Promise.resolve(true); };
++  speech.finalize('what are my priorities?');
++  await sleep(900);
++  const chatHtml = w.document.getElementById('chat-scroll').innerHTML;
++  check('spoken transcript is appended to the chat', /what are my priorities\?/i.test(chatHtml));
++  check('spoken turn gets an ARIA reply in the transcript', (chatHtml.match(/msg aria/g) || []).length >= 1);
++  check('reply is handed to speechSynthesis', typeof spoke === 'string' && spoke.length > 0, String(spoke).slice(0, 40));
++
++  /* Agency view: mission → live steps → final output → read aloud. */
++  w.location.hash = '#/agency';
++  w.dispatchEvent(new w.HashChangeEvent('hashchange'));
++  await sleep(600);
++  check('agency view renders the swarm roster', (w.document.querySelectorAll('.agent-card') || []).length >= 4);
++  check('agency view exposes the shared #asst-mic', !!w.document.getElementById('asst-mic'));
++  check('agency mission field is the voice input', !!w.document.querySelector('#agency-task[data-voice-input]'));
++  let agencySpoke = null;
++  w.AriaSpeech.speak = (t) => { agencySpoke = t; return Promise.resolve(true); };
++  w.document.getElementById('agency-task').value = 'Analyze all supplier notes and draft an executive briefing';
++  w.document.getElementById('agency-run').click();
++  for (let i = 0; i < 40 && w.document.getElementById('agency-output-card').hidden; i++) await sleep(200);
++  const steps = w.document.querySelectorAll('#agency-trace .agent-step.done');
++  check('live execution shows each agent step', steps.length >= 5, `${steps.length} steps`);
++  check('execution steps name the agent + action', /DirectorAgent/.test(w.document.getElementById('agency-trace').textContent) && /AnalystAgent/.test(w.document.getElementById('agency-trace').textContent));
++  check('final output is rendered', /Agency mission report/i.test(w.document.getElementById('agency-output').textContent || ''));
++  check('mission summary is read aloud', typeof agencySpoke === 'string' && agencySpoke.length > 0, String(agencySpoke).slice(0, 40));
++  check('recent missions list is refreshed', (w.document.querySelectorAll('#agency-runs .row') || []).length >= 1);
++
++  /* The Hub card hands a mission to the swarm. */
++  w.location.hash = '#/hub';
++  w.dispatchEvent(new w.HashChangeEvent('hashchange'));
++  await sleep(500);
++  check('hub shows the Agency Swarm card', !!w.document.querySelector('.agency-hub'));
++  w.document.getElementById('hub-mission').value = 'Review the financial records and list the risks';
++  w.document.getElementById('hub-mission-run').click();
++  await sleep(400);
++  check('hub card routes the mission to the swarm', w.location.hash === '#/agency');
++  await sleep(1200);
++
+   const chip = w.document.getElementById('engine-chip');
+   check('sidebar engine chip updated', /engine|LLM/i.test((chip && chip.textContent) || ''), (chip && chip.textContent) || '');
+   check('no console errors during render', errors.length === 0, errors.slice(0, 5).join(' | '));
+diff --git a/server/agency.js b/server/agency.js
+new file mode 100644
+index 0000000..d280fa7
+--- /dev/null
++++ b/server/agency.js
+@@ -0,0 +1,161 @@
++'use strict';
++/* AGENCY SWARM — a lightweight, zero-dependency multi-agent orchestrator.
++
++   ARIA (DirectorAgent) is the Executive Chief of Staff: it parses a complex multi-step
++   instruction, delegates the sub-tasks to specialised background agents, and signs off the
++   synthesis. Agents never call each other — they read/write one shared mission context, so
++   the same roster runs either sequentially or in parallel waves.
++
++   Public surface:
++     listAgents()            → the roster (serialisable cards)
++     plan(task, agents)      → the delegation plan, without executing it
++     run({task, agents, mode}) → { finalOutput, agentTrace: [{agent, action, result}], … }
++     history(limit)          → recent missions (persisted with the rest of the state) */
++
++const dbm = require('./db');
++const cfgm = require('./config');
++const brain = require('./brain');
++const registry = require('./agents');
++const { snippet } = require('./util');
++
++const MAX_RUNS = 40;
++const MODES = ['sequential', 'parallel'];
++
++const listAgents = () => registry.list();
++
++function normalizeMode(mode) {
++  const m = String(mode || 'sequential').toLowerCase();
++  return MODES.includes(m) ? m : 'sequential';
++}
++
++function makePlan(task, agents) {
++  return registry.director.plan(String(task || '').trim(), registry.roster(), agents);
++}
++
++/* Plan only — used by the UI to render the queued steps before execution starts. */
++function plan(task, agents) {
++  const t = String(task || '').trim();
++  if (!t) throw Object.assign(new Error('task required'), { status: 400 });
++  const p = makePlan(t, agents);
++  return {
++    ok: true,
++    task: t,
++    subtasks: p.subtasks,
++    agents: p.agents,
++    assignments: p.assignments,
++    director: registry.director.card()
++  };
++}
++
++async function runAgent(agent, ctx, method = 'run') {
++  const startedAt = Date.now();
++  let step;
++  try {
++    step = await agent[method](ctx);
++  } catch (e) {
++    console.error('[agency]', agent.id, (e && e.stack) || e);
++    step = agent.failStep(method, e);
++  }
++  step.startedAt = startedAt;
++  step.ms = Date.now() - startedAt;
++  ctx.trace.push(step);
++  return step;
++}
++
++async function run(opts = {}) {
++  const task = String(opts.task || '').trim();
++  if (!task) throw Object.assign(new Error('task required'), { status: 400 });
++
++  const mode = normalizeMode(opts.mode);
++  const roster = registry.roster();
++  const p = makePlan(task, opts.agents);
++
++  const ctx = {
++    task,
++    mode,
++    plan: p,
++    cfg: cfgm.load(),
++    allowWeb: opts.allowWeb !== false,
++    shared: {},
++    trace: []
++  };
++
++  const startedAt = Date.now();
++
++  /* 1. ARIA parses the instruction and delegates. */
++  await runAgent(registry.director, ctx);
++
++  /* 2. The swarm works — one agent per wave (sequential) or whole waves at once (parallel). */
++  const waves = (p.waves && p.waves[mode]) || p.agents.map(id => [id]);
++  for (const wave of waves) {
++    const live = wave.map(id => roster.get(id)).filter(Boolean);
++    if (!live.length) continue;
++    if (mode === 'parallel' && live.length > 1) await Promise.all(live.map(a => runAgent(a, ctx)));
++    else for (const a of live) await runAgent(a, ctx);
++  }
++
++  /* 3. ARIA signs off. */
++  const finalStep = await runAgent(registry.director, ctx, 'synthesize');
++  const finalOutput = finalStep.result;
++  const finishedAt = Date.now();
++
++  const record = {
++    id: 'agency-' + startedAt,
++    task,
++    mode,
++    agents: p.agents,
++    subtasks: p.subtasks,
++    finalOutput,
++    agentTrace: ctx.trace,
++    startedAt,
++    finishedAt,
++    durationMs: finishedAt - startedAt,
++    ts: finishedAt
++  };
++
++  await persist(record);
++
++  return {
++    ok: true,
++    id: record.id,
++    task,
++    mode,
++    agents: p.agents,
++    subtasks: p.subtasks,
++    finalOutput,
++    agentTrace: ctx.trace,
++    startedAt,
++    finishedAt,
++    durationMs: record.durationMs
++  };
++}
++
++/* Missions are memory too: keep the last N runs and write the report into the second brain. */
++async function persist(record) {
++  try {
++    const db = dbm.load();
++    if (!Array.isArray(db.agencyRuns)) db.agencyRuns = [];
++    db.agencyRuns.unshift(record);
++    db.agencyRuns = db.agencyRuns.slice(0, MAX_RUNS);
++    brain.ingestNote({
++      title: `Agency mission — ${snippet(record.task, 70)}`,
++      content: record.finalOutput,
++      source: 'agency',
++      kind: 'note',
++      tags: ['agency', ...record.agents],
++      refId: record.id
++    });
++    try { brain.buildIndex(); } catch (_) {}
++    await dbm.saveNow();
++  } catch (e) {
++    console.error('[agency:persist]', (e && e.message) || e);
++  }
++}
++
++function history(limit = 20) {
++  const db = dbm.load();
++  const runs = Array.isArray(db.agencyRuns) ? db.agencyRuns : [];
++  return runs.slice(0, Math.max(1, Number(limit) || 20));
++}
++
++module.exports = { listAgents, plan, run, history, MODES, MAX_RUNS };
+diff --git a/server/agents/analyst.js b/server/agents/analyst.js
+new file mode 100644
+index 0000000..13b194e
+--- /dev/null
++++ b/server/agents/analyst.js
+@@ -0,0 +1,135 @@
++'use strict';
++/* AnalystAgent — scans priorities, inbox items and financial records to create an
++   actionable summary. Pure deterministic reasoning over the local database. */
++
++const dbm = require('../db');
++const cfgm = require('../config');
++const { Agent, money, isFinancial, snippet, PRIORITY_RANK } = require('./base');
++const { dayKey, timeStr } = require('../util');
++
++const ANALYSIS_HINTS = /\b(analy[sz]e?|analysis|priorit|inbox|triage|financ|invoice|payment|revenue|money|cash|risk|status|health|summar|report|kpi|metric|backlog|overdue|workload|next\s+actions?|action\s+items?|to-?dos?|focus|agenda|schedule|calendar|brief(?:ing)?|snapshot|scan)\b/i;
++
++class AnalystAgent extends Agent {
++  constructor() {
++    super({
++      id: 'analyst',
++      name: 'AnalystAgent',
++      emoji: '📊',
++      role: 'Analysis & prioritisation',
++      description: 'Scans priorities, inbox items and financial records, then turns them into an actionable summary.',
++      skills: ['priority ranking', 'inbox triage', 'financial scan', 'risk flags']
++    });
++  }
++
++  relevance(task) {
++    let s = 0.3;
++    if (ANALYSIS_HINTS.test(task)) s += 0.55;
++    return Math.min(1, s);
++  }
++
++  async run(ctx) {
++    const db = dbm.load();
++    const cfg = cfgm.load();
++    const tz = (cfg.owner && cfg.owner.timezone) || 'Africa/Nairobi';
++    const now = Date.now();
++
++    /* 1. Priorities — open action items, highest first, overdue on top. */
++    const open = (db.tasks || []).filter(t => t && !t.done);
++    const ranked = open.slice().sort((a, b) => {
++      const oa = a.due && a.due < now ? -1 : 0;
++      const ob = b.due && b.due < now ? -1 : 0;
++      if (oa !== ob) return oa - ob;
++      const pa = PRIORITY_RANK[a.priority] ?? 1;
++      const pb = PRIORITY_RANK[b.priority] ?? 1;
++      if (pa !== pb) return pa - pb;
++      return (a.due || Infinity) - (b.due || Infinity);
++    });
++    const overdue = ranked.filter(t => t.due && t.due < now);
++    const highPriority = ranked.filter(t => t.priority === 'high');
++
++    /* 2. Inbox — unread + high signal email and messages. */
++    const unread = (db.emails || []).filter(e => e && !e.read)
++      .sort((a, b) => (b.receivedAt || b.ts || 0) - (a.receivedAt || a.ts || 0));
++    const hotEmails = unread.filter(e => e.priority === 'high' || e.priority === 'medium');
++    const hotMessages = (db.messages || []).filter(m => m && (m.priority === 'high' || m.priority === 'medium'))
++      .sort((a, b) => (b.sentAt || b.ts || 0) - (a.sentAt || a.ts || 0));
++
++    /* 3. Financial records — anything money-shaped across email, chat and notes. */
++    const financial = [];
++    for (const e of (db.emails || [])) {
++      const text = `${e.subject || ''} ${e.body || e.snippet || ''}`;
++      if (isFinancial(text)) financial.push({ kind: 'email', who: e.fromName || e.from || 'unknown', label: e.subject || 'email', amounts: money(text), ts: e.receivedAt || e.ts || 0 });
++    }
++    for (const m of (db.messages || [])) {
++      if (isFinancial(m.text)) financial.push({ kind: 'message', who: m.from || m.channel || 'unknown', label: snippet(m.text, 70), amounts: money(m.text), ts: m.sentAt || m.ts || 0 });
++    }
++    for (const n of (db.notes || [])) {
++      const text = `${n.title || ''} ${n.content || ''}`;
++      if (isFinancial(text)) financial.push({ kind: 'note', who: n.source || 'brain', label: n.title || 'note', amounts: money(text), ts: n.updatedAt || 0 });
++    }
++    financial.sort((a, b) => (b.ts || 0) - (a.ts || 0));
++    const topFinancial = financial.slice(0, 6);
++
++    /* 4. Today's calendar load. */
++    const today = dayKey(now, tz);
++    const todayEvents = (db.events || []).filter(e => e && e.start && dayKey(e.start, tz) === today).sort((a, b) => a.start - b.start);
++
++    /* 5. A single, honest pressure score. */
++    const pressure = Math.min(100, Math.round(
++      overdue.length * 18 + highPriority.length * 11 + hotEmails.length * 7 + hotMessages.length * 5 + todayEvents.length * 4
++    ));
++    const posture = pressure >= 70 ? 'overloaded — protect deep-work time' : pressure >= 35 ? 'busy but controllable' : 'clear runway';
++
++    const focus = ranked.slice(0, 3).map(t => t.title);
++    const risks = [];
++    if (overdue.length) risks.push(`${overdue.length} action item${overdue.length === 1 ? '' : 's'} past due`);
++    if (hotEmails.length >= 3) risks.push(`${hotEmails.length} unread emails flagged medium/high`);
++    if (topFinancial.length) risks.push(`${topFinancial.length} open financial thread${topFinancial.length === 1 ? '' : 's'} to reconcile`);
++    if (todayEvents.length >= 4) risks.push(`${todayEvents.length} meetings today leave little execution time`);
++
++    ctx.shared.analysis = {
++      pressure, posture, focus, risks,
++      counts: {
++        openTasks: open.length, overdue: overdue.length, highPriority: highPriority.length,
++        unread: unread.length, hotMessages: hotMessages.length, financial: financial.length, todayEvents: todayEvents.length
++      },
++      topTasks: ranked.slice(0, 5).map(t => ({ title: t.title, priority: t.priority || 'medium', due: t.due || null, context: t.context || 'day-job' })),
++      inbox: hotEmails.slice(0, 5).map(e => ({ from: e.fromName || e.from, subject: e.subject, priority: e.priority || 'medium' })),
++      messages: hotMessages.slice(0, 4).map(m => ({ from: m.from, channel: m.channel, text: snippet(m.text, 100) })),
++      financial: topFinancial,
++      events: todayEvents.slice(0, 6).map(e => ({ title: e.title, at: timeStr(e.start, tz) }))
++    };
++
++    const L = [];
++    L.push(`**Pressure index: ${pressure}/100 — ${posture}.**`);
++    L.push('');
++    L.push(`**Priorities (${open.length} open, ${overdue.length} overdue, ${highPriority.length} high):**`);
++    if (ranked.length) ranked.slice(0, 5).forEach(t => L.push(`- [${t.priority || 'medium'}${t.due && t.due < now ? ' · OVERDUE' : ''}] ${t.title}`));
++    else L.push('- Nothing open — the action list is clear.');
++    L.push('');
++    L.push(`**Inbox (${unread.length} unread, ${hotMessages.length} priority messages):**`);
++    if (hotEmails.length) hotEmails.slice(0, 5).forEach(e => L.push(`- (${e.priority || 'medium'}) **${e.fromName || e.from}** — ${e.subject}`));
++    else L.push('- No unread mail needing a decision.');
++    if (hotMessages.length) hotMessages.slice(0, 3).forEach(m => L.push(`- [${m.channel || 'chat'}] **${m.from}** — ${snippet(m.text, 90)}`));
++    L.push('');
++    L.push(`**Financial records (${financial.length} matched):**`);
++    if (topFinancial.length) topFinancial.forEach(f => L.push(`- [${f.kind}] ${f.who} — ${f.label}${f.amounts.length ? ` (${f.amounts.join(', ')})` : ''}`));
++    else L.push('- No invoices, payments or quotes in the current window.');
++    if (todayEvents.length) {
++      L.push('');
++      L.push(`**Today's calendar (${todayEvents.length}):** ` + todayEvents.slice(0, 6).map(e => `${timeStr(e.start, tz)} ${e.title}`).join(' · '));
++    }
++    if (risks.length) {
++      L.push('');
++      L.push('**Risk flags:** ' + risks.join('; ') + '.');
++    }
++
++    return this.step(
++      `Scanned ${open.length} priorities, ${unread.length} unread inbox items and ${financial.length} financial records`,
++      L.join('\n'),
++      { pressure, openTasks: open.length, unread: unread.length, financial: financial.length }
++    );
++  }
++}
++
++module.exports = AnalystAgent;
+diff --git a/server/agents/base.js b/server/agents/base.js
+new file mode 100644
+index 0000000..79f1d52
+--- /dev/null
++++ b/server/agents/base.js
+@@ -0,0 +1,119 @@
++'use strict';
++/* Agency Swarm — shared agent primitives.
++   ZERO dependencies: every agent is a plain class with an async run(ctx) that returns a
++   trace step. Agents never talk to each other directly — they read and write the shared
++   mission context (ctx.shared), which is what makes sequential AND parallel waves safe. */
++
++const { llmChat } = require('../llm');
++const { snippet } = require('../util');
++
++/* ---------- text helpers shared by the whole swarm ---------- */
++
++const MONEY_RE = /\b(?:kes|ksh|usd|eur|gbp|\$|€|£)\s?\d[\d,]*(?:\.\d{1,2})?\b|\b\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?\b/gi;
++const MONEY_WORDS = ['invoice', 'payment', 'mpesa', 'quote', 'quotation', 'pricing', 'budget', 'deposit', 'refund', 'receipt', 'purchase order', 'lpo', 'paid', 'balance', 'revenue', 'cost'];
++
++const PRIORITY_RANK = { high: 0, medium: 1, low: 2 };
++
++function money(text) {
++  const found = String(text || '').match(MONEY_RE) || [];
++  return [...new Set(found.map(s => s.trim()))].slice(0, 4);
++}
++
++function isFinancial(text) {
++  const t = String(text || '').toLowerCase();
++  return MONEY_WORDS.some(w => t.includes(w)) || MONEY_RE.test(t);
++}
++
++function bullets(list, empty = '_Nothing found._') {
++  const items = (list || []).filter(Boolean);
++  return items.length ? items.map(l => `- ${l}`).join('\n') : empty;
++}
++
++function urlsIn(text) {
++  const found = String(text || '').match(/https?:\/\/[^\s"'<>\])]+/gi) || [];
++  return [...new Set(found.map(u => u.replace(/[.,;!?]+$/, '')))];
++}
++
++/* Split a multi-step instruction into ordered sub-tasks.
++   "Scan the supplier notes and draft an executive briefing, then list next actions"
++     → ["Scan the supplier notes", "draft an executive briefing", "list next actions"] */
++const ACTION_VERB = '(?:draft|write|compose|send|reply|create|prepare|produce|build|plan|summari[sz]e|analy[sz]e|review|scan|research|investigate|find|look\\s?up|gather|list|report|check|propose|email|update|outline)';
++const SPLIT_RE = new RegExp(
++  `\\s*(?:[;\\n]|,?\\s+then\\s+|\\s+and\\s+then\\s+|\\s+after\\s+that\\s+|\\s+&&\\s+|,?\\s+and\\s+(?=${ACTION_VERB}\\b)|,\\s+(?=${ACTION_VERB}\\b))\\s*`,
++  'i'
++);
++
++function splitSubtasks(task) {
++  const raw = String(task || '').trim();
++  if (!raw) return [];
++  const numbered = raw.split(/\s*(?:\d+[.)]\s+|\n\s*[-*]\s+)/).map(s => s.trim()).filter(Boolean);
++  const base = numbered.length > 1 ? numbered : [raw];
++  const parts = [];
++  for (const chunk of base) {
++    chunk
++      .split(SPLIT_RE)
++      .map(s => s.trim().replace(/^(?:and|also|please)\s+/i, '').replace(/[.\s]+$/, ''))
++      .filter(s => s.length > 2)
++      .forEach(s => parts.push(s));
++  }
++  const seen = new Set();
++  return parts.filter(p => { const k = p.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; }).slice(0, 6);
++}
++
++/* Ask the local LLM, but never depend on it: `fallback` always produces a real answer. */
++async function think(system, user, fallback) {
++  try {
++    const { text, engine } = await llmChat(system, user);
++    if (text && String(text).trim()) return { text: String(text).trim(), engine: engine || 'llm' };
++  } catch (_) { /* offline is a normal state, not an error */ }
++  return { text: String(fallback || '').trim(), engine: 'offline-engine' };
++}
++
++/* ---------- the agent base class ---------- */
++
++class Agent {
++  constructor({ id, name, emoji, role, description, skills = [] }) {
++    this.id = id;
++    this.name = name;
++    this.emoji = emoji || '🤖';
++    this.role = role || '';
++    this.description = description || '';
++    this.skills = skills;
++  }
++
++  /* Public, serialisable identity — used by GET /api/agency/agents and the frontend roster. */
++  card() {
++    return { id: this.id, name: this.name, emoji: this.emoji, role: this.role, description: this.description, skills: this.skills };
++  }
++
++  /* Does this agent add value to this mission? Directors use it for auto-delegation. */
++  relevance() { return 0; }
++
++  /* Every agent answers with the SAME step shape so the trace is uniform. */
++  step(action, result, meta) {
++    return {
++      agent: this.name,
++      agentId: this.id,
++      emoji: this.emoji,
++      role: this.role,
++      action: String(action || 'work'),
++      result: String(result == null ? '' : result),
++      ok: true,
++      ...(meta ? { meta } : {})
++    };
++  }
++
++  failStep(action, error) {
++    return {
++      agent: this.name, agentId: this.id, emoji: this.emoji, role: this.role,
++      action: String(action || 'work'),
++      result: `⚠️ ${this.name} could not finish: ${(error && error.message) || error || 'unknown error'}`,
++      ok: false
++    };
++  }
++
++  // eslint-disable-next-line no-unused-vars
++  async run(ctx) { throw new Error(`${this.id} has no run()`); }
++}
++
++module.exports = { Agent, think, money, isFinancial, bullets, urlsIn, splitSubtasks, snippet, PRIORITY_RANK };
+diff --git a/server/agents/copywriter.js b/server/agents/copywriter.js
+new file mode 100644
+index 0000000..7c6c0f1
+--- /dev/null
++++ b/server/agents/copywriter.js
+@@ -0,0 +1,179 @@
++'use strict';
++/* CopywriterAgent — drafts emails, customer proposals and daily summaries.
++   Uses the local LLM when one is reachable; otherwise composes from templates so the
++   swarm ALWAYS returns a usable draft. */
++
++const cfgm = require('../config');
++const { Agent, think, snippet } = require('./base');
++const { dayLabel } = require('../util');
++
++const WRITE_HINTS = /\b(draft|write|compose|reply|respond|email|e-mail|letter|memo|proposal|pitch|quote|briefing|brief|summary|summari[sz]e|announce|newsletter|message|copy)\b/i;
++
++function deliverableKind(task) {
++  const t = String(task || '').toLowerCase();
++  if (/\bproposal|pitch|quotation|quote|offer|tender\b/.test(t)) return 'proposal';
++  if (/\bemail|e-mail|reply|respond|letter|follow[- ]?up note\b/.test(t)) return 'email';
++  if (/\bbriefing|brief|memo|report\b/.test(t)) return 'briefing';
++  return 'summary';
++}
++
++const TITLES = {
++  proposal: 'Customer proposal',
++  email: 'Email draft',
++  briefing: 'Executive briefing',
++  summary: 'Daily summary'
++};
++
++class CopywriterAgent extends Agent {
++  constructor() {
++    super({
++      id: 'copywriter',
++      name: 'CopywriterAgent',
++      emoji: '✍️',
++      role: 'Drafting & communication',
++      description: 'Drafts emails, customer proposals and daily summaries from the swarm’s findings.',
++      skills: ['email drafts', 'proposals', 'daily summaries', 'executive tone']
++    });
++  }
++
++  relevance(task) {
++    let s = 0.3;
++    if (WRITE_HINTS.test(task)) s += 0.55;
++    return Math.min(1, s);
++  }
++
++  /* Condense what the other agents produced into the copy brief. */
++  material(ctx) {
++    const r = ctx.shared.research || {};
++    const a = ctx.shared.analysis || {};
++    const facts = (r.hits || []).slice(0, 6).map(h => `- [${h.kind}] ${h.title}: ${snippet(h.snippet, 140)}`);
++    (r.crawled || []).forEach(c => facts.push(`- [web] ${c.title}: ${snippet(c.snippet, 140)}`));
++    const priorities = (a.topTasks || []).map(t => `- [${t.priority}] ${t.title}`);
++    const inbox = (a.inbox || []).map(e => `- ${e.from}: ${e.subject}`);
++    const financial = (a.financial || []).map(f => `- ${f.who} — ${f.label}${f.amounts && f.amounts.length ? ` (${f.amounts.join(', ')})` : ''}`);
++    return { facts, priorities, inbox, financial, analysis: a };
++  }
++
++  template(kind, ctx, mat) {
++    const cfg = cfgm.load();
++    const owner = (cfg.owner && cfg.owner.name) || 'ARIA';
++    const tz = (cfg.owner && cfg.owner.timezone) || 'Africa/Nairobi';
++    const today = dayLabel(Date.now(), tz);
++    const a = mat.analysis || {};
++    const none = '- (nothing on record yet)';
++    const facts = mat.facts.length ? mat.facts.join('\n') : none;
++    const priorities = mat.priorities.length ? mat.priorities.join('\n') : none;
++
++    if (kind === 'email') {
++      return [
++        `**Subject:** ${snippet(ctx.task.replace(/^\s*(draft|write|compose|send)\s+(an?\s+)?(email|e-mail|reply)?\s*(about|on|to|for)?\s*/i, '') || 'Update', 70)}`,
++        '',
++        'Hi there,',
++        '',
++        `Quick update following our review${mat.facts.length ? ' of the material on file' : ''}:`,
++        '',
++        facts,
++        '',
++        mat.priorities.length ? `Next on our side:\n${priorities}` : 'Next on our side: I will confirm the outstanding points and revert.',
++        '',
++        'Happy to jump on a short call if that is easier.',
++        '',
++        'Best regards,',
++        owner
++      ].join('\n');
++    }
++
++    if (kind === 'proposal') {
++      return [
++        `### Proposal — ${snippet(ctx.task, 80)}`,
++        `_Prepared by ${owner} · ${today}_`,
++        '',
++        '**1. Understanding**',
++        facts,
++        '',
++        '**2. What we propose**',
++        mat.priorities.length ? priorities : '- A focused engagement covering the scope above, delivered in two phases.',
++        '',
++        '**3. Commercials**',
++        mat.financial.length ? mat.financial.join('\n') : '- Pricing to be confirmed once scope is signed off.',
++        '',
++        '**4. Next step**',
++        '- Confirm scope and timeline, then we issue the formal quotation.'
++      ].join('\n');
++    }
++
++    if (kind === 'briefing') {
++      return [
++        `### Executive briefing — ${today}`,
++        '',
++        `**Situation.** ${a.posture ? `Workload is ${a.posture} (pressure ${a.pressure}/100).` : 'Workload assessed from the current records.'} ${mat.facts.length ? `${mat.facts.length} supporting record${mat.facts.length === 1 ? '' : 's'} reviewed.` : ''}`,
++        '',
++        '**What the evidence says**',
++        facts,
++        '',
++        '**Where the pressure is**',
++        priorities,
++        '',
++        mat.inbox.length ? `**Waiting on you**\n${mat.inbox.join('\n')}` : '**Waiting on you**\n- Inbox is clear.',
++        '',
++        mat.financial.length ? `**Money in motion**\n${mat.financial.join('\n')}\n` : null,
++        `**Recommendation.** ${(a.focus && a.focus[0]) ? `Clear “${a.focus[0]}” first — it is the highest-leverage item on the board.` : 'No blockers: use the open runway for deep work.'}`
++      ].filter(l => l !== null).join('\n');
++    }
++
++    return [
++      `### Daily summary — ${today}`,
++      '',
++      `${a.counts ? `${a.counts.openTasks} open actions · ${a.counts.unread} unread · ${a.counts.todayEvents} meetings today.` : 'Snapshot of the current desk.'}`,
++      '',
++      '**Focus**',
++      priorities,
++      '',
++      '**Context**',
++      facts,
++      '',
++      mat.inbox.length ? `**Inbox needing a decision**\n${mat.inbox.join('\n')}` : '**Inbox needing a decision**\n- None.',
++      '',
++      `**Close the day by** ${(a.focus && a.focus[0]) ? `finishing “${a.focus[0]}”.` : 'clearing one deep-work block.'}`
++    ].join('\n');
++  }
++
++  async run(ctx) {
++    const kind = deliverableKind(ctx.task);
++    const mat = this.material(ctx);
++    const fallback = this.template(kind, ctx, mat);
++
++    const system = 'You are CopywriterAgent inside ARIA OS, an executive communications writer. ' +
++      'Write in clear, confident business English. No preamble, no meta-commentary — output the deliverable only. Use short paragraphs and markdown.';
++    const user = [
++      `MISSION: ${ctx.task}`,
++      `DELIVERABLE: ${TITLES[kind]}`,
++      '',
++      'RESEARCH FINDINGS:',
++      mat.facts.join('\n') || '(none)',
++      '',
++      'ANALYSIS — PRIORITIES:',
++      mat.priorities.join('\n') || '(none)',
++      '',
++      'ANALYSIS — INBOX:',
++      mat.inbox.join('\n') || '(none)',
++      '',
++      'ANALYSIS — FINANCIAL:',
++      mat.financial.join('\n') || '(none)'
++    ].join('\n');
++
++    const { text, engine } = await think(system, user, fallback);
++    const draft = text || fallback;
++
++    ctx.shared.draft = { kind, title: TITLES[kind], body: draft, engine };
++
++    return this.step(
++      `Drafted the ${TITLES[kind].toLowerCase()} from the swarm’s findings`,
++      draft,
++      { kind, engine }
++    );
++  }
++}
++
++module.exports = CopywriterAgent;
++module.exports.deliverableKind = deliverableKind;
+diff --git a/server/agents/director.js b/server/agents/director.js
+new file mode 100644
+index 0000000..33e110c
+--- /dev/null
++++ b/server/agents/director.js
+@@ -0,0 +1,188 @@
++'use strict';
++/* DirectorAgent (ARIA) — the Executive Chief of Staff.
++   Parses a complex multi-step instruction, delegates the sub-tasks to the specialist
++   agents, then synthesises everything they produced into one executive answer. */
++
++const cfgm = require('../config');
++const { Agent, think, splitSubtasks, snippet } = require('./base');
++const { dayLabel } = require('../util');
++
++/* Order matters: research feeds analysis feeds copy. */
++const PIPELINE = ['researcher', 'analyst', 'copywriter'];
++
++class DirectorAgent extends Agent {
++  constructor() {
++    super({
++      id: 'director',
++      name: 'DirectorAgent',
++      emoji: '🎩',
++      role: 'Executive Chief of Staff (ARIA)',
++      description: 'Parses complex multi-step instructions, delegates to the swarm and signs off the final executive output.',
++      skills: ['task decomposition', 'delegation', 'synthesis']
++    });
++  }
++
++  relevance() { return 1; }   // the Director always runs
++
++  /* ---------- planning ---------- */
++  /* `roster` is a Map(id → agent instance) of the available specialists. */
++  plan(task, roster, requested) {
++    const subtasks = splitSubtasks(task);
++    const ids = [];
++
++    const wanted = Array.isArray(requested)
++      ? requested.map(x => String(x || '').toLowerCase().trim()).filter(x => x && x !== 'director')
++      : null;
++
++    if (wanted && wanted.length) {
++      for (const id of PIPELINE) if (wanted.includes(id) && roster.has(id)) ids.push(id);
++    }
++
++    if (!ids.length) {
++      /* Auto-delegation: score every specialist against the mission, keep the useful ones. */
++      const scored = PIPELINE
++        .filter(id => roster.has(id))
++        .map(id => ({ id, score: roster.get(id).relevance(task) }))
++        .sort((a, b) => b.score - a.score);
++      for (const s of scored) if (s.score >= 0.6) ids.push(s.id);
++      if (!ids.length && scored.length) ids.push(scored[0].id);
++      ids.sort((a, b) => PIPELINE.indexOf(a) - PIPELINE.indexOf(b));
++    }
++
++    /* Which sub-task does each agent own? */
++    const assignments = ids.map(id => {
++      const agent = roster.get(id);
++      const owned = subtasks.filter(s => agent.relevance(s) >= 0.6);
++      return {
++        id,
++        name: agent.name,
++        emoji: agent.emoji,
++        role: agent.role,
++        subtasks: owned.length ? owned : [task],
++        action: this.actionLabel(id, owned.length ? owned[0] : task)
++      };
++    });
++
++    /* Sequential = one agent per wave; parallel = research + analysis together, copy after. */
++    const waves = { sequential: ids.map(id => [id]), parallel: [] };
++    const first = ids.filter(id => id !== 'copywriter');
++    const second = ids.filter(id => id === 'copywriter');
++    if (first.length) waves.parallel.push(first);
++    if (second.length) waves.parallel.push(second);
++
++    return { task, subtasks, agents: ids, assignments, waves };
++  }
++
++  actionLabel(id, subtask) {
++    const s = snippet(subtask, 60);
++    if (id === 'researcher') return `Gather facts for “${s}”`;
++    if (id === 'analyst') return `Analyse priorities, inbox & finances for “${s}”`;
++    if (id === 'copywriter') return `Draft the deliverable for “${s}”`;
++    return `Work on “${s}”`;
++  }
++
++  /* ---------- step 1: the delegation step in the trace ---------- */
++  async run(ctx) {
++    const plan = ctx.plan;
++    const L = [];
++    L.push(`**Mission:** ${ctx.task}`);
++    L.push('');
++    L.push(`**Decomposed into ${plan.subtasks.length} step${plan.subtasks.length === 1 ? '' : 's'}:**`);
++    plan.subtasks.forEach((s, i) => L.push(`${i + 1}. ${s}`));
++    L.push('');
++    L.push(`**Delegated (${ctx.mode}) to ${plan.assignments.length} agent${plan.assignments.length === 1 ? '' : 's'}:**`);
++    plan.assignments.forEach(a => L.push(`- ${a.emoji} **${a.name}** → ${a.action}`));
++    return this.step(
++      `Parsed the mission into ${plan.subtasks.length} step${plan.subtasks.length === 1 ? '' : 's'} and delegated to ${plan.assignments.length} agent${plan.assignments.length === 1 ? '' : 's'}`,
++      L.join('\n'),
++      { subtasks: plan.subtasks, agents: plan.agents, mode: ctx.mode }
++    );
++  }
++
++  /* ---------- step N: synthesis ---------- */
++  nextActions(ctx) {
++    const a = ctx.shared.analysis || {};
++    const r = ctx.shared.research || {};
++    const d = ctx.shared.draft || null;
++    const out = [];
++    (a.focus || []).slice(0, 3).forEach(f => out.push(`Clear **${f}**`));
++    if (a.counts && a.counts.overdue) out.push(`Reschedule or close ${a.counts.overdue} overdue item${a.counts.overdue === 1 ? '' : 's'}`);
++    if (a.counts && a.counts.unread) out.push(`Triage ${a.counts.unread} unread inbox item${a.counts.unread === 1 ? '' : 's'}`);
++    if (a.financial && a.financial.length) out.push(`Reconcile ${a.financial.length} open financial thread${a.financial.length === 1 ? '' : 's'}`);
++    if (d) out.push(`Review and send the ${d.title.toLowerCase()} drafted above`);
++    if (r.hits && !r.hits.length) out.push('Feed the brain more context (upload a document or say “remember that …”) so research lands deeper next time');
++    return out.slice(0, 6);
++  }
++
++  async synthesize(ctx) {
++    const cfg = cfgm.load();
++    const tz = (cfg.owner && cfg.owner.timezone) || 'Africa/Nairobi';
++    const owner = (cfg.owner && cfg.owner.name) || 'Boss';
++    const a = ctx.shared.analysis || {};
++    const r = ctx.shared.research || {};
++    const d = ctx.shared.draft || null;
++    const actions = this.nextActions(ctx);
++
++    const evidence = [
++      r.hits ? `${r.hits.length} brain record${r.hits.length === 1 ? '' : 's'}` : null,
++      r.crawled && r.crawled.length ? `${r.crawled.length} web page${r.crawled.length === 1 ? '' : 's'}` : null,
++      a.counts ? `${a.counts.openTasks} open actions` : null,
++      a.counts ? `${a.counts.unread} unread` : null,
++      a.counts && a.counts.financial ? `${a.counts.financial} financial records` : null
++    ].filter(Boolean).join(' · ');
++
++    const fallbackSummary = [
++      `${ctx.plan.assignments.length} agent${ctx.plan.assignments.length === 1 ? '' : 's'} worked this mission over ${evidence || 'the available records'}.`,
++      a.posture ? `Current workload reads **${a.posture}** (pressure ${a.pressure}/100).` : '',
++      (a.focus && a.focus[0]) ? `The single highest-leverage move is **${a.focus[0]}**.` : '',
++      d ? `${/^[aeiou]/i.test(d.title) ? 'An' : 'A'} ${d.title.toLowerCase()} is drafted and ready for your review.` : ''
++    ].filter(Boolean).join(' ');
++
++    const { text: summary, engine } = await think(
++      'You are ARIA, Executive Chief of Staff. Write ONE tight executive paragraph (max 70 words) summarising the mission outcome for the principal. No headings, no bullet points, no preamble.',
++      [`MISSION: ${ctx.task}`, '', 'AGENT OUTPUTS:', ...ctx.trace.map(t => `${t.agent}: ${snippet(t.result, 400)}`)].join('\n'),
++      fallbackSummary
++    );
++
++    const L = [];
++    L.push(`## 🤖 Agency mission report`);
++    L.push(`_${dayLabel(Date.now(), tz)} · squad: ${ctx.plan.assignments.map(x => x.name).join(', ') || 'DirectorAgent'} · mode: ${ctx.mode}_`);
++    L.push('');
++    L.push(`**Mission:** ${ctx.task}`);
++    L.push('');
++    L.push(`### Executive summary`);
++    L.push(summary || fallbackSummary);
++    if (r.hits && r.hits.length) {
++      L.push('');
++      L.push('### Key findings');
++      r.hits.slice(0, 5).forEach(h => L.push(`- [${h.kind}] **${h.title}** — ${snippet(h.snippet, 130)}`));
++    }
++    if (a.counts) {
++      L.push('');
++      L.push('### Desk analysis');
++      L.push(`- Pressure index **${a.pressure}/100** — ${a.posture}`);
++      L.push(`- ${a.counts.openTasks} open actions (${a.counts.overdue} overdue, ${a.counts.highPriority} high priority)`);
++      L.push(`- ${a.counts.unread} unread emails · ${a.counts.hotMessages} priority messages · ${a.counts.financial} financial records`);
++      if (a.risks && a.risks.length) L.push(`- Risks: ${a.risks.join('; ')}`);
++    }
++    if (d) {
++      L.push('');
++      L.push(`### ${d.title} (draft)`);
++      L.push(d.body);
++    }
++    L.push('');
++    L.push('### ⚡ Recommended next actions');
++    L.push(actions.length ? actions.map((x, i) => `${i + 1}. ${x}`).join('\n') : `1. Nothing outstanding, ${owner} — the board is clear.`);
++
++    const step = this.step(
++      'Synthesised every agent output into the executive report',
++      L.join('\n'),
++      { engine, actions }
++    );
++    step.final = true;
++    return step;
++  }
++}
++
++module.exports = DirectorAgent;
++module.exports.PIPELINE = PIPELINE;
+diff --git a/server/agents/index.js b/server/agents/index.js
+new file mode 100644
+index 0000000..23e2f7a
+--- /dev/null
++++ b/server/agents/index.js
+@@ -0,0 +1,28 @@
++'use strict';
++/* Agency Swarm roster — one place that knows every agent that exists. */
++
++const DirectorAgent = require('./director');
++const ResearcherAgent = require('./researcher');
++const CopywriterAgent = require('./copywriter');
++const AnalystAgent = require('./analyst');
++const { Agent } = require('./base');
++
++const director = new DirectorAgent();
++const specialists = [new ResearcherAgent(), new CopywriterAgent(), new AnalystAgent()];
++
++/* Map(id → instance) of the delegatable specialists (the Director is not delegatable — it IS ARIA). */
++function roster() {
++  return new Map(specialists.map(a => [a.id, a]));
++}
++
++/* Everything, Director first — this is what the frontend renders as the swarm roster. */
++function all() { return [director, ...specialists]; }
++
++function list() { return all().map(a => a.card()); }
++
++function get(id) { return all().find(a => a.id === String(id || '').toLowerCase()) || null; }
++
++module.exports = {
++  Agent, DirectorAgent, ResearcherAgent, CopywriterAgent, AnalystAgent,
++  director, specialists, roster, all, list, get
++};
+diff --git a/server/agents/researcher.js b/server/agents/researcher.js
+new file mode 100644
+index 0000000..9fb06a6
+--- /dev/null
++++ b/server/agents/researcher.js
+@@ -0,0 +1,112 @@
++'use strict';
++/* ResearcherAgent — queries the second brain, crawls external URLs, gathers facts. */
++
++const brain = require('../brain');
++const dbm = require('../db');
++const weblearn = require('../weblearn');
++const { Agent, urlsIn, snippet } = require('./base');
++
++const RESEARCH_HINTS = /\b(research|find|look ?up|investigate|gather|source|evidence|facts?|what do (?:we|i) know|background|context|notes?|supplier|competitor|market|read|crawl|scan)\b/i;
++
++class ResearcherAgent extends Agent {
++  constructor() {
++    super({
++      id: 'researcher',
++      name: 'ResearcherAgent',
++      emoji: '🔎',
++      role: 'Research & retrieval',
++      description: 'Queries the second brain, crawls external URLs and gathers the facts the rest of the swarm reasons over.',
++      skills: ['second-brain search', 'web crawling', 'fact extraction']
++    });
++  }
++
++  relevance(task) {
++    let s = 0.35;                                   // research is almost always useful
++    if (RESEARCH_HINTS.test(task)) s += 0.5;
++    if (urlsIn(task).length) s += 0.4;
++    return Math.min(1, s);
++  }
++
++  /* Build the queries this mission should hit the brain with. */
++  queries(ctx) {
++    const out = [ctx.task];
++    for (const sub of (ctx.plan && ctx.plan.subtasks) || []) if (sub && sub !== ctx.task) out.push(sub);
++    return out.slice(0, 4);
++  }
++
++  async run(ctx) {
++    const queries = this.queries(ctx);
++    const hits = [];
++    const seen = new Set();
++    for (const q of queries) {
++      let found = [];
++      try { found = brain.search(q, 6) || []; } catch (_) { found = []; }
++      for (const h of found) {
++        const key = `${h.kind}:${h.title}`;
++        if (seen.has(key)) continue;
++        seen.add(key);
++        hits.push(h);
++      }
++    }
++    hits.sort((a, b) => (b.score || 0) - (a.score || 0));
++    const top = hits.slice(0, 8);
++
++    /* External sources: crawl at most two URLs found in the mission text. */
++    const crawled = [];
++    const failed = [];
++    if (ctx.allowWeb !== false) {
++      for (const url of urlsIn(ctx.task).slice(0, 2)) {
++        try {
++          const note = await weblearn.learnFromUrl(url);
++          crawled.push({ url, title: note.title, snippet: snippet(note.content, 240) });
++        } catch (e) {
++          failed.push({ url, error: (e && e.message) || 'unreachable' });
++        }
++      }
++    }
++
++    /* Corpus stats give the Director an honest picture of how much evidence exists. */
++    const db = dbm.load();
++    const corpus = {
++      notes: (db.notes || []).length,
++      emails: (db.emails || []).length,
++      messages: (db.messages || []).length,
++      events: (db.events || []).length
++    };
++
++    ctx.shared.research = {
++      queries,
++      hits: top.map(h => ({ kind: h.kind, title: h.title, snippet: snippet(h.snippet, 200), score: h.score, ts: h.ts })),
++      crawled,
++      failed,
++      corpus
++    };
++
++    const lines = [];
++    lines.push(`Searched the second brain for: ${queries.map(q => `“${snippet(q, 60)}”`).join(', ')}.`);
++    lines.push('');
++    if (top.length) {
++      lines.push(`**${top.length} relevant record${top.length === 1 ? '' : 's'} found:**`);
++      top.forEach(h => lines.push(`- [${h.kind}] **${h.title}** — ${snippet(h.snippet, 160)}`));
++    } else {
++      lines.push(`No matching records yet — the brain holds ${corpus.notes} notes, ${corpus.emails} emails, ${corpus.messages} messages. Teach ARIA with “remember that …” or ingest a document to deepen this answer.`);
++    }
++    if (crawled.length) {
++      lines.push('');
++      lines.push('**External sources read:**');
++      crawled.forEach(c => lines.push(`- **${c.title}** (${c.url}) — ${c.snippet}`));
++    }
++    if (failed.length) {
++      lines.push('');
++      failed.forEach(f => lines.push(`- Could not read ${f.url} — ${f.error}`));
++    }
++
++    return this.step(
++      `Searched the second brain (${queries.length} quer${queries.length === 1 ? 'y' : 'ies'}) and read ${crawled.length} external page${crawled.length === 1 ? '' : 's'}`,
++      lines.join('\n'),
++      { hits: top.length, crawled: crawled.length, corpus }
++    );
++  }
++}
++
++module.exports = ResearcherAgent;
+diff --git a/server/app.js b/server/app.js
+index 3d9219b..481e162 100644
+--- a/server/app.js
++++ b/server/app.js
+@@ -14,6 +14,7 @@ const dbm = require('./db');
+ const cfgm = require('./config');
+ const brain = require('./brain');
+ const assistant = require('./assistant');
++const agency = require('./agency');
+ const weblearn = require('./weblearn');
+ const doclearn = require('./doclearn');
+ const briefGen = require('./brief');
+@@ -79,6 +80,7 @@ function buildState() {
+   const notes = arr(db.notes);
+   const chats = arr(db.chats);
+   const briefs = arr(db.briefs).slice().sort((a, b) => (b.generatedAt || 0) - (a.generatedAt || 0));
++  const agencyRuns = arr(db.agencyRuns).slice().sort((a, b) => (b.startedAt || b.ts || 0) - (a.startedAt || a.ts || 0));
+   const unread = emails.filter(e => !e.read).length;
+ 
+   const tz = (cfg.owner && cfg.owner.timezone) || 'Africa/Nairobi';
+@@ -106,6 +108,8 @@ function buildState() {
+     chats,
+     briefs,
+     brief: briefs[0] || null,
++    agencyRuns,
++    agents: agency.listAgents(),
+     stats: {
+       engine: engine.activeEngine || 'offline',
+       lastSync: (db.meta && db.meta.lastSync) || null,
+@@ -114,7 +118,8 @@ function buildState() {
+       emails: emails.length,
+       messages: messages.length,
+       events: events.length,
+-      tasks: tasks.length
++      tasks: tasks.length,
++      agencyRuns: agencyRuns.length
+     },
+     counts: {
+       events: events.length,
+@@ -123,7 +128,8 @@ function buildState() {
+       notes: notes.length,
+       messages: messages.length,
+       chats: chats.length,
+-      briefs: briefs.length
++      briefs: briefs.length,
++      agencyRuns: agencyRuns.length
+     }
+   };
+ }
+@@ -149,8 +155,9 @@ api.get('/state', (req, res) => {
+       engine: { activeEngine: 'offline', model: '' }, llm: { activeEngine: 'offline', model: '' },
+       activeEngine: 'offline', unread: 0,
+       events: [], allEvents: [], emails: [], inbox: [], tasks: [], messages: [], notes: [], chats: [], briefs: [], brief: null,
+-      stats: { engine: 'offline', lastSync: null, notes: 0, briefs: 0, emails: 0, messages: 0, events: 0, tasks: 0 },
+-      counts: { events: 0, emails: 0, inbox: 0, notes: 0, messages: 0, chats: 0, briefs: 0 }
++      agencyRuns: [], agents: [],
++      stats: { engine: 'offline', lastSync: null, notes: 0, briefs: 0, emails: 0, messages: 0, events: 0, tasks: 0, agencyRuns: 0 },
++      counts: { events: 0, emails: 0, inbox: 0, notes: 0, messages: 0, chats: 0, briefs: 0, agencyRuns: 0 }
+     });
+   }
+ });
+@@ -427,6 +434,57 @@ api.get('/ai/status', async (req, res) => {
+   } catch (e) { fail(res, e, { provider: 'offline', activeEngine: 'offline', model: '', ollamaReachable: false, models: [] }); }
+ });
+ 
++/* ---------------- agency swarm (multi-agent) ----------------
++   ARIA (DirectorAgent) delegates a mission to a swarm of background specialists and
++   answers with the final output PLUS the full agent trace, so the UI can replay who did
++   what. Everything is deterministic and offline-safe; a local LLM only sharpens the prose. */
++api.get('/agency/agents', (req, res) => {
++  try { ok(res, arr(agency.listAgents())); } catch (e) { fail(res, e, []); }
++});
++
++api.get('/agency/runs', (req, res) => {
++  try { ok(res, arr(agency.history(Number(req.query.limit) || 20))); } catch (e) { fail(res, e, []); }
++});
++
++api.get('/agency/runs/:id', (req, res) => {
++  try {
++    const run = arr(agency.history(agency.MAX_RUNS)).find(r => r.id === req.params.id);
++    if (!run) return res.status(404).json({ error: 'not found' });
++    ok(res, run);
++  } catch (e) { fail(res, e); }
++});
++
++/* Plan only — lets the UI render the queued steps before the swarm starts working. */
++api.post('/agency/plan', (req, res) => {
++  try {
++    const { task, agents } = req.body || {};
++    if (!String(task || '').trim()) return res.status(400).json({ error: 'task required' });
++    ok(res, agency.plan(task, agents));
++  } catch (e) {
++    if (e && e.status === 400) return res.status(400).json({ error: e.message });
++    fail(res, e);
++  }
++});
++
++api.post('/agency/run', async (req, res) => {
++  try {
++    const { task, agents, mode, allowWeb } = req.body || {};
++    if (!String(task || '').trim()) return res.status(400).json({ error: 'task required' });
++    const result = await agency.run({ task, agents, mode, allowWeb });
++    ok(res, result);
++  } catch (e) {
++    if (e && e.status === 400) return res.status(400).json({ error: e.message });
++    console.error('[agency]', (e && e.stack) || e);
++    ok(res, {
++      ok: false,
++      task: (req.body && req.body.task) || '',
++      finalOutput: 'The swarm hit an error: ' + ((e && e.message) || 'unknown'),
++      agentTrace: [],
++      error: (e && e.message) || 'unknown'
++    });
++  }
++});
++
+ /* ---------------- push ---------------- */
+ api.get('/push/key', async (req, res) => {
+   try { const v = await push.vapid(); ok(res, { publicKey: (v && v.publicKey) || null }); }
+diff --git a/server/db.js b/server/db.js
+index 41a6ff9..54ce58d 100644
+--- a/server/db.js
++++ b/server/db.js
+@@ -7,7 +7,7 @@
+         db.events.filter(...) / res.json(db.emails) without ever seeing `undefined`. */
+ const store = require('./store');
+ 
+-const COLLECTIONS = ['events', 'emails', 'messages', 'tasks', 'notes', 'briefs', 'chats', 'inbox', 'subscriptions'];
++const COLLECTIONS = ['events', 'emails', 'messages', 'tasks', 'notes', 'briefs', 'chats', 'inbox', 'subscriptions', 'agencyRuns'];
+ 
+ const seedTs = Date.now();
+ 
+@@ -34,6 +34,7 @@ function seed() {
+     briefs: [],
+     chats: [],
+     subscriptions: [],
++    agencyRuns: [],
+     meta: { lastSync: null, lastBriefDate: null, createdAt: seedTs }
+   };
+ }
