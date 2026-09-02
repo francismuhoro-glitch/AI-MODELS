@@ -707,6 +707,11 @@ async function viewBrain(main) {
         <label class="field">Paste anything — an idea, a client brief, a lesson learned<textarea id="cap-content" placeholder="Paste or type… it gets indexed, topic-tagged and searchable forever."></textarea></label>
         <button class="btn primary" id="cap-save" style="height:40px">＋ Remember</button>
       </div></div>
+    <div class="card" style="margin-top:14px"><h3>🌐 Learn from a website</h3>
+      <div class="form-grid" style="grid-template-columns:1fr auto;align-items:end">
+        <label class="field">Paste any article or page — ARIA reads its text into the brain<input id="web-url" placeholder="https://example.com/supplier-prices"></label>
+        <button class="btn primary" id="web-learn" style="height:40px">🌐 Learn</button>
+      </div></div>
     <div class="card" style="margin-top:14px"><h3>🔎 Search everything</h3>
       <input id="brain-q" placeholder="Ask your brain… e.g. “Kamau invoice terms”, “client demo feedback”, “M-Pesa reconciliation”">
       <div class="search-results" id="brain-results"></div></div>
@@ -716,6 +721,20 @@ async function viewBrain(main) {
     await POST('/api/notes', { title: $('#cap-title').value.trim(), content });
     toast('🧠 Remembered'); route();
   };
+  $('#web-learn').onclick = async () => {
+    const url = $('#web-url').value.trim();
+    if (!url) return toast('Paste a website URL first');
+    const btn = $('#web-learn'); btn.disabled = true; btn.textContent = '🌐 reading…';
+    try {
+      const r = await POST('/api/notes/from-url', { url });
+      toast(`🧠 Learned: “${r.note.title}” — saved to your brain`);
+      route();
+    } catch (e) {
+      btn.disabled = false; btn.textContent = '🌐 Learn';
+      toast(`⚠️ ${e.message}`);
+    }
+  };
+  $('#web-url').onkeydown = (e) => { if (e.key === 'Enter') $('#web-learn').click(); };
   let t; $('#brain-q').oninput = (e) => { clearTimeout(t); t = setTimeout(async () => {
     const q = e.target.value.trim(); if (!q) { $('#brain-results').innerHTML = ''; return; }
     const hits = await api(`/api/search?q=${encodeURIComponent(q)}`);

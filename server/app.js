@@ -10,6 +10,7 @@ const brain = require('./brain');
 const assistant = require('./assistant');
 const briefGen = require('./brief');
 const connectors = require('./connectors');
+const weblearn = require('./weblearn');
 const { llmStatus, checkOllama } = require('./llm');
 const { uid, dayKey, priorityOf, scorePriority, classifyContext } = require('./util');
 
@@ -156,6 +157,20 @@ app.post('/api/notes', async (req, res) => {
   brain.buildIndex();
   await dbm.saveNow();
   res.json(note);
+});
+/* Learn from a website — reads a page and saves its text into the second brain */
+app.post('/api/notes/from-url', async (req, res) => {
+  try {
+    const { url } = req.body || {};
+    if (!url) return res.status(400).json({ error: 'url required' });
+    let parsed;
+    try { parsed = new URL(String(url).trim()); } catch (_) { return res.status(400).json({ error: 'that does not look like a valid URL' }); }
+    if (parsed.protocol !== 'https:') return res.status(400).json({ error: 'only https URLs are supported' });
+    const note = await weblearn.learnFromUrl(url);
+    res.json({ ok: true, note });
+  } catch (e) {
+    res.status(502).json({ error: e.message || 'could not read that page' });
+  }
 });
 app.delete('/api/notes/:id', async (req, res) => {
   const db = dbm.load(); db.notes = db.notes.filter(n => n.id !== req.params.id); await dbm.saveNow(); brain.buildIndex(); res.json({ ok: true });

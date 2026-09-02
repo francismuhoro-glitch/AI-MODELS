@@ -57,6 +57,8 @@ ARIA_DEMO=1 npm start
 
 You can also talk to ARIA by voice (Assistant → 🎤) in browsers with Web Speech API support (Chrome/Edge/Safari; needs HTTPS or localhost), and she reads her replies aloud.
 
+Teach ARIA by talking: **“remember that …”**, **“my name is …”**, **“read this website https://…”** — or paste any URL into **Second Brain → Learn from a website** and she'll read it into her brain.
+
 ## 🔑 Connect your real accounts
 
 Open **Settings → Connectors** in the app:
