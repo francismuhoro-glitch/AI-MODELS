@@ -41,21 +41,17 @@ function load() {
   ensureDir();
   try {
     if (fs.existsSync(DB_FILE)) {
-      const data = fs.readFileSync(DB_FILE, 'utf8');
-      memDb = JSON.parse(data);
+      memDb = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
     }
   } catch (_) {}
-  
   if (!memDb) memDb = JSON.parse(JSON.stringify(INITIAL_DB));
   
-  // Guarantee core arrays exist
   memDb.events = memDb.events || [];
   memDb.emails = memDb.emails || [];
   memDb.inbox = memDb.inbox || [];
   memDb.notes = memDb.notes || [];
   memDb.messages = memDb.messages || [];
   memDb.chats = memDb.chats || [];
-  
   return memDb;
 }
 
