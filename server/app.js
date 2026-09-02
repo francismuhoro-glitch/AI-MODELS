@@ -7,6 +7,7 @@ const brain = require('./brain');
 const assistant = require('./assistant');
 const weblearn = require('./weblearn');
 const doclearn = require('./doclearn');
+const { llmStatus } = require('./llm');
 
 const app = express();
 
@@ -21,67 +22,120 @@ app.use((req, res, next) => {
   next();
 });
 
-// Serve frontend static assets
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
-// Create an isolated API router
 const apiRouter = express.Router();
 
+/* --- 1. Comprehensive /api/state for Hub, Sidebar & Tabs --- */
 apiRouter.get('/state', (req, res) => {
   try {
     const db = dbm.load();
     const cfg = cfgm.load();
+    let engine = { activeEngine: 'offline-engine', model: 'none', label: 'Built-in Engine', ready: true };
+    try { engine = llmStatus(); } catch (_) {}
+
     res.json({
+      ok: true,
       cfg,
-      owner: cfg.owner || { name: 'Francis Muhoro' },
+      owner: cfg.owner || { name: 'Francis Muhoro', timezone: 'Africa/Nairobi' },
+      rhythm: cfg.rhythm || { wakeHour: 6, workStartHour: 8, workEndHour: 17, sleepHour: 22 },
+      engine: engine || { activeEngine: 'offline-engine', model: 'none' },
+      llm: engine || { activeEngine: 'offline-engine', model: 'none' },
+      activeEngine: (engine && engine.activeEngine) || 'offline-engine',
+      events: db.events || [],
+      emails: db.emails || [],
+      inbox: db.inbox || [],
+      notes: db.notes || [],
+      messages: db.messages || [],
+      chats: db.chats || [],
       counts: {
         events: (db.events || []).length,
         emails: (db.emails || []).filter(e => !e.read).length,
         inbox: (db.inbox || []).filter(i => !i.done).length,
-        notes: (db.notes || []).length
-      },
-      activeEngine: 'offline-engine',
-      llm: { activeEngine: 'offline-engine', model: 'none' }
+        notes: (db.notes || []).length,
+        messages: (db.messages || []).length
+      }
     });
   } catch (e) {
-    res.json({ counts: { events: 0, emails: 0, inbox: 0, notes: 0 } });
+    res.json({
+      ok: true,
+      cfg: {},
+      owner: { name: 'Francis Muhoro', timezone: 'Africa/Nairobi' },
+      engine: { activeEngine: 'offline-engine', model: 'none' },
+      llm: { activeEngine: 'offline-engine', model: 'none' },
+      events: [],
+      emails: [],
+      inbox: [],
+      notes: [],
+      messages: [],
+      chats: [],
+      counts: { events: 0, emails: 0, inbox: 0, notes: 0, messages: 0 }
+    });
   }
 });
 
-apiRouter.get('/emails', (req, res) => {
-  try {
-    const db = dbm.load();
-    res.json(db.emails || []);
-  } catch (e) {
-    res.json([]);
+/* --- 2. Collection Routes (Inbox, Events, Emails, Messages) --- */
+apiRouter.get('/inbox', (req, res) => {
+  const db = dbm.load();
+  res.json(db.inbox || []);
+});
+
+apiRouter.post('/inbox', async (req, res) => {
+  const db = dbm.load();
+  const item = { id: 'task-' + Date.now(), done: false, ts: Date.now(), ...req.body };
+  db.inbox = db.inbox || [];
+  db.inbox.unshift(item);
+  await dbm.saveNow();
+  res.json(item);
+});
+
+apiRouter.put('/inbox/:id', async (req, res) => {
+  const db = dbm.load();
+  const item = (db.inbox || []).find(i => i.id === req.params.id);
+  if (item) {
+    Object.assign(item, req.body);
+    await dbm.saveNow();
+    return res.json(item);
   }
+  res.status(404).json({ error: 'not found' });
+});
+
+apiRouter.delete('/inbox/:id', async (req, res) => {
+  const db = dbm.load();
+  db.inbox = (db.inbox || []).filter(i => i.id !== req.params.id);
+  await dbm.saveNow();
+  res.json({ ok: true });
 });
 
 apiRouter.get('/events', (req, res) => {
-  try {
-    const db = dbm.load();
-    res.json(db.events || []);
-  } catch (e) {
-    res.json([]);
-  }
+  const db = dbm.load();
+  res.json(db.events || []);
 });
 
-apiRouter.get('/inbox', (req, res) => {
-  try {
-    const db = dbm.load();
-    res.json(db.inbox || []);
-  } catch (e) {
-    res.json([]);
-  }
+apiRouter.post('/events', async (req, res) => {
+  const db = dbm.load();
+  const ev = { id: 'ev-' + Date.now(), ...req.body };
+  db.events = db.events || [];
+  db.events.push(ev);
+  await dbm.saveNow();
+  brain.buildIndex();
+  res.json(ev);
 });
 
+apiRouter.get('/emails', (req, res) => {
+  const db = dbm.load();
+  res.json(db.emails || []);
+});
+
+apiRouter.get('/messages', (req, res) => {
+  const db = dbm.load();
+  res.json(db.messages || []);
+});
+
+/* --- 3. Second Brain & Document Routes --- */
 apiRouter.get('/notes', (req, res) => {
-  try {
-    const db = dbm.load();
-    res.json(db.notes || []);
-  } catch (e) {
-    res.json([]);
-  }
+  const db = dbm.load();
+  res.json(db.notes || []);
 });
 
 apiRouter.post('/notes', async (req, res) => {
@@ -140,6 +194,7 @@ apiRouter.get('/search', (req, res) => {
   }
 });
 
+/* --- 4. Assistant & Config Routes --- */
 apiRouter.post('/assistant', async (req, res) => {
   try {
     const { message } = req.body || {};
@@ -151,20 +206,12 @@ apiRouter.post('/assistant', async (req, res) => {
 });
 
 apiRouter.get('/assistant/history', (req, res) => {
-  try {
-    const db = dbm.load();
-    res.json(db.chats || []);
-  } catch (e) {
-    res.json([]);
-  }
+  const db = dbm.load();
+  res.json(db.chats || []);
 });
 
 apiRouter.get('/config', (req, res) => {
-  try {
-    res.json(cfgm.load());
-  } catch (e) {
-    res.json({});
-  }
+  res.json(cfgm.load());
 });
 
 apiRouter.post('/config', async (req, res) => {
@@ -176,7 +223,6 @@ apiRouter.post('/config', async (req, res) => {
   }
 });
 
-// Mount router under BOTH /api and root / (guarantees matching regardless of Vercel path rewrites)
 app.use('/api', apiRouter);
 app.use(apiRouter);
 
