@@ -1,7 +1,7 @@
 {
   "name": "aria-os",
   "version": "1.0.0",
-  "description": "ARIA OS \u2014 personal AI operating system: morning briefs, second brain, executive assistant",
+  "description": "ARIA OS — personal AI operating system: morning briefs, second brain, executive assistant",
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
