@@ -1,23 +1,26 @@
-const websearch = require('./websearch');
 'use strict';
+/**
+ * ARIA Assistant — deterministic intent routing + actions + web search + LLM fallback
+ */
 const dbm = require('./db');
 const brain = require('./brain');
 const cfgm = require('./config');
 const weblearn = require('./weblearn');
+const websearch = require('./websearch');
 const { llmChat, llmStatus } = require('./llm');
 const { dayKey, timeStr, dayLabel, snippet, extractTopics } = require('./util');
 
 const SYSTEM_PROMPT = `You are ARIA, the user's private executive assistant inside ARIA OS.
 You manage their day job and their business. You are concise, proactive, well-organized.
-Use the provided CONTEXT (calendar, emails, chats, second-brain notes) to answer the user's query.`;
+Use the provided CONTEXT (calendar, emails, chats, second-brain notes) to answer the user's query.
+If something is unknown, say so and suggest what to check. Never invent meetings or emails.`;
 
 async function respond(message) {
   const cfg = cfgm.load();
   const db = dbm.load();
   const engine = llmStatus();
 
-  db.chats = Array.isArray(db.chats) ? db.chats : [];
-  db.chats.push({ id: 'chat-' + Date.now() + '-u', role: 'user', content: message, ts: Date.now() });
+  db.upsert('chats', { id: `chat-${Date.now()}-u`, role: 'user', content: message, ts: Date.now() });
 
   const pre = await routeIntent(String(message || ''));
   let reply, source;
@@ -34,12 +37,12 @@ async function respond(message) {
       reply = text;
       source = usedEngine;
     } else {
-      reply = offlineEngine(message, context, engine);
+      reply = await offlineEngine(message, context, engine);
       source = 'offline-engine';
     }
   }
 
-  db.chats.push({ id: 'chat-' + Date.now() + '-a', role: 'assistant', content: reply, ts: Date.now(), engine: source });
+  db.upsert('chats', { id: `chat-${Date.now()}-a`, role: 'assistant', content: reply, ts: Date.now(), engine: source });
   await dbm.saveNow();
   return { reply, engine: source, llm: engine };
 }
@@ -73,21 +76,21 @@ async function routeIntent(msg) {
   const cfg = cfgm.load();
   const tz = (cfg.owner && cfg.owner.timezone) || 'Africa/Nairobi';
 
-  // Schedule Meeting
+  // Schedule Event
   let mm = m.match(/^(?:schedule|add event|create meeting|meeting with|calendar)\s+(.+)$/i);
   if (mm) {
     const raw = mm[1].trim();
     const start = parseRelativeDateTime(raw);
     const cleanTitle = raw.replace(/(at\s+\d+(:\d+)?\s*(am|pm)?|tomorrow|today|next\s+[a-z]+|on\s+[a-z]+)/gi, '').trim() || 'Appointment';
     const newEvent = {
-      id: 'event-' + Date.now(),
+      id: `event-${Date.now()}`,
       title: cleanTitle,
       start,
       end: start + 3600000,
       context: /client|order|supplier|money|biz|pay/i.test(raw) ? 'business' : 'day-job',
       source: 'assistant'
     };
-    db.events = Array.isArray(db.events) ? db.events : [];
+    db.events = db.events || [];
     db.events.push(newEvent);
     await dbm.saveNow();
     brain.buildIndex();
@@ -99,25 +102,24 @@ async function routeIntent(msg) {
   if (mm) {
     const taskTitle = mm[1].trim();
     const isHigh = /urgent|important|asap|critical|now/i.test(taskTitle);
-    db.tasks = Array.isArray(db.tasks) ? db.tasks : [];
-    db.tasks.unshift({
-      id: 'task-' + Date.now(),
+    db.inbox = db.inbox || [];
+    db.inbox.unshift({
+      id: `task-${Date.now()}`,
       title: taskTitle.replace(/urgent|asap|critical/gi, '').trim(),
       priority: isHigh ? 'high' : 'medium',
       done: false,
       ts: Date.now(),
       context: /client|invoice|sale|biz/i.test(taskTitle) ? 'business' : 'day-job'
     });
-    db.inbox = db.tasks;
     await dbm.saveNow();
-    return `✅ **Task Added:** "${db.tasks[0].title}" (Priority: ${isHigh ? '🔥 High' : '⚡ Normal'})`;
+    return `✅ **Task Added:** "${db.inbox[0].title}" (Priority: ${isHigh ? '🔥 High' : '⚡ Normal'})`;
   }
 
   // Complete Task
   mm = m.match(/^(?:complete task|mark done|finish task|done with)\s+(.+)$/i);
   if (mm) {
     const q = mm[1].toLowerCase().trim();
-    const item = (db.tasks || []).find(t => !t.done && (t.title || '').toLowerCase().includes(q));
+    const item = (db.inbox || []).find(t => !t.done && (t.title || '').toLowerCase().includes(q));
     if (item) {
       item.done = true;
       await dbm.saveNow();
@@ -133,7 +135,7 @@ async function routeIntent(msg) {
 
   if (/^(what(?:'s| is) my name|who am i|do you know (?:my name|who i am)|what do you know about me)\??$/i.test(m)) return identityReply();
 
-  // Remember
+  // Remember Commands
   mm = m.match(/^(?:remember|note)(?:\s+that|\s+this)?\s+(.{3,2000})/i);
   if (mm) return await rememberReply(mm[1].trim());
 
@@ -157,8 +159,8 @@ async function setName(name) {
 
 function identityReply() {
   const cfg = cfgm.load();
-  const name = cfg.owner.name || 'Boss';
-  const where = cfg.owner.location && cfg.owner.location.label ? `${cfg.owner.location.label}, ${cfg.owner.timezone}` : cfg.owner.timezone;
+  const name = (cfg.owner && cfg.owner.name) || 'Boss';
+  const where = cfg.owner && cfg.owner.location && cfg.owner.location.label ? `${cfg.owner.location.label}, ${cfg.owner.timezone}` : (cfg.owner ? cfg.owner.timezone : 'Africa/Nairobi');
   const hits = brain.search(name, 3).filter(h => !/^day log/i.test(h.title));
   let out = `Your name is **${name}** — stored in Settings → Rhythm and remembered in my brain. You're in ${where}.\n\n`;
   if (hits.length) out += `What I know about you so far:\n` + hits.map(h => `- **${h.title}** _[${h.kind}]_ — ${snippet(h.snippet, 140)}`).join('\n');
@@ -182,14 +184,15 @@ async function learnReply(url) {
   }
 }
 
-function offlineEngine(msg, context, engineStatus) {
+/* ---------- Asynchronous Heuristic Offline Engine with Web Search ---------- */
+async function offlineEngine(msg, context, engineStatus) {
   const db = dbm.load();
   const cfg = cfgm.load();
-  const tz = cfg.owner.timezone;
+  const tz = (cfg.owner && cfg.owner.timezone) || 'Africa/Nairobi';
   const m = String(msg || '').toLowerCase();
 
-  if (/^(hi|hello|hey|good morning|sup|yo)\b/.test(m)) {
-    return `Hello ${cfg.owner.name || 'there'}! I'm ARIA, running locally. Ask me about your day, priorities, or second brain.`;
+  if (/^(hi|hello|hey|good morning|good afternoon|good evening|sup|yo)\b/.test(m)) {
+    return `Hello ${(cfg.owner && cfg.owner.name) || 'there'}! I'm ARIA, running locally. Ask me about your day, priorities, or second brain.`;
   }
 
   if (/\b(schedule|calendar|day look|agenda|meetings|what('s| is) on today)\b/.test(m)) {
@@ -200,7 +203,7 @@ function offlineEngine(msg, context, engineStatus) {
   }
 
   if (/\b(priorit|urgent|important|to do|tasks|focus)\b/.test(m)) {
-    const items = (db.tasks || db.inbox || []).filter(i => !i.done).slice(0, 5);
+    const items = (db.inbox || []).filter(i => !i.done).slice(0, 5);
     if (!items.length) return "No urgent priority items flagged right now.";
     return `**Top Priorities**:\n` + items.map(i => `- [${i.priority || 'medium'}] ${i.title}`).join('\n');
   }
@@ -211,18 +214,41 @@ function offlineEngine(msg, context, engineStatus) {
     return `**Unread Inbox** (${emails.length}):\n` + emails.map(e => `- **${e.fromName || e.from}**: ${e.subject}`).join('\n');
   }
 
+  if (/\b(slack|whatsapp|chat)\b/.test(m)) {
+    const chats = (db.messages || []).slice(-5);
+    if (!chats.length) return "No recent chat messages found.";
+    return `**Recent Messages**:\n` + chats.map(c => `- [${c.channel || c.source}] **${c.from}**: ${snippet(c.text, 60)}`).join('\n');
+  }
+
+  if (/\b(business|orders|suppliers|money|revenue|sales)\b/.test(m)) {
+    const bizEvents = (db.events || []).filter(e => e.context === 'business');
+    const bizEmails = (db.emails || []).filter(e => e.context === 'business');
+    const bizMsgs = (db.messages || []).filter(e => e.context === 'business');
+    return `**Business snapshot** 🏪\n\n*Upcoming business events*\n${bizEvents.map(e => `- ${dayKey(e.start, tz)} ${timeStr(e.start, tz)} — ${e.title}`).join('\n') || '- none' }\n\n*Business emails*\n${bizEmails.map(e => `- ${e.subject} — ${e.fromName}`).join('\n') || '- none'}\n\n*Business chats*\n${bizMsgs.map(x => `- [${x.channel}] ${x.from}: ${snippet(x.text, 80)}`).join('\n') || '- none'}`;
+  }
+
+  if (/\b(help|what can you do|capabilit)/.test(m)) {
+    return `I'm ARIA — your executive assistant. Things you can ask me:\n\n- **"Schedule meeting with Kamau tomorrow at 3pm"**\n- **"Add task: Review Q3 supplier prices"**\n- **"Draft email to user@domain.com saying hello"**\n- **"What does my day look like?"** — schedule across every calendar\n- **"What are my priorities?"** — ranked by urgency\n- **"How's my inbox?"** — unread, split day-job vs business\n- **"Remember that …"** — teach me something permanently\n- **"My name is …"** — I'll remember who you are\n- **"Read this website https://…"** — pull a page into the brain\n\nI reason over your real data.`;
+  }
+
+  // 1. Check local brain
   let hits = brain.search(msg, 3);
-  if (!hits.length && !/^(hi|hello|hey|schedule|calendar|day look|priorit|inbox|email|slack|whatsapp|business|help)/i.test(msg)) {
+
+  // 2. If nothing found in local brain, search live internet
+  if (!hits.length && !/^(hi|hello|hey|schedule|calendar|day look|priorit|inbox|email|slack|whatsapp|business|help)/i.test(m)) {
     try {
       const newNotes = await websearch.searchAndIngest(msg, 2);
       if (newNotes && newNotes.length) hits = brain.search(msg, 3);
     } catch (_) {}
   }
+
   if (hits && hits.length) {
-    return `From your brain:\n\n` + hits.map(h => `- **${h.title}**: ${snippet(h.snippet, 180)}`).join('\n\n');
+    return `Here is what I found:
+
+` + hits.map(h => `- **${h.title}**: ${snippet(h.snippet, 180)}`).join('\n\n');
   }
 
-  return "I don't have enough context in my brain or calendar to answer that specifically. Teach me with **“remember that …”**!";
+  return "I don't have enough context in my brain to answer that specifically. Teach me with **“remember that …”** or ask me to search the web!";
 }
 
 module.exports = { respond, offlineEngine };
