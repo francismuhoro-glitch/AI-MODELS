@@ -157,6 +157,11 @@ class DirectorAgent extends Agent {
       L.push('### Key findings');
       r.hits.slice(0, 5).forEach(h => L.push(`- [${h.kind}] **${h.title}** — ${snippet(h.snippet, 130)}`));
     }
+    if (r.webResults && r.webResults.length) {
+      L.push('');
+      L.push('### Live web intelligence');
+      r.webResults.slice(0, 5).forEach(w => L.push(`- [${w.source}] **${w.title}** — ${snippet(w.snippet, 130)}\n  🔗 ${w.url}`));
+    }
     if (a.counts) {
       L.push('');
       L.push('### Desk analysis');

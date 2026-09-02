@@ -1,10 +1,11 @@
-const websearch = require('../websearch');
 'use strict';
-/* ResearcherAgent — queries the second brain, crawls external URLs, gathers facts. */
+/* ResearcherAgent — queries the second brain, crawls external URLs, performs live web
+   searches, and gathers facts for the swarm to reason over. */
 
 const brain = require('../brain');
 const dbm = require('../db');
 const weblearn = require('../weblearn');
+const websearch = require('../websearch');
 const { Agent, urlsIn, snippet } = require('./base');
 
 const RESEARCH_HINTS = /\b(research|find|look ?up|investigate|gather|source|evidence|facts?|what do (?:we|i) know|background|context|notes?|supplier|competitor|market|read|crawl|scan)\b/i;
@@ -16,8 +17,8 @@ class ResearcherAgent extends Agent {
       name: 'ResearcherAgent',
       emoji: '🔎',
       role: 'Research & retrieval',
-      description: 'Queries the second brain, crawls external URLs and gathers the facts the rest of the swarm reasons over.',
-      skills: ['second-brain search', 'web crawling', 'fact extraction']
+      description: 'Queries the second brain, crawls external URLs, performs live web searches and gathers the facts the rest of the swarm reasons over.',
+      skills: ['second-brain search', 'web crawling', 'live web search', 'fact extraction']
     });
   }
 
@@ -25,6 +26,8 @@ class ResearcherAgent extends Agent {
     let s = 0.35;                                   // research is almost always useful
     if (RESEARCH_HINTS.test(task)) s += 0.5;
     if (urlsIn(task).length) s += 0.4;
+    // Boost relevance for queries that look like they need external knowledge
+    if (/what\s+is|who\s+is|latest|news|tell me about|search|look up/i.test(task)) s += 0.3;
     return Math.min(1, s);
   }
 
@@ -66,6 +69,32 @@ class ResearcherAgent extends Agent {
       }
     }
 
+    /* Live web search — if brain results are thin or mission looks like it needs external knowledge. */
+    const webResults = [];
+    const HIGH_CONFIDENCE = 3.0;
+    const hasStrongBrainHits = top.some(h => h.score >= HIGH_CONFIDENCE);
+    const needsWebKnowledge = !hasStrongBrainHits || /what\s+is|who\s+is|latest|news|github|tell me about/i.test(ctx.task);
+
+    if (ctx.allowWeb !== false && needsWebKnowledge) {
+      try {
+        const searchResults = await websearch.searchWeb(ctx.task, 3);
+        if (searchResults && searchResults.length > 0) {
+          for (const r of searchResults) {
+            webResults.push({
+              title: r.title,
+              snippet: snippet(r.snippet, 240),
+              url: r.url,
+              source: r.source
+            });
+          }
+          // Ingest top web result into second brain in background
+          if (searchResults[0].url && searchResults[0].url.startsWith('http')) {
+            weblearn.learnFromUrl(searchResults[0].url).catch(() => {});
+          }
+        }
+      } catch (_) {}
+    }
+
     /* Corpus stats give the Director an honest picture of how much evidence exists. */
     const db = dbm.load();
     const corpus = {
@@ -80,32 +109,38 @@ class ResearcherAgent extends Agent {
       hits: top.map(h => ({ kind: h.kind, title: h.title, snippet: snippet(h.snippet, 200), score: h.score, ts: h.ts })),
       crawled,
       failed,
+      webResults,
       corpus
     };
 
     const lines = [];
-    lines.push(`Searched the second brain for: ${queries.map(q => `“${snippet(q, 60)}”`).join(', ')}.`);
+    lines.push(`Searched the second brain for: ${queries.map(q => `"${snippet(q, 60)}"`).join(', ')}.`);
     lines.push('');
     if (top.length) {
-      lines.push(`**${top.length} relevant record${top.length === 1 ? '' : 's'} found:**`);
+      lines.push(`**${top.length} relevant record${top.length === 1 ? '' : 's'} found in brain:**`);
       top.forEach(h => lines.push(`- [${h.kind}] **${h.title}** — ${snippet(h.snippet, 160)}`));
     } else {
-      lines.push(`No matching records yet — the brain holds ${corpus.notes} notes, ${corpus.emails} emails, ${corpus.messages} messages. Teach ARIA with “remember that …” or ingest a document to deepen this answer.`);
+      lines.push(`No matching records in brain — ${corpus.notes} notes, ${corpus.emails} emails, ${corpus.messages} messages.`);
     }
     if (crawled.length) {
       lines.push('');
-      lines.push('**External sources read:**');
+      lines.push('**External pages read:**');
       crawled.forEach(c => lines.push(`- **${c.title}** (${c.url}) — ${c.snippet}`));
     }
     if (failed.length) {
       lines.push('');
       failed.forEach(f => lines.push(`- Could not read ${f.url} — ${f.error}`));
     }
+    if (webResults.length) {
+      lines.push('');
+      lines.push(`**🌐 Live web search found ${webResults.length} result${webResults.length === 1 ? '' : 's'}:**`);
+      webResults.forEach(r => lines.push(`- [${r.source}] **${r.title}** — ${r.snippet}\n  🔗 ${r.url}`));
+    }
 
     return this.step(
-      `Searched the second brain (${queries.length} quer${queries.length === 1 ? 'y' : 'ies'}) and read ${crawled.length} external page${crawled.length === 1 ? '' : 's'}`,
+      `Searched brain (${queries.length} quer${queries.length === 1 ? 'y' : 'ies'}), crawled ${crawled.length} page${crawled.length === 1 ? '' : 's'}${webResults.length ? ', found ' + webResults.length + ' web result' + (webResults.length === 1 ? '' : 's') : ''}`,
       lines.join('\n'),
-      { hits: top.length, crawled: crawled.length, corpus }
+      { hits: top.length, crawled: crawled.length, webResults: webResults.length, corpus }
     );
   }
 }

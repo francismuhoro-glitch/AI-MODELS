@@ -15,6 +15,53 @@ You manage their day job and their business. You are concise, proactive, well-or
 Use the provided CONTEXT (calendar, emails, chats, second-brain notes) to answer the user's query.
 If something is unknown, say so and suggest what to check. Never invent meetings or emails.`;
 
+/* ─── Intent classification ───────────────────────────────────────────── */
+const WEB_SEARCH_PATTERNS = [
+  /^search\s+(?:for\s+)?/i,
+  /^look\s+up\s+/i,
+  /^find\s+(?:out\s+)?(?:about|who|what|where|when|how|why)\s+/i,
+  /^what\s+is\s+(?:the|a\s+)?(?!my|your|our|today|on|the\s+(?:time|date|schedule|calendar))/i,
+  /^who\s+is\s+/i,
+  /^where\s+is\s+(?!my)/i,
+  /^when\s+(?:was|did|is|are)\s+(?!my|our|your)/i,
+  /^how\s+(?:does|do|did|can|could|is)\s+/i,
+  /^latest\s+(?:news|updates|on|about)\s+/i,
+  /^news\s+(?:on|about)\s+/i,
+  /^tell\s+me\s+(?:about|who|what)\s+/i,
+  /^define\s+/i,
+  /^explain\s+/i,
+  /(?:on|in)\s+github$/i,
+  /what\s+does\s+\S+\s+mean/i,
+  /(?:current|recent)\s+(?:news|events|developments)/i,
+  /^(?:google|web\s*search)\s+/i,
+];
+
+const PERSONAL_OPERATIONAL_PATTERNS = [
+  /^(?:hi|hello|hey|good\s+(?:morning|afternoon|evening)|sup|yo)\b/i,
+  /^(?:what(?:'s|\s+is)\s+(?:on|up|my|the\s+schedule|the\s+calendar))/i,
+  /^(?:schedule|calendar|agenda|my\s+day|today)/i,
+  /^(?:priorit|urgent|important|to\s?do|tasks|focus|my\s+tasks)/i,
+  /^(?:inbox|email|emails|unread|messages|my\s+messages)/i,
+  /^(?:slack|whatsapp|chat)/i,
+  /^(?:business|orders|suppliers|money|revenue|sales|my\s+business)/i,
+  /^(?:my\s+name|who\s+am\s+i|what.*know\s+about\s+me)/i,
+  /^(?:remember|note)\b/i,
+  /^(?:add\s+(?:task|event)|create\s+(?:meeting|task|event)|todo|remind\s+me)/i,
+  /^(?:complete\s+task|mark\s+done|finish\s+task|done\s+with)/i,
+  /^(?:call\s+me|my\s+name\s+is)/i,
+  /^(?:what(?:'s|\s+is)\s+my\s+name)/i,
+];
+
+function isWebSearchQuery(msg) {
+  const m = String(msg || '').trim();
+  return WEB_SEARCH_PATTERNS.some(p => p.test(m));
+}
+
+function isPersonalQuery(msg) {
+  const m = String(msg || '').trim();
+  return PERSONAL_OPERATIONAL_PATTERNS.some(p => p.test(m));
+}
+
 async function respond(message) {
   const cfg = cfgm.load();
   const db = dbm.load();
@@ -27,6 +74,10 @@ async function respond(message) {
   if (pre) {
     reply = pre;
     source = 'intent';
+  } else if (isWebSearchQuery(message)) {
+    // Explicit web search query -> directly trigger live web search
+    reply = await handleWebSearch(message);
+    source = 'web-search';
   } else {
     const context = brain.contextPack(message);
     const { text, engine: usedEngine } = await llmChat(
@@ -45,6 +96,24 @@ async function respond(message) {
   db.upsert('chats', { id: `chat-${Date.now()}-a`, role: 'assistant', content: reply, ts: Date.now(), engine: source });
   await dbm.saveNow();
   return { reply, engine: source, llm: engine };
+}
+
+/* ─── Web search handler ──────────────────────────────────────────────── */
+async function handleWebSearch(message) {
+  try {
+    const webHits = await websearch.searchWeb(message, 3);
+    if (webHits && webHits.length > 0) {
+      // Ingest top result into Supabase in background
+      if (webHits[0].url && webHits[0].url.startsWith('http')) {
+        weblearn.learnFromUrl(webHits[0].url).catch(() => {});
+      }
+      let reply = '🌐 **Live Web Search Results:**\n\n';
+      reply += webHits.map((h, i) => '- **' + h.title + '**\n  ' + (h.snippet || 'Read full source online.') + '\n  🔗 [' + h.source + '](' + h.url + ')').join('\n\n');
+      reply += '\n\n_Sources: ' + webHits.map(h => h.source).filter(Boolean).join(', ') + '_';
+      return reply;
+    }
+  } catch (_) {}
+  return 'I searched the web for "' + message + '" but could not find any results. You can try rephrasing the query.';
 }
 
 function parseRelativeDateTime(text) {
@@ -81,7 +150,7 @@ async function routeIntent(msg) {
   if (mm) {
     const raw = mm[1].trim();
     const start = parseRelativeDateTime(raw);
-    const cleanTitle = raw.replace(/(at\s+\d+(:\d+)?\s*(am|pm)?|tomorrow|today|next\s+[a-z]+|on\s+[a-z]+)/gi, '').trim() || 'Appointment';
+    const cleanTitle = raw.replace(/(at\s+\d+(:\d+)?\s*(am|pm)|tomorrow|today|next\s+[a-z]+|on\s+[a-z]+)/gi, '').trim() || 'Appointment';
     const newEvent = {
       id: `event-${Date.now()}`,
       title: cleanTitle,
@@ -172,7 +241,7 @@ async function rememberReply(content) {
   brain.buildIndex();
   await dbm.saveNow();
   const topic = extractTopics(content, 1)[0] || 'that';
-  return `🧠 Remembered: “${snippet(content, 160)}” — saved to brain. Ask me “what do you know about ${topic}?” anytime.`;
+  return `🧠 Remembered: "${snippet(content, 160)}" — saved to brain. Ask me "what do you know about ${topic}?" anytime.`;
 }
 
 async function learnReply(url) {
@@ -227,26 +296,39 @@ async function offlineEngine(msg, context, engineStatus) {
     return `**Business snapshot** 🏪\n\n*Upcoming events*` + (bizEvents.map(e => `\n- ${e.title}`).join('') || '\n- None') + `\n\n*Emails*` + (bizEmails.map(e => `\n- ${e.subject}`).join('') || '\n- None');
   }
 
-  // 1. Check local second brain
+  // 1. Check local second brain with HIGH confidence threshold to avoid false positives
+  const HIGH_CONFIDENCE_SCORE = 3.0;
   const hits = brain.search(msg, 3);
-  if (hits && hits.length) {
-    return `Here is what I found in your brain:\n\n` + hits.map(h => `- **${h.title}**: ${snippet(h.snippet, 180)}`).join('\n\n');
+  const strongHits = (hits || []).filter(h => h.score >= HIGH_CONFIDENCE_SCORE);
+
+  if (strongHits.length > 0) {
+    return 'Here is what I found in your brain:\n\n' + strongHits.map(h => '- **' + h.title + '**: ' + snippet(h.snippet, 180)).join('\n\n');
   }
 
-  // 2. AUTOMATIC LIVE WEB SEARCH (If not in brain, automatically search internet)
+  // 2. AUTOMATIC LIVE WEB SEARCH — if brain has no high-confidence match, search the internet
   try {
-    const webHits = await websearch.searchDuckDuckGo(msg);
+    const webHits = await websearch.searchWeb(msg, 3);
     if (webHits && webHits.length > 0) {
       // Ingest top result into Supabase in background
-      weblearn.learnFromUrl(webHits[0].url).catch(() => {});
-      
-      let reply = `🌐 **Live Web Search:**\n\n`;
-      reply += webHits.slice(0, 3).map(h => `- **${h.title}**\n  ${h.snippet || 'Read full source online.'}\n  🔗 _${h.url}_`).join('\n\n');
+      if (webHits[0].url && webHits[0].url.startsWith('http')) {
+        weblearn.learnFromUrl(webHits[0].url).catch(() => {});
+      }
+
+      let reply = '🌐 **Live Web Search Results:**\n\n';
+      reply += webHits.map(h => '- **' + h.title + '**\n  ' + (h.snippet || 'Read full source online.') + '\n  🔗 [' + h.source + '](' + h.url + ')').join('\n\n');
+      reply += '\n\n_Sources: ' + webHits.map(h => h.source).filter(Boolean).join(', ') + '_';
       return reply;
     }
   } catch (_) {}
 
-  return "I couldn't find information about that in your brain or on the web. You can teach me by saying **“remember that …”**!";
+  // 3. Show weak brain hits if we have any (better than nothing)
+  if (hits && hits.length > 0) {
+    return 'I did not find an exact match on the web, but here is what I have in your brain:\n\n' +
+      hits.map(h => '- **' + h.title + '**: ' + snippet(h.snippet, 180)).join('\n\n') +
+      '\n\n_Try saying "search for ..." or "look up ..." for a live web search._';
+  }
+
+  return 'I could not find information about that in your brain or on the web. You can teach me by saying "remember that ...", or try "search for ..." to search the web!';
 }
 
-module.exports = { respond, offlineEngine };
+module.exports = { respond, offlineEngine, isWebSearchQuery, isPersonalQuery };
