@@ -1,3 +1,4 @@
+const websearch = require('../websearch');
 'use strict';
 /* ResearcherAgent — queries the second brain, crawls external URLs, gathers facts. */
 

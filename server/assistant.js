@@ -1,3 +1,4 @@
+const websearch = require('./websearch');
 'use strict';
 const dbm = require('./db');
 const brain = require('./brain');
@@ -210,8 +211,14 @@ function offlineEngine(msg, context, engineStatus) {
     return `**Unread Inbox** (${emails.length}):\n` + emails.map(e => `- **${e.fromName || e.from}**: ${e.subject}`).join('\n');
   }
 
-  const hits = brain.search(msg, 3);
-  if (hits.length) {
+  let hits = brain.search(msg, 3);
+  if (!hits.length && !/^(hi|hello|hey|schedule|calendar|day look|priorit|inbox|email|slack|whatsapp|business|help)/i.test(msg)) {
+    try {
+      const newNotes = await websearch.searchAndIngest(msg, 2);
+      if (newNotes && newNotes.length) hits = brain.search(msg, 3);
+    } catch (_) {}
+  }
+  if (hits && hits.length) {
     return `From your brain:\n\n` + hits.map(h => `- **${h.title}**: ${snippet(h.snippet, 180)}`).join('\n\n');
   }
 
