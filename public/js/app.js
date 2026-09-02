@@ -1030,44 +1030,58 @@ function bindTaskToggles(sel) {
 })();
 
 
-/* --- Continuous Voice Activation Wake-Word Engine ("Hey ARIA") --- */
+
+/* --- Coordinated Hands-Free & Mic Voice Engine --- */
+let wakeRecognizer = null;
+let isAssistantListening = false;
+
 function initWakeWord() {
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SpeechRecognition) return console.log('Wake-word disabled: Web Speech API not supported in this browser.');
-  
-  const recognizer = new SpeechRecognition();
-  recognizer.continuous = true;
-  recognizer.interimResults = true;
-  recognizer.lang = 'en-US';
+  if (!SpeechRecognition) return;
 
-  recognizer.onresult = (event) => {
-    for (let i = event.resultIndex; i < event.results.length; ++i) {
-      if (event.results[i].isFinal) {
-        const transcript = event.results[i][0].transcript.trim().toLowerCase();
-        console.log('Background heard:', transcript);
-        if (transcript.includes('aria') || transcript.includes('hey aria') || transcript.includes('hey area')) {
-          toast('🎙️ Hey Francis! ARIA is Listening...');
-          // Play wake sound
-          const ctx = new (window.AudioContext || window.webkitAudioContext)();
-          const osc = ctx.createOscillator();
-          osc.type = 'sine'; osc.frequency.setValueAtTime(587.33, ctx.currentTime); // D5 Note
-          osc.connect(ctx.destination); osc.start(); osc.stop(ctx.currentTime + 0.15);
-          
-          // Switch tab to Assistant & trigger micro
-          route('#asst');
-          setTimeout(() => {
-            const micBtn = $('#asst-mic');
-            if (micBtn) micBtn.click();
-          }, 350);
-        }
+  wakeRecognizer = new SpeechRecognition();
+  wakeRecognizer.continuous = true;
+  wakeRecognizer.interimResults = false;
+  wakeRecognizer.lang = 'en-US';
+
+  wakeRecognizer.onresult = (event) => {
+    if (isAssistantListening) return;
+    const last = event.results[event.results.length - 1];
+    if (last && last[0]) {
+      const text = last[0].transcript.trim().toLowerCase();
+      if (text.includes('aria') || text.includes('hey aria')) {
+        // Pause wake recognizer to let assistant mic capture
+        try { wakeRecognizer.stop(); } catch (_) {}
+        toast('🎙️ ARIA activated!');
+        
+        // Switch tab
+        route('#asst');
+        setTimeout(() => {
+          const micBtn = $('#asst-mic');
+          if (micBtn) {
+            isAssistantListening = true;
+            micBtn.click();
+          }
+        }, 200);
       }
     }
   };
 
-  recognizer.onend = () => { recognizer.start(); }; // Restart automatically
-  recognizer.start();
-  console.log('🎙️ Background Wake-Word listener active ("Hey ARIA")');
+  wakeRecognizer.onend = () => {
+    if (!isAssistantListening) {
+      try { wakeRecognizer.start(); } catch (_) {}
+    }
+  };
+
+  try { wakeRecognizer.start(); } catch (_) {}
 }
 
-// Boot wake word engine
-setTimeout(initWakeWord, 2000);
+// Re-arm wake word when assistant finishes
+window.addEventListener('asst-mic-done', () => {
+  isAssistantListening = false;
+  setTimeout(() => {
+    try { if (wakeRecognizer) wakeRecognizer.start(); } catch (_) {}
+  }, 1000);
+});
+
+setTimeout(initWakeWord, 1500);

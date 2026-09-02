@@ -137,7 +137,7 @@ app.get('/api/briefs', (req, res) => res.json(dbm.find('briefs').sort((a, b) => 
 app.get('/api/briefs/:id', (req, res) => res.json(dbm.one('briefs', b => b.id === req.params.id) || null));
 
 /* ---------- Calendar / Inbox / Messages ---------- */
-app.get('/api/events', (req, res) => {
+app.get('/api/events', (req, res) => { try { const db = dbm.load(); return res.json(db.events || []); } catch(e){ return res.json([]); }
   const all = dbm.find('events').sort((a, b) => a.start - b.start);
   const days = +(req.query.days || 7);
   const from = Date.now() - 2 * 864e5;

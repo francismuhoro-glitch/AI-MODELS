@@ -1,80 +1,78 @@
 'use strict';
-/* Persistence — one JSON document of state, backed by local file OR Supabase (see store.js).
-   Personal scale, zero native deps. All data lives in the `state` doc; settings live in `settings`. */
-const store = require('./store');
-const cfgm = require('./config');
+const fs = require('fs');
+const path = require('path');
 
-const EMPTY = {
-  events: [], emails: [], messages: [], notes: [], briefs: [], tasks: [], chats: [], subscriptions: [],
-  meta: { lastSync: null, lastBriefDate: null, seeded: false }
+const IS_VERCEL = !!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+const DATA_DIR = IS_VERCEL ? '/tmp' : path.join(__dirname, '..', 'data');
+const DB_FILE = path.join(DATA_DIR, 'db.json');
+
+const INITIAL_DB = {
+  events: [
+    { id: 'ev-1', title: 'Strategy & Growth Sync', start: Date.now() + 3600000, end: Date.now() + 7200000, context: 'business', source: 'calendar' },
+    { id: 'ev-2', title: 'Team Standup', start: Date.now() + 10800000, end: Date.now() + 12600000, context: 'day-job', source: 'calendar' }
+  ],
+  emails: [
+    { id: 'em-1', from: 'finance@client.com', fromName: 'Client Finance', subject: 'Payment confirmation for Invoice #1042', snippet: 'Funds transferred via M-Pesa.', read: false, context: 'business', ts: Date.now() - 3600000 },
+    { id: 'em-2', from: 'hr@company.com', fromName: 'HR Team', subject: 'Quarterly Review Schedule', snippet: 'Please book your time slot.', read: true, context: 'day-job', ts: Date.now() - 7200000 }
+  ],
+  inbox: [
+    { id: 'task-1', title: 'Review supplier price updates', priority: 'high', done: false, context: 'business', ts: Date.now() },
+    { id: 'task-2', title: 'Prepare monthly KPI summary', priority: 'medium', done: false, context: 'day-job', ts: Date.now() }
+  ],
+  notes: [
+    { id: 'note-1', title: 'Welcome to ARIA', content: 'ARIA is your personal AI executive assistant with local intelligence and persistent memory.', source: 'system', tags: ['welcome', 'guide'], ts: Date.now() }
+  ],
+  messages: [
+    { id: 'msg-1', channel: 'WhatsApp', from: 'Kamau', text: 'Invoice terms agreed. Proceed with order.', context: 'business', ts: Date.now() - 1800000 }
+  ],
+  chats: []
 };
 
-let db = null;
-let saveTimer = null;
-let readyPromise = null;
+let memDb = null;
 
-/* Called once before serving requests: loads state + settings from the backing store. */
-function init() {
-  if (readyPromise) return readyPromise;
-  readyPromise = (async () => {
-    const [savedState, savedSettings] = await Promise.all([store.docGet('state'), store.docGet('settings')]);
-    cfgm.hydrate(savedSettings);
-    db = { ...structuredClone(EMPTY), ...(savedState || {}) };
-    attachHelpers();
-    if (!savedState) await store.docSet('state', serialise());
-  })();
-  return readyPromise;
+function ensureDir() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  } catch (_) {}
 }
 
-function attachHelpers() {
-  // Convenience: allow state.find(...)/state.upsert(...)/state.one(...)
-  db.find = (col, pred) => find(col, pred);
-  db.one = (col, pred) => one(col, pred);
-  db.upsert = (col, item, key) => upsert(col, item, key);
-}
-
-function serialise() {
-  const clone = { ...db };
-  delete clone.find; delete clone.one; delete clone.upsert;
-  return clone;
-}
-
-/* Synchronous access — valid any time after init() (or lazily in local-file mode). */
 function load() {
-  if (db) return db;
-  if (store.isRemote()) throw new Error('DB not initialised — await db.init() first (the server does this before routes).');
-  db = { ...structuredClone(EMPTY), ...(store.docGetSync('state') || {}) };
-  attachHelpers();
-  return db;
+  if (memDb) return memDb;
+  ensureDir();
+  try {
+    if (fs.existsSync(DB_FILE)) {
+      const data = fs.readFileSync(DB_FILE, 'utf8');
+      memDb = JSON.parse(data);
+    }
+  } catch (_) {}
+  
+  if (!memDb) memDb = JSON.parse(JSON.stringify(INITIAL_DB));
+  
+  // Guarantee core arrays exist
+  memDb.events = memDb.events || [];
+  memDb.emails = memDb.emails || [];
+  memDb.inbox = memDb.inbox || [];
+  memDb.notes = memDb.notes || [];
+  memDb.messages = memDb.messages || [];
+  memDb.chats = memDb.chats || [];
+  
+  return memDb;
 }
 
-function find(col, pred) { return load()[col].filter(pred || (() => true)); }
-function one(col, pred) { return load()[col].find(pred || (() => true)); }
-
-function upsert(collection, item, key = 'id') {
-  const d = load();
-  const i = d[collection].findIndex(x => x[key] === item[key]);
-  if (i >= 0) d[collection][i] = { ...d[collection][i], ...item };
-  else d[collection].push(item);
-  save();
-  return item;
-}
-
-/* Debounced background write (non-critical paths). */
-function save() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => { docSetSafe(); }, store.isRemote() ? 75 : 150);
-}
-
-/* Awaited write — use for anything you cannot afford to lose (briefs, settings, subscriptions). */
 async function saveNow() {
-  clearTimeout(saveTimer);
-  await docSetSafe();
+  if (!memDb) return;
+  ensureDir();
+  try {
+    fs.writeFileSync(DB_FILE, JSON.stringify(memDb, null, 2), 'utf8');
+  } catch (_) {}
 }
 
-async function docSetSafe() {
-  try { await store.docSet('state', serialise()); }
-  catch (e) { console.error('[db] persist failed:', e.message); }
+function upsert(collection, item) {
+  const db = load();
+  if (!db[collection]) db[collection] = [];
+  const idx = db[collection].findIndex(x => x.id === item.id);
+  if (idx >= 0) db[collection][idx] = item;
+  else db[collection].unshift(item);
 }
 
-module.exports = { init, load, save, saveNow, upsert, find, one };
+module.exports = { load, saveNow, upsert };

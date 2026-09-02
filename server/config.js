@@ -1,64 +1,43 @@
 'use strict';
-/* Settings: defaults + user overrides.
-   Local mode: persisted to data/settings.json.
-   Supabase mode: persisted to the aria_docs store (via db layer). */
 const fs = require('fs');
 const path = require('path');
-const store = require('./store');
 
-const DATA_DIR = store.dataDir();
-const FILE = path.join(DATA_DIR, 'settings.json');
+const IS_VERCEL = !!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+const DATA_DIR = IS_VERCEL ? '/tmp' : path.join(__dirname, '..', 'data');
+const CFG_FILE = path.join(DATA_DIR, 'config.json');
 
-const DEFAULTS = {
-  owner: { name: 'Boss', timezone: 'Africa/Nairobi', location: { lat: -1.3733, lon: 36.9183, label: 'Mlolongo, KE' } },
-  wakeTime: '06:00',
-  brief: { email: true, dashboard: true },
-  llm: { provider: 'auto', ollamaUrl: 'http://127.0.0.1:11434', model: 'llama3.1' },
-  smtp: { host: '', port: 587, secure: false, user: '', pass: '', to: '' },
-  connectors: {
-    /* Demo is opt-in: only enabled out of the box when ARIA_DEMO=1 (first-boot seeding). */
-    demo: { enabled: process.env.ARIA_DEMO === '1' },
-    google: { enabled: false, clientId: '', clientSecret: '', refreshToken: '' },
-    microsoft: { enabled: false, accessToken: '' },
-    slack: { enabled: false, userToken: '' },
-    whatsapp: { enabled: false, accessToken: '', phoneNumberId: '' }
-  }
+const DEFAULT_CONFIG = {
+  owner: { name: 'Francis Muhoro', timezone: 'Africa/Nairobi', location: { label: 'Nairobi, Kenya' } },
+  rhythm: { wakeHour: 6, workStartHour: 8, workEndHour: 17, sleepHour: 22 },
+  ollama: { host: 'http://127.0.0.1:11434', model: 'llama3.1' },
+  telegram: { enabled: false, token: '', allowedChatId: '' }
 };
 
-let cache = null;
+let memCfg = null;
 
 function load() {
-  if (cache) return cache;
-  let saved = {};
-  try { saved = JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch (_) {}
-  cache = deepMerge(structuredClone(DEFAULTS), saved);
-  return cache;
-}
-
-/* Called by db.init(): merge settings restored from the backing store (Supabase mode). */
-function hydrate(savedSettings) {
-  if (savedSettings && typeof savedSettings === 'object') cache = deepMerge(load(), savedSettings);
-  return cache;
+  if (memCfg) return memCfg;
+  try {
+    if (fs.existsSync(CFG_FILE)) {
+      memCfg = JSON.parse(fs.readFileSync(CFG_FILE, 'utf8'));
+    }
+  } catch (_) {}
+  if (!memCfg) memCfg = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+  memCfg.owner = memCfg.owner || DEFAULT_CONFIG.owner;
+  return memCfg;
 }
 
 async function save(patch) {
-  cache = deepMerge(load(), patch || {});
-  if (store.isRemote()) {
-    await store.docSet('settings', cache);
-  } else {
-    try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(FILE, JSON.stringify(cache, null, 2)); }
-    catch (e) { console.error('[config] persist failed:', e.message); }
-  }
-  return cache;
+  const cfg = load();
+  if (patch.owner) cfg.owner = { ...cfg.owner, ...patch.owner };
+  if (patch.rhythm) cfg.rhythm = { ...cfg.rhythm, ...patch.rhythm };
+  if (patch.ollama) cfg.ollama = { ...cfg.ollama, ...patch.ollama };
+  if (patch.telegram) cfg.telegram = { ...cfg.telegram, ...patch.telegram };
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(CFG_FILE, JSON.stringify(cfg, null, 2), 'utf8');
+  } catch (_) {}
+  return cfg;
 }
 
-function deepMerge(base, patch) {
-  if (!patch || typeof patch !== 'object') return base;
-  for (const [k, v] of Object.entries(patch)) {
-    if (v && typeof v === 'object' && !Array.isArray(v) && base[k] && typeof base[k] === 'object' && !Array.isArray(base[k])) deepMerge(base[k], v);
-    else base[k] = v;
-  }
-  return base;
-}
-
-module.exports = { load, save, hydrate, DATA_DIR };
+module.exports = { load, save };
