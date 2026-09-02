@@ -17,16 +17,23 @@ async function checkOllama() {
   return ollamaState.ok;
 }
 
-async function llmChat(system, user) {
+async function llmChat(system, user, history) {
   const cfg = cfgm.load();
   const want = cfg.llm.provider === 'ollama' || (cfg.llm.provider === 'auto' && (await checkOllama()));
   if (!want) return { text: null, engine: 'offline' };
   try {
     const model = cfg.llm.model && ollamaState.models.some(m => m.startsWith(cfg.llm.model)) ? cfg.llm.model
       : (ollamaState.models[0] || cfg.llm.model);
+    /* Multi-turn conversation memory: the caller passes prior turns ({role, content}) so
+       the model can resolve follow-ups like "what about tomorrow?". */
+    const messages = [{ role: 'system', content: system }];
+    for (const h of (Array.isArray(history) ? history : []).slice(-10)) {
+      if (h && h.content) messages.push({ role: h.role === 'assistant' ? 'assistant' : 'user', content: String(h.content).slice(0, 4000) });
+    }
+    messages.push({ role: 'user', content: user });
     const res = await fetch(`${cfg.llm.ollamaUrl.replace(/\/$/, '')}/api/chat`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, stream: false, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] })
+      body: JSON.stringify({ model, stream: false, messages })
     });
     if (!res.ok) throw new Error(`ollama ${res.status}`);
     const json = await res.json();

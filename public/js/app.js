@@ -181,23 +181,124 @@ const Sound = {
   }
 };
 
-/* strip markdown so speech synthesis reads replies as plain sentences
-   (no asterisks, hashes, backticks or link URLs read out loud) */
+/* ---------------- natural speech pipeline ----------------
+   Replies are written for the screen (markdown, emojis, links, code). Before
+   speechSynthesis reads one aloud it goes through cleanForSpeech(): markdown and
+   code/JSON are stripped, raw URLs become "link", emojis become natural words
+   (calendar emoji -> "calendar"), dashes and symbol runs become spoken pauses,
+   offline data dumps get a conversational lead-in ("Here's what I found on your
+   calendar..."), long replies are capped at 400 characters with a pointer to the
+   screen, and sensitive strings (PINs, tokens, card numbers, emails, phone numbers)
+   never reach the voice. */
 function stripMd(s) {
   return String(s || '')
-    .replace(/```[\s\S]*?```/g, (m) => m.replace(/```/g, ''))   // code blocks → speak the code
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')                        // images → nothing
-    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')                     // links → label
-    .replace(/^#{1,6}\s+/gm, '')                                 // headers
-    .replace(/(\*\*|__)([\s\S]*?)\1/g, '$2')                     // bold
-    .replace(/(\*|_)([^*_\n]+)\1/g, '$2')                        // italics
-    .replace(/`([^`]*)`/g, '$1')                                 // inline code
-    .replace(/^\s*(?:[-*+•]|\d+[.)])\s+/gm, '')                  // list markers
-    .replace(/^\s*>\s?/gm, '')                                   // blockquotes
-    .replace(/^\s*[-–—]{2,}\s*$/gm, '')                          // horizontal rules
-    .replace(/[~^]/g, '')
+    .replace(/```[\s\S]*?```/g, ' ')                            // code blocks -> removed here
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')                       // images -> nothing
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')                   // links -> label
+    .replace(/^#{1,6}\s+/gm, '')                                // headers
+    .replace(/(\*\*|__)([\s\S]*?)\1/g, '$2')                    // bold
+    .replace(/(\*|_)([^*_\n]+)\1/g, '$2')                       // italics
+    .replace(/~~([^~]+)~~/g, '$1')                              // strikethrough
+    .replace(/`([^`]*)`/g, '$1')                                // inline code
+    .replace(/^\s*(?:[-*+\u2022]|\d+[.)])\s+/gm, '')             // list markers
+    .replace(/^\s*>\s?/gm, '')                                  // blockquotes
+    .replace(/^\s*[-\u2013\u2014]{2,}\s*$/gm, '')               // horizontal rules
+    .replace(/\[|\]|\(|\)/g, ' ')                               // leftover brackets
+    .replace(/[~^]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+/* Emojis that carry meaning are translated into words; the rest are dropped. */
+const EMOJI_SPEECH = {
+  '\u{1F4C5}': 'calendar', '\u{1F5D3}\uFE0F': 'calendar', '\u{1F4C6}': 'calendar', '\u2705': 'completed', '\u2714\uFE0F': 'completed',
+  '\u{1F310}': 'web result', '\u{1F517}': 'link', '\u{1F525}': 'high priority', '\u26A1': 'quick', '\u{1F389}': 'done',
+  '\u{1F9E0}': 'memory', '\u{1F4DA}': 'learning', '\u26A0\uFE0F': 'warning', '\u274C': 'removed', '\u23F0': 'alarm',
+  '\u{1F4E9}': 'email', '\u2709\uFE0F': 'email', '\u{1F4E5}': 'inbox', '\u{1F4AC}': 'message', '\u{1F3EA}': 'business',
+  '\u2600\uFE0F': 'morning', '\u{1F916}': 'agent', '\u{1F3AF}': 'priorities', '\u{1F4CC}': 'pinned', '\u{1F514}': 'notification',
+  '\u{1F4C4}': 'document', '\u{1F4B0}': 'money', '\u{1F4C8}': 'growth', '\u{1F5D1}\uFE0F': 'deleted', '\u{1F50D}': 'search',
+  '\u{1F7E2}': 'on', '\u{1F7E1}': 'pending', '\u{1F534}': 'off', '\u{1F7E3}': 'agent', '\u{1F44B}': 'hello'
+};
+
+/* Client-side backstop of the server's discretion filter - secrets never reach TTS even
+   when the spoken text comes from a swarm report or an older cached payload. */
+function redactSpeechSecrets(t) {
+  return String(t || '')
+    .replace(/\b(?:sk|pk|rk|gh|gl|npm)[-_](?:live|test|pub)?[-_]?[A-Za-z0-9_-]{8,}\b/gi, 'a secret key')
+    .replace(/\b(api key|apikey|api-key|access token|auth token|token|secret|password|passwd|pwd)\b(?:\s+is|:|=)?\s*[\w.+-]{4,}/gi, '$1 redacted')
+    .replace(/\bmpesa\s+pin\b(?:\s+is|:|=)?\s*\d{4,5}/gi, 'your M-Pesa PIN, redacted')
+    .replace(/\bpin\b(?:\s+is|:|=)?\s*\d{4,5}\b/gi, 'a PIN, redacted')
+    .replace(/\b(?:\d[ -]?){13,16}\b/g, 'a card number')
+    .replace(/\b(?:\+?254|0)(?:[ -]?\d){8,9}\b/g, 'a phone number')
+    .replace(/\b[\w.+-]+@(?:[\w-]+\.)+[a-z]{2,}\b/gi, 'an email address');
+}
+
+/* Offline-engine answers are data dumps; wrap them in an executive spoken lead-in. */
+function conversationalLeadIn(t) {
+  if (/^(hi|hello|hey|here|based|looking|you have|i've|i |your|sure|got it|sorry|unfortunately|done|no |yes |good )/i.test(t)) return t;
+  const lead =
+    /schedule|calendar|agenda|today|tomorrow|events?|meeting/i.test(t) ? "Here's what I found on your calendar." :
+    /inbox|unread|email/i.test(t) ? 'Looking at your inbox now.' :
+    /priorit|urgent|task|focus/i.test(t) ? "Here's what needs your attention." :
+    /business|revenue|order|supplier|sales|invoice/i.test(t) ? "Here's your business snapshot." :
+    /found in your brain|brain|remember/i.test(t) ? 'Based on our earlier conversation,' :
+    /web result|live web|search/i.test(t) ? "Here's what I found on the web." :
+    "Here's what I found.";
+  return lead + ' ' + t;
+}
+
+const SPEECH_CAP = 400;
+
+function cleanForSpeech(text, opts = {}) {
+  let t = String(text == null ? '' : text);
+  if (!t.trim()) return '';
+
+  // 1. Fenced code blocks and raw JSON are never read aloud
+  let hadCode = false;
+  t = t.replace(/```[a-zA-Z0-9_-]*\n?[\s\S]*?```/g, () => { hadCode = true; return ' '; });
+  const trimmed = t.trim();
+  if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+    try { JSON.parse(trimmed); hadCode = true; t = ' '; } catch (_) { /* not JSON - keep */ }
+  }
+
+  // 2. Markdown -> plain words
+  t = stripMd(t);
+
+  // 3. Raw URLs -> "link"; never spelled out letter by letter
+  t = t.replace(/\b(?:https?|ftp):\/\/\S+/gi, 'link').replace(/\bwww\.\S+/gi, 'link');
+
+  // 4. Secrets (PINs, tokens, cards, emails, phone numbers) never reach the voice
+  t = redactSpeechSecrets(t);
+
+  // 5. Emojis -> natural words; any pictographic leftover is dropped
+  t = Array.from(t).map(ch => (Object.prototype.hasOwnProperty.call(EMOJI_SPEECH, ch) ? (EMOJI_SPEECH[ch] ? ' ' + EMOJI_SPEECH[ch] + ' ' : ' ') : ch)).join('');
+  t = t.replace(/\p{Extended_Pictographic}/gu, '').replace(/[\uFE0F\u200D\u20E3]/gu, '');
+
+  // 6. Repetitive symbols & long dashes -> spoken pauses (commas); tidy punctuation
+  t = t.replace(/#/g, ' ')
+    .replace(/([*_~`>|=+])\1+/g, ' ')
+    .replace(/\s*(?:\u2014+|\u2013+|-{2,})\s*/g, ', ')
+    .replace(/\s*[\u2022\u00B7\u25AA]+\s*/g, ', ')
+    .replace(/([!,.?;:]){2,}/g, '$1')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+
+  if (!t) return hadCode ? 'I sent the code to your screen instead of reading it.' : '';
+
+  // 7. Conversational tone for offline fallback replies
+  if (opts.offline) t = conversationalLeadIn(t);
+
+  if (hadCode) t += " There's code on your screen I won't read aloud.";
+
+  // 8. Length cap: speak the summary, point at the screen for the rest
+  if (t.length > SPEECH_CAP) {
+    let cut = t.lastIndexOf('. ', SPEECH_CAP);
+    if (cut < SPEECH_CAP * 0.5) cut = t.lastIndexOf(', ', SPEECH_CAP);
+    if (cut < SPEECH_CAP * 0.5) cut = t.lastIndexOf(' ', SPEECH_CAP);
+    if (cut < 0) cut = SPEECH_CAP;
+    t = t.slice(0, cut + 1).trim().replace(/,\s*$/, '. ') + " I've shown the full details on your screen.";
+  }
+  return t;
 }
 
 /* ---------------- voice: speech recognition in + speech synthesis out ----------------
@@ -375,10 +476,11 @@ const Speech = {
     if (was) this.emit('asst-speak-done', { cancelled: true });
   },
 
-  /* Speak ARIA's reply aloud. Respects the Sound.on mute toggle + the voice preference;
-     strips markdown first so it does not read asterisks and hashes out loud. */
-  speak(text) {
-    const body = stripMd(text);
+  /* Speak ARIA's reply aloud. Respects the Sound.on mute toggle + the voice preference.
+     The reply goes through cleanForSpeech() first so markdown, URLs, code/JSON and emojis
+     are never read aloud; long replies are summarised with a pointer to the screen. */
+  speak(text, opts = {}) {
+    const body = cleanForSpeech(text, opts);
     if (!Sound.on || !this.on || !this.tts() || !body) {
       /* Silent path still closes the loop so hands-free conversation never stalls. */
       this.emit('asst-speak-done', { spoken: false });
@@ -403,7 +505,9 @@ const Speech = {
         synth.cancel();
         const u = new SpeechSynthesisUtterance(body);
         if (this._voice) { u.voice = this._voice; u.lang = this._voice.lang; }
-        u.rate = 1; u.pitch = 1; u.volume = 1;
+        /* Natural cadence: rate 1.0 and the cleaned text keeps its commas & periods,
+           which speechSynthesis turns into pauses. */
+        u.rate = 1.0; u.pitch = 1; u.volume = 1;
         u.onend = () => done(true);
         u.onerror = () => done(false);
         this._utterance = u;
@@ -583,6 +687,7 @@ function normalizeSettings(raw) {
     llm: { provider: 'auto', ollamaUrl: '', model: '', ...(s.llm || {}) },
     smtp: { host: '', port: 587, user: '', pass: '', to: '', ...(s.smtp || {}) },
     brief: { email: false, ...(s.brief || {}) },
+    discretion: s.discretion !== false,
     connectors: s.connectors || {}
   };
 }
@@ -974,7 +1079,10 @@ async function viewAssistant(main) {
       const _typ = $('#aria-typing'); if (_typ) _typ.outerHTML = `<div class="msg aria"><div class="md">${md(r.reply)}</div><div class="engine-tag">${esc(r.engine)}</div></div>`;
       // Speak the reply aloud (respects the Sound mute + voice preference); conversation
       // mode resumes listening once ARIA is done talking (or right away if replies are silent).
-      Speech.speak(r.reply).then((spoken) => { if (Speech.convo && !spoken) Speech.afterSpeak(); });
+      /* Speak the discretion-filtered twin (secrets redacted server-side); the client
+         pipeline still strips markdown/URLs/emojis and caps the length. */
+      Speech.speak(r.speech || r.reply, { engine: r.engine, offline: /offline/.test(r.engine || '') })
+        .then((spoken) => { if (Speech.convo && !spoken) Speech.afterSpeak(); });
     } catch (e) {
       const _typ = $('#aria-typing'); if (_typ) _typ.outerHTML = `<div class="msg aria"><div class="md"><p>⚠️ ${esc(e.message)}</p></div></div>`;
       if (Speech.convo) Speech.afterSpeak();
@@ -1043,11 +1151,13 @@ function agencyStepRow(step, state) {
   </div>`;
 }
 
-/* Pull the executive paragraph out of the report — that is what ARIA reads aloud. */
+/* Pull the executive paragraph out of the report — that is what ARIA reads aloud,
+   run through the natural-speech pipeline (no markdown/URLs/emojis, length-capped). */
 function agencySpokenSummary(markdown) {
   const m = String(markdown || '').match(/###\s*Executive summary\s*\n([\s\S]*?)(?:\n###|$)/i);
   const body = (m ? m[1] : String(markdown || '')).trim();
-  return stripMd(body).split('\n').filter(Boolean).slice(0, 3).join(' ').slice(0, 700);
+  const lines = stripMd(body).split('\n').filter(Boolean).slice(0, 3).join(' ');
+  return cleanForSpeech(lines) || cleanForSpeech(body);
 }
 
 async function viewAgency(main) {
@@ -1294,6 +1404,10 @@ async function viewSettings(main) {
           <button class="btn" id="btn-push">🔔 Enable morning notifications</button>
           <button class="btn ghost" id="btn-push-test">Send test notification</button>
         </div>
+        <label class="switch" style="display:flex;gap:9px;align-items:center;margin-top:12px" title="When on, ARIA never speaks passwords, PINs, tokens, card numbers, addresses or full email contents aloud — you read those on screen.">
+          <input type="checkbox" id="s-discretion" ${s.discretion !== false ? 'checked' : ''}>
+          <span>🤫 Discretion mode — keep secrets & long lists off the air</span>
+        </label>
         <p style="color:var(--faint);font-size:12px;margin-top:12px">Install puts ARIA on your home screen / desktop like a native app — full screen, offline access to your latest brief, and her voice every morning. Notifications deliver the brief to your lock screen at ${esc(s.wakeTime)} even before you open the app.</p>
       </div>
 
@@ -1318,7 +1432,8 @@ async function viewSettings(main) {
       owner: { name: $('#s-name').value, timezone: $('#s-tz').value, location: { lat: +$('#s-lat').value, lon: +$('#s-lon').value, label: $('#s-loc-label').value } },
       wakeTime: $('#s-wake').value,
       llm: { provider: $('#s-provider').value, ollamaUrl: $('#s-ourl').value, model: $('#s-model').value },
-      smtp: { host: $('#s-smtphost').value, port: +$('#s-smtpport').value || 587, user: $('#s-smtpuser').value, pass: $('#s-smtppass').value, to: $('#s-smtpto').value }
+      smtp: { host: $('#s-smtphost').value, port: +$('#s-smtpport').value || 587, user: $('#s-smtpuser').value, pass: $('#s-smtppass').value, to: $('#s-smtpto').value },
+      discretion: $('#s-discretion').checked
     });
     for (const c of conns) {
       const enabled = $(`input[data-conn="${c.id}"]`).checked;
@@ -1522,6 +1637,7 @@ window.addEventListener('asst-mic-done', () => WakeWord.rearm());
 window.addEventListener('asst-speak-start', () => WakeWord.release());
 window.addEventListener('asst-speak-done', () => WakeWord.rearm());
 window.AriaWakeWord = WakeWord;
+Speech.cleanForSpeech = cleanForSpeech;
 window.AriaSpeech = Speech;
 
 /* Opt-in only (localStorage aria.wake = '1'). Enabling it unprompted would hold the

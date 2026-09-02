@@ -13,6 +13,9 @@ const DEFAULTS = {
   wakeTime: '06:00',
   rhythm: { wakeHour: 6, workStartHour: 8, workEndHour: 17, sleepHour: 22 },
   llm: { provider: 'auto', ollamaUrl: 'http://127.0.0.1:11434', model: 'llama3.1' },
+  /* Discretion mode: TTS output skips full email contents, long lists and sensitive strings
+     (passwords, PINs, tokens, card numbers, addresses). Display text stays complete. */
+  discretion: true,
   smtp: { host: '', port: 587, secure: false, user: '', pass: '', to: '' },
   brief: { email: false },
   telegram: { enabled: false, token: '', allowedChatId: '' },
@@ -52,6 +55,7 @@ function normalize(cfg) {
   out.smtp = merge(clone(DEFAULTS.smtp), out.smtp || {});
   out.brief = merge(clone(DEFAULTS.brief), out.brief || {});
   out.rhythm = merge(clone(DEFAULTS.rhythm), out.rhythm || {});
+  out.discretion = out.discretion !== false;   // default ON — never leak secrets to TTS
   out.telegram = merge(clone(DEFAULTS.telegram), out.telegram || {});
   out.connectors = merge(clone(DEFAULTS.connectors), out.connectors || {});
   for (const key of Object.keys(DEFAULTS.connectors)) {

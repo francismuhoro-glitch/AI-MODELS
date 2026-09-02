@@ -38,7 +38,8 @@ Install the app, then **Settings → Enable morning notifications**. At wake tim
 | **💬 Messages** | Slack + WhatsApp in one feed. |
 | **🧠 Second Brain** | An ever-evolving library. It **automatically captures** priority emails, important messages, every brief and a rolling day-log — then indexes everything (BM25) so you can ask *"what do I know about ___?"*. Capture anything manually too. |
 | **🎯 Action items** | Asks inside emails/messages ("by Friday", "please send", invoices…) become trackable tasks automatically. |
-| **🤖 Executive Assistant** | Chat that reasons over your **real** schedule, inbox, messages and brain. Ask for your day, priorities, business snapshot, or to draft email replies. |
+| **🤖 Executive Assistant** | Chat that reasons over your **real** schedule, inbox, messages and brain — and **remembers the conversation**: follow-ups like *"what about tomorrow?"* and *"add another one for Friday"* just work, with people and topics carried across turns. |
+| **🗓️ Autonomous Scheduler** | Say *"plan my day tomorrow"*, *"build a weekly plan"* or *"organize this week"* and ARIA drafts a full calendar around your rhythm — wake-up brief, 2-hour deep-work blocks for high-priority tasks, a meeting window that never double-books, morning & end-of-day inbox triage, business vs day-job blocks, 15-minute buffers — then refines on command (*"move the standup to 10am"*, *"remove the inbox triage"*, *"confirm the plan"*). |
 | **🤖 Agency Swarm** | ARIA becomes your **Executive Chief of Staff**: hand her a complex, multi-step mission and she decomposes it and delegates to background specialists — **ResearcherAgent** (second brain + web), **AnalystAgent** (priorities, inbox, financial records), **CopywriterAgent** (emails, proposals, daily summaries) — then signs off one executive report. Every step is replayed live in the UI. |
 | **🔌 Connectors** | Opt-in **demo mode** + real adapters: **Gmail/Google Calendar**, **Outlook**, **Slack** (works with a token today), **WhatsApp Business Cloud API** + a universal `/api/ingest` endpoint (iOS Shortcuts, Zapier, n8n…). |
 
@@ -57,6 +58,10 @@ ARIA_DEMO=1 npm start
 ```
 
 You can also talk to ARIA by voice (Assistant → 🎤, or Agency Swarm → 🎤) in browsers with Web Speech API support (Chrome/Edge/Safari; needs HTTPS or localhost), and she reads her replies aloud. The loop is fully two-way and synchronized: what you say lands in the input, is posted to `/api/assistant` (or `/api/agency/run` in the swarm), appended to the transcript, and read back with `speechSynthesis` — the mic is always released while ARIA talks, and the optional wake-word listener (`localStorage.aria.wake = '1'`) re-arms only once she is idle.
+
+**She speaks like a person, not a screen.** Every reply is cleaned before `speechSynthesis`: markdown, code blocks and raw JSON are stripped, raw URLs become *"link"*, emojis become words (📅 → *"calendar"*, ✅ → *"completed"*, 🌐 → *"web result"*), dashes and symbol runs become natural pauses at rate 1.0, offline answers get a conversational lead-in (*"Here's what I found on your calendar…"*), and replies longer than 400 characters are summarised aloud with *"I've shown the full details on your screen."*
+
+**Discretion mode** (Settings, on by default) keeps secrets off the air: passwords, API keys, tokens, M-Pesa PINs, card & account numbers, email addresses and phone numbers are redacted from speech (they stay readable on screen), full inboxes are summarised (*"you have 3 unread — check the app"*), long lists are capped (*"you have 15 open tasks — the top 3 are…"*), and profanity is filtered out of web results and swarm reports.
 
 ### 🤖 Agency Swarm — delegate a whole mission
 
