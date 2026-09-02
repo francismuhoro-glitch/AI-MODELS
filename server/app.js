@@ -14,6 +14,7 @@ const dbm = require('./db');
 const cfgm = require('./config');
 const brain = require('./brain');
 const assistant = require('./assistant');
+const agency = require('./agency');
 const weblearn = require('./weblearn');
 const doclearn = require('./doclearn');
 const briefGen = require('./brief');
@@ -79,6 +80,7 @@ function buildState() {
   const notes = arr(db.notes);
   const chats = arr(db.chats);
   const briefs = arr(db.briefs).slice().sort((a, b) => (b.generatedAt || 0) - (a.generatedAt || 0));
+  const agencyRuns = arr(db.agencyRuns).slice().sort((a, b) => (b.startedAt || b.ts || 0) - (a.startedAt || a.ts || 0));
   const unread = emails.filter(e => !e.read).length;
 
   const tz = (cfg.owner && cfg.owner.timezone) || 'Africa/Nairobi';
@@ -106,6 +108,8 @@ function buildState() {
     chats,
     briefs,
     brief: briefs[0] || null,
+    agencyRuns,
+    agents: agency.listAgents(),
     stats: {
       engine: engine.activeEngine || 'offline',
       lastSync: (db.meta && db.meta.lastSync) || null,
@@ -114,7 +118,8 @@ function buildState() {
       emails: emails.length,
       messages: messages.length,
       events: events.length,
-      tasks: tasks.length
+      tasks: tasks.length,
+      agencyRuns: agencyRuns.length
     },
     counts: {
       events: events.length,
@@ -123,7 +128,8 @@ function buildState() {
       notes: notes.length,
       messages: messages.length,
       chats: chats.length,
-      briefs: briefs.length
+      briefs: briefs.length,
+      agencyRuns: agencyRuns.length
     }
   };
 }
@@ -149,8 +155,9 @@ api.get('/state', (req, res) => {
       engine: { activeEngine: 'offline', model: '' }, llm: { activeEngine: 'offline', model: '' },
       activeEngine: 'offline', unread: 0,
       events: [], allEvents: [], emails: [], inbox: [], tasks: [], messages: [], notes: [], chats: [], briefs: [], brief: null,
-      stats: { engine: 'offline', lastSync: null, notes: 0, briefs: 0, emails: 0, messages: 0, events: 0, tasks: 0 },
-      counts: { events: 0, emails: 0, inbox: 0, notes: 0, messages: 0, chats: 0, briefs: 0 }
+      agencyRuns: [], agents: [],
+      stats: { engine: 'offline', lastSync: null, notes: 0, briefs: 0, emails: 0, messages: 0, events: 0, tasks: 0, agencyRuns: 0 },
+      counts: { events: 0, emails: 0, inbox: 0, notes: 0, messages: 0, chats: 0, briefs: 0, agencyRuns: 0 }
     });
   }
 });
@@ -425,6 +432,57 @@ api.get('/ai/status', async (req, res) => {
     await checkOllama().catch(() => {});
     ok(res, llmStatus());
   } catch (e) { fail(res, e, { provider: 'offline', activeEngine: 'offline', model: '', ollamaReachable: false, models: [] }); }
+});
+
+/* ---------------- agency swarm (multi-agent) ----------------
+   ARIA (DirectorAgent) delegates a mission to a swarm of background specialists and
+   answers with the final output PLUS the full agent trace, so the UI can replay who did
+   what. Everything is deterministic and offline-safe; a local LLM only sharpens the prose. */
+api.get('/agency/agents', (req, res) => {
+  try { ok(res, arr(agency.listAgents())); } catch (e) { fail(res, e, []); }
+});
+
+api.get('/agency/runs', (req, res) => {
+  try { ok(res, arr(agency.history(Number(req.query.limit) || 20))); } catch (e) { fail(res, e, []); }
+});
+
+api.get('/agency/runs/:id', (req, res) => {
+  try {
+    const run = arr(agency.history(agency.MAX_RUNS)).find(r => r.id === req.params.id);
+    if (!run) return res.status(404).json({ error: 'not found' });
+    ok(res, run);
+  } catch (e) { fail(res, e); }
+});
+
+/* Plan only — lets the UI render the queued steps before the swarm starts working. */
+api.post('/agency/plan', (req, res) => {
+  try {
+    const { task, agents } = req.body || {};
+    if (!String(task || '').trim()) return res.status(400).json({ error: 'task required' });
+    ok(res, agency.plan(task, agents));
+  } catch (e) {
+    if (e && e.status === 400) return res.status(400).json({ error: e.message });
+    fail(res, e);
+  }
+});
+
+api.post('/agency/run', async (req, res) => {
+  try {
+    const { task, agents, mode, allowWeb } = req.body || {};
+    if (!String(task || '').trim()) return res.status(400).json({ error: 'task required' });
+    const result = await agency.run({ task, agents, mode, allowWeb });
+    ok(res, result);
+  } catch (e) {
+    if (e && e.status === 400) return res.status(400).json({ error: e.message });
+    console.error('[agency]', (e && e.stack) || e);
+    ok(res, {
+      ok: false,
+      task: (req.body && req.body.task) || '',
+      finalOutput: 'The swarm hit an error: ' + ((e && e.message) || 'unknown'),
+      agentTrace: [],
+      error: (e && e.message) || 'unknown'
+    });
+  }
 });
 
 /* ---------------- push ---------------- */
