@@ -1,12 +1,14 @@
 {
   "name": "aria-os",
   "version": "1.0.0",
-  "description": "ARIA OS — personal AI operating system: morning briefs, second brain, executive assistant",
+  "description": "ARIA OS \u2014 personal AI operating system: morning briefs, second brain, executive assistant",
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
     "dev": "node --watch server/index.js",
-    "oauth:google": "node scripts/oauth-google.js"
+    "oauth:google": "node scripts/oauth-google.js",
+    "test": "node scripts/test-app.js",
+    "verify": "node scripts/test-app.js"
   },
   "engines": {
     "node": ">=18"
@@ -17,5 +19,8 @@
     "node-cron": "^4.6.0",
     "nodemailer": "^9.1.0",
     "web-push": "^3.6.7"
+  },
+  "devDependencies": {
+    "jsdom": "^30.0.1"
   }
 }

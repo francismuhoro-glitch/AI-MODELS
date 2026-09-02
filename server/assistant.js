@@ -15,7 +15,8 @@ async function respond(message) {
   const db = dbm.load();
   const engine = llmStatus();
 
-  db.upsert('chats', { id: 'chat-' + Date.now() + '-u', role: 'user', content: message, ts: Date.now() });
+  db.chats = Array.isArray(db.chats) ? db.chats : [];
+  db.chats.push({ id: 'chat-' + Date.now() + '-u', role: 'user', content: message, ts: Date.now() });
 
   const pre = await routeIntent(String(message || ''));
   let reply, source;
@@ -37,7 +38,7 @@ async function respond(message) {
     }
   }
 
-  db.upsert('chats', { id: 'chat-' + Date.now() + '-a', role: 'assistant', content: reply, ts: Date.now(), engine: source });
+  db.chats.push({ id: 'chat-' + Date.now() + '-a', role: 'assistant', content: reply, ts: Date.now(), engine: source });
   await dbm.saveNow();
   return { reply, engine: source, llm: engine };
 }
@@ -85,6 +86,7 @@ async function routeIntent(msg) {
       context: /client|order|supplier|money|biz|pay/i.test(raw) ? 'business' : 'day-job',
       source: 'assistant'
     };
+    db.events = Array.isArray(db.events) ? db.events : [];
     db.events.push(newEvent);
     await dbm.saveNow();
     brain.buildIndex();
@@ -96,7 +98,8 @@ async function routeIntent(msg) {
   if (mm) {
     const taskTitle = mm[1].trim();
     const isHigh = /urgent|important|asap|critical|now/i.test(taskTitle);
-    db.inbox.unshift({
+    db.tasks = Array.isArray(db.tasks) ? db.tasks : [];
+    db.tasks.unshift({
       id: 'task-' + Date.now(),
       title: taskTitle.replace(/urgent|asap|critical/gi, '').trim(),
       priority: isHigh ? 'high' : 'medium',
@@ -104,15 +107,16 @@ async function routeIntent(msg) {
       ts: Date.now(),
       context: /client|invoice|sale|biz/i.test(taskTitle) ? 'business' : 'day-job'
     });
+    db.inbox = db.tasks;
     await dbm.saveNow();
-    return `✅ **Task Added:** "${db.inbox[0].title}" (Priority: ${isHigh ? '🔥 High' : '⚡ Normal'})`;
+    return `✅ **Task Added:** "${db.tasks[0].title}" (Priority: ${isHigh ? '🔥 High' : '⚡ Normal'})`;
   }
 
   // Complete Task
   mm = m.match(/^(?:complete task|mark done|finish task|done with)\s+(.+)$/i);
   if (mm) {
     const q = mm[1].toLowerCase().trim();
-    const item = db.inbox.find(t => !t.done && (t.title || '').toLowerCase().includes(q));
+    const item = (db.tasks || []).find(t => !t.done && (t.title || '').toLowerCase().includes(q));
     if (item) {
       item.done = true;
       await dbm.saveNow();
@@ -195,7 +199,7 @@ function offlineEngine(msg, context, engineStatus) {
   }
 
   if (/\b(priorit|urgent|important|to do|tasks|focus)\b/.test(m)) {
-    const items = (db.inbox || []).filter(i => !i.done).slice(0, 5);
+    const items = (db.tasks || db.inbox || []).filter(i => !i.done).slice(0, 5);
     if (!items.length) return "No urgent priority items flagged right now.";
     return `**Top Priorities**:\n` + items.map(i => `- [${i.priority || 'medium'}] ${i.title}`).join('\n');
   }
