@@ -50,6 +50,82 @@ async function respond(message) {
 }
 
 /* ---------- Deterministic intents: identity, memory, website learning ---------- */
+
+  // --- ACTION: Schedule / Add Event ---
+  let mm = m.match(/^(?:schedule|add event|create meeting|meeting with)\s+(.+)$/i);
+  if (mm) {
+    const details = mm[1].trim();
+    const eventId = `event-${Date.now()}`;
+    const cfg = cfgm.load();
+    const tz = cfg.owner.timezone || 'Africa/Nairobi';
+    const tomorrow = /tomorrow/i.test(details);
+    const start = Date.now() + (tomorrow ? 86400000 : 3600000);
+    const newEvent = {
+      id: eventId,
+      title: details.replace(/tomorrow|today|at \d+(:\d+)?(am|pm)?/gi, '').trim() || 'Scheduled Meeting',
+      start,
+      end: start + 3600000,
+      context: /client|order|supplier|money|biz/i.test(details) ? 'business' : 'day-job',
+      source: 'assistant'
+    };
+    db.events = db.events || [];
+    db.events.push(newEvent);
+    await dbm.saveNow();
+    brain.buildIndex();
+    return `📅 **Event Scheduled:** "${newEvent.title}" on ${dayLabel(newEvent.start, tz)} at ${timeStr(newEvent.start, tz)}.`;
+  }
+
+  // --- ACTION: Add Priority Task / To-Do ---
+  mm = m.match(/^(?:add task|todo|remind me to|prioritize|create task):?\s+(.+)$/i);
+  if (mm) {
+    const taskTitle = mm[1].trim();
+    const taskId = `task-${Date.now()}`;
+    const isHigh = /urgent|important|asap|critical/i.test(taskTitle);
+    db.inbox = db.inbox || [];
+    db.inbox.unshift({
+      id: taskId,
+      title: taskTitle,
+      priority: isHigh ? 'high' : 'medium',
+      done: false,
+      ts: Date.now(),
+      context: 'day-job'
+    });
+    await dbm.saveNow();
+    return `✅ **Task Added:** "${taskTitle}" (Priority: ${isHigh ? '🔥 High' : '⚡ Normal'})`;
+  }
+
+  // --- ACTION: Draft Email ---
+  mm = m.match(/^(?:draft email to|send email to|email)\s+([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}|[a-z]+)\s+(?:about|saying|subject)\s+(.+)$/i);
+  if (mm) {
+    const to = mm[1];
+    const rest = mm[2];
+    db.emails = db.emails || [];
+    const draft = {
+      id: `draft-${Date.now()}`,
+      to,
+      subject: snippet(rest, 50),
+      body: rest,
+      from: cfgm.load().owner.name || 'ARIA User',
+      draft: true,
+      ts: Date.now()
+    };
+    db.emails.unshift(draft);
+    await dbm.saveNow();
+    return `✉️ **Email Draft Created** to **${to}**:\n*Subject:* ${draft.subject}\n*Body:* ${draft.body}`;
+  }
+
+  // --- ACTION: Complete Task ---
+  mm = m.match(/^(?:complete task|mark done|finish task|done with)\s+(.+)$/i);
+  if (mm) {
+    const q = mm[1].toLowerCase().trim();
+    const item = (db.inbox || []).find(t => !t.done && (t.title || '').toLowerCase().includes(q));
+    if (item) {
+      item.done = true;
+      await dbm.saveNow();
+      return `🎉 **Completed Task:** "${item.title}" marked as done!`;
+    }
+  }
+
 const CALL_ME_BLOCK = /^(later|tomorrow|now|soon|when|if|after|before|back|again|next|first|sometime|once)$/i;
 
 async function routeIntent(msg) {

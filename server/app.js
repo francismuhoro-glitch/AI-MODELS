@@ -11,6 +11,8 @@ const assistant = require('./assistant');
 const briefGen = require('./brief');
 const connectors = require('./connectors');
 const weblearn = require('./weblearn');
+const doclearn = require('./doclearn');
+const telegram = require('./connectors/telegram');
 const { llmStatus, checkOllama } = require('./llm');
 const { uid, dayKey, priorityOf, scorePriority, classifyContext } = require('./util');
 
@@ -150,6 +152,33 @@ app.get('/api/messages', (req, res) => res.json(dbm.find('messages').sort((a, b)
 
 /* ---------- Second brain ---------- */
 app.get('/api/notes', (req, res) => res.json(dbm.find('notes').sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 200)));
+
+/* Document & File Upload Endpoint */
+app.post('/api/notes/upload', async (req, res) => {
+  try {
+    const { filename, content, base64, mimeType } = req.body || {};
+    if (!filename || (!content && !base64)) return res.status(400).json({ error: 'filename and content/base64 required' });
+    const buffer = base64 ? Buffer.from(base64, 'base64') : Buffer.from(content, 'utf8');
+    const note = await doclearn.ingestDocument(filename, buffer, mimeType);
+    res.json({ ok: true, note });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* Telegram Connector Config & Test */
+app.post('/api/connectors/telegram/setup', async (req, res) => {
+  try {
+    const { token, allowedChatId, enabled } = req.body || {};
+    const cfg = await cfgm.save({ telegram: { token, allowedChatId, enabled: !!enabled } });
+    if (enabled && token) telegram.startTelegram();
+    else telegram.stopTelegram();
+    res.json({ ok: true, telegram: cfg.telegram });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/api/notes', async (req, res) => {
   const { title, content, tags } = req.body || {};
   if (!content) return res.status(400).json({ error: 'content required' });

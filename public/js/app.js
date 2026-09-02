@@ -707,7 +707,15 @@ async function viewBrain(main) {
         <label class="field">Paste anything — an idea, a client brief, a lesson learned<textarea id="cap-content" placeholder="Paste or type… it gets indexed, topic-tagged and searchable forever."></textarea></label>
         <button class="btn primary" id="cap-save" style="height:40px">＋ Remember</button>
       </div></div>
-    <div class="card" style="margin-top:14px"><h3>🌐 Learn from a website</h3>
+    <div class="card" style="margin-top:14px">
+    <div class="card" style="margin-top:14px"><h3>📄 Upload Document or PDF</h3>
+      <div class="form-grid" style="grid-template-columns:1fr auto;align-items:end">
+        <label class="field">Drop or choose a .pdf, .csv, .md, .txt or .json file
+          <input type="file" id="doc-upload-file" accept=".pdf,.csv,.txt,.md,.json">
+        </label>
+        <button class="btn primary" id="doc-upload-btn" style="height:40px">📄 Ingest File</button>
+      </div></div>
+  <h3>🌐 Learn from a website</h3>
       <div class="form-grid" style="grid-template-columns:1fr auto;align-items:end">
         <label class="field">Paste any article or page — ARIA reads its text into the brain<input id="web-url" placeholder="https://example.com/supplier-prices"></label>
         <button class="btn primary" id="web-learn" style="height:40px">🌐 Learn</button>
@@ -721,6 +729,27 @@ async function viewBrain(main) {
     await POST('/api/notes', { title: $('#cap-title').value.trim(), content });
     toast('🧠 Remembered'); route();
   };
+  
+  $('#doc-upload-btn').onclick = async () => {
+    const fileInput = $('#doc-upload-file');
+    if (!fileInput.files || !fileInput.files[0]) return toast('Select a file first');
+    const file = fileInput.files[0];
+    const btn = $('#doc-upload-btn'); btn.disabled = true; btn.textContent = '📄 reading…';
+    try {
+      const reader = new FileReader();
+      reader.onload = async () => {
+        const base64 = reader.result.split(',')[1];
+        const r = await POST('/api/notes/upload', { filename: file.name, base64, mimeType: file.type });
+        toast(`🧠 Ingested: "${r.note.title}"`);
+        route();
+      };
+      reader.readAsDataURL(file);
+    } catch (e) {
+      btn.disabled = false; btn.textContent = '📄 Ingest File';
+      toast(`⚠️ ${e.message}`);
+    }
+  };
+  
   $('#web-learn').onclick = async () => {
     const url = $('#web-url').value.trim();
     if (!url) return toast('Paste a website URL first');
