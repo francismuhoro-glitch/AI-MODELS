@@ -44,7 +44,9 @@ class ResearcherAgent extends Agent {
     const seen = new Set();
     for (const q of queries) {
       let found = [];
-      try { found = brain.search(q, 6) || []; } catch (_) { found = []; }
+      /* Hybrid retrieval: BM25 plus embeddings when a backend is live, so a mission phrased
+         differently from the notes ("who sells cement?" → supplier notes) still finds them. */
+      try { found = (await brain.searchAsync(q, 6)) || []; } catch (_) { try { found = brain.search(q, 6) || []; } catch (__) { found = []; } }
       for (const h of found) {
         const key = `${h.kind}:${h.title}`;
         if (seen.has(key)) continue;
@@ -52,7 +54,7 @@ class ResearcherAgent extends Agent {
         hits.push(h);
       }
     }
-    hits.sort((a, b) => (b.score || 0) - (a.score || 0));
+    hits.sort((a, b) => ((b.blended || 0) - (a.blended || 0)) || ((b.score || 0) - (a.score || 0)));
     const top = hits.slice(0, 8);
 
     /* External sources: crawl at most two URLs found in the mission text. */
@@ -72,7 +74,8 @@ class ResearcherAgent extends Agent {
     /* Live web search — if brain results are thin or mission looks like it needs external knowledge. */
     const webResults = [];
     const HIGH_CONFIDENCE = 3.0;
-    const hasStrongBrainHits = top.some(h => h.score >= HIGH_CONFIDENCE);
+    const HIGH_CONFIDENCE_SEMANTIC = 0.55;
+    const hasStrongBrainHits = top.some(h => (h.score || 0) >= HIGH_CONFIDENCE || (h.semantic || 0) >= HIGH_CONFIDENCE_SEMANTIC);
     const needsWebKnowledge = !hasStrongBrainHits || /what\s+is|who\s+is|latest|news|github|tell me about/i.test(ctx.task);
 
     if (ctx.allowWeb !== false && needsWebKnowledge) {
@@ -106,7 +109,7 @@ class ResearcherAgent extends Agent {
 
     ctx.shared.research = {
       queries,
-      hits: top.map(h => ({ kind: h.kind, title: h.title, snippet: snippet(h.snippet, 200), score: h.score, ts: h.ts })),
+      hits: top.map(h => ({ kind: h.kind, title: h.title, snippet: snippet(h.snippet, 200), score: h.score, semantic: h.semantic || 0, ts: h.ts })),
       crawled,
       failed,
       webResults,

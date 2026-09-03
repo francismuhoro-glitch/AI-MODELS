@@ -305,6 +305,84 @@ function cleanForSpeech(text, opts = {}) {
    Browser-native Web Speech API only — no new dependencies, no paid services.
    Recognition (the mic) needs HTTPS or localhost and works in Chrome/Edge/Safari, not Firefox.
    Replies are read aloud with speechSynthesis, gated by the Sound.on mute toggle. */
+
+/* ---- Voice gender preference -------------------------------------------------------
+   ARIA used to be hard-wired to a FEMALE voice name, so she always sounded female on any
+   device that had female voices installed. The owner asked for a male voice, so the default
+   is now MALE, stored in two places:
+     • localStorage 'aria.voiceGender' — per device, applied instantly (no round-trip)
+     • settings.voiceGender            — the server-side default for a fresh device
+   Re-picking is immediate: setGender() clears Speech._voice and prime() chooses again. */
+const VOICE_GENDER_KEY = 'aria.voiceGender';
+const VOICE_NAME_GENDER = {
+  /* Explicit male voice names across Chrome, Edge, Safari, macOS, Windows, Android & iOS. */
+  male: /\b(?:daniel|alex|fred|thomas|george|oliver|liam|noah|aaron|arthur|rishi|eddy|rocko|grandpa|reed|junior|ralph|david|mark|guy|ryan|james|peter|paul|adam|eric|diego|jorge|male)\b|google uk english male|google us english|microsoft (?:david|mark|guy|ryan|george|james|paul)/i,
+  female: /\b(?:aria|samantha|zira|karen|moira|tessa|victoria|serena|allison|ava|susan|joanna|kendra|fiona|veena|monica|libby|sonia|amira|catherine|heather|linda|sandy|shelley|zoe|kate|eva|hazel|female)\b|google uk english female|microsoft (?:zira|linda|heather|eva|hazel|susan|catherine)/i
+};
+
+/* 'male' | 'female' | null — null means the name says nothing, so speak() nudges the pitch. */
+function voiceGenderOf(name) {
+  const n = String(name || '');
+  const male = VOICE_NAME_GENDER.male.test(n);
+  const female = VOICE_NAME_GENDER.female.test(n);
+  if (male && !female) return 'male';
+  if (female && !male) return 'female';
+  return null;
+}
+
+function storedVoiceGender() {
+  let g = null;
+  try { g = localStorage.getItem(VOICE_GENDER_KEY); } catch (_) {}
+  if (g !== 'male' && g !== 'female') g = serverVoiceGender || 'male';   // the owner's default: a MALE voice
+  return g === 'female' ? 'female' : 'male';
+}
+
+/* Adopt the server-side default (settings.voiceGender) on a device that has not chosen yet.
+   An explicit localStorage choice always wins, so the switch is instant and per-device. */
+let serverVoiceGender = null;
+function syncVoiceGender(serverValue) {
+  const g = String(serverValue || '').toLowerCase();
+  if (g !== 'male' && g !== 'female') return storedVoiceGender();
+  serverVoiceGender = g;
+  try {
+    const local = localStorage.getItem(VOICE_GENDER_KEY);
+    if (local !== 'male' && local !== 'female') localStorage.setItem(VOICE_GENDER_KEY, g);
+  } catch (_) {}
+  return storedVoiceGender();
+}
+
+/* Keep the per-device preference explicit so a fresh install behaves predictably. */
+try {
+  if (localStorage.getItem(VOICE_GENDER_KEY) !== 'male' && localStorage.getItem(VOICE_GENDER_KEY) !== 'female') {
+    localStorage.setItem(VOICE_GENDER_KEY, 'male');
+  }
+} catch (_) {}
+
+const preferLocale = (list) => list.find(v => /(?:^|[-_])(?:US|GB)$/i.test(v.lang || '')) || list[0] || null;
+
+/**
+ * Choose the voice ARIA speaks with.
+ * @param {Array}  list   speechSynthesis.getVoices()
+ * @param {string} gender 'male' (default) | 'female'
+ * Pure + injectable so it is unit-testable with a fake voice list (jsdom has no voices).
+ */
+function pickVoice(list, gender) {
+  const want = String(gender || storedVoiceGender()).toLowerCase() === 'female' ? 'female' : 'male';
+  const other = want === 'male' ? 'female' : 'male';
+  const all = (Array.isArray(list) ? list : []).filter(v => v && typeof v.name === 'string');
+  if (!all.length) return null;
+  const en = all.filter(v => /^en/i.test(v.lang || ''));
+  const pool = en.length ? en : all;
+  /* 1. a voice whose NAME is explicitly the requested gender */
+  const named = pool.filter(v => voiceGenderOf(v.name) === want);
+  if (named.length) return preferLocale(named);
+  /* 2. any voice that is not clearly the OTHER gender (speak() nudges the pitch) */
+  const neutral = pool.filter(v => voiceGenderOf(v.name) !== other);
+  if (neutral.length) return preferLocale(neutral);
+  /* 3. last resort: the best English voice available, pitch-corrected in speak() */
+  return preferLocale(pool);
+}
+
 const Speech = {
   on: localStorage.getItem('aria.speech') !== '0',     // speak ARIA's replies aloud
   convo: localStorage.getItem('aria.convo') === '1',   // hands-free conversation mode
@@ -336,26 +414,45 @@ const Speech = {
   /* True while ARIA is talking OR listening — the wake listener must stay off. */
   busy() { return !!(this.listening || this._speaking || (this.tts() && window.speechSynthesis.speaking)); },
 
-  pickVoice(list) {
-    const en = (list || []).filter(v => /^en/i.test(v.lang || ''));
-    return en.find(v => /aria|female|samantha|zira|karen|moira|tessa|victoria|serena|allison|ava|susan|joanna|kendra|fiona|veena|monica|libby|sonia|amira/i.test(v.name))
-      || en.find(v => /(US|GB)$/i.test(v.lang || '')) || en[0] || null;
+  /* The voice picker lives at module scope (pure + injectable) so it can be unit-tested with
+     a fake voice list — jsdom has no real speechSynthesis voices. Speech.pickVoice delegates. */
+  gender() { return storedVoiceGender(); },
+
+  /* Switch ARIA's voice: persist per-device, drop the cached voice and re-pick right away. */
+  setGender(gender) {
+    const g = String(gender || '').toLowerCase() === 'female' ? 'female' : 'male';
+    try { localStorage.setItem(VOICE_GENDER_KEY, g); } catch (_) {}
+    serverVoiceGender = g;
+    this._voice = null;                 // force a re-pick
+    this._voicesHooked = false;
+    this.prime(true);
+    return g;
   },
 
   /* iOS Safari keeps speechSynthesis muted until a speak() happens inside a user gesture.
-     Prime it on the first tap so ARIA's first reply is not silent. */
-  prime() {
-    if (this._primeDone || !this.tts()) return;
-    this._primeDone = true;
+     Prime it on the first tap so ARIA's first reply is not silent. Also re-primes whenever the
+     cached voice was dropped (a gender switch) so the new preference is picked up at once. */
+  prime(force) {
+    if (!this.tts()) return;
+    if (force) { this._primeDone = false; this._voice = null; }
     if (!this._voicesHooked) {
       this._voicesHooked = true;
-      const voices = window.speechSynthesis.getVoices();
-      if (voices.length) this._voice = this.pickVoice(voices);
-      window.speechSynthesis.onvoiceschanged = () => {
-        const v = window.speechSynthesis.getVoices();
-        if (v.length) this._voice = this.pickVoice(v);
-      };
+      try {
+        const voices = window.speechSynthesis.getVoices();
+        if (voices && voices.length) this._voice = pickVoice(voices, this.gender());
+        window.speechSynthesis.onvoiceschanged = () => {
+          const v = window.speechSynthesis.getVoices();
+          if (v && v.length) this._voice = pickVoice(v, this.gender());
+        };
+      } catch (_) {}
+    } else if (!this._voice) {
+      try {
+        const voices = window.speechSynthesis.getVoices();
+        if (voices && voices.length) this._voice = pickVoice(voices, this.gender());
+      } catch (_) {}
     }
+    if (this._primeDone) return;
+    this._primeDone = true;
     if (/iphone|ipad|ipod/i.test(navigator.userAgent)) {
       try {
         const u = new SpeechSynthesisUtterance(' ');
@@ -503,11 +600,17 @@ const Speech = {
       try {
         const synth = window.speechSynthesis;
         synth.cancel();
+        if (!this._voice) this.prime();          // honour a gender switch made since the last reply
         const u = new SpeechSynthesisUtterance(body);
+        const gender = this.gender();
         if (this._voice) { u.voice = this._voice; u.lang = this._voice.lang; }
         /* Natural cadence: rate 1.0 and the cleaned text keeps its commas & periods,
-           which speechSynthesis turns into pauses. */
-        u.rate = 1.0; u.pitch = 1; u.volume = 1;
+           which speechSynthesis turns into pauses. When the device only offers voices with
+           neutral names, the pitch carries the requested gender instead. */
+        const namedGender = this._voice ? voiceGenderOf(this._voice.name) : null;
+        u.rate = 1.0;
+        u.pitch = namedGender ? 1 : (gender === 'male' ? 0.85 : 1.05);
+        u.volume = 1;
         u.onend = () => done(true);
         u.onerror = () => done(false);
         this._utterance = u;
@@ -680,11 +783,17 @@ const TZ = () => (STATE && STATE.timezone) || (STATE && STATE.owner && STATE.own
    fill every one of them so an older/partial settings document cannot blank the form. */
 function normalizeSettings(raw) {
   const s = raw && typeof raw === 'object' ? raw : {};
+  const llm = s.llm && typeof s.llm === 'object' ? s.llm : {};
   return {
     ...s,
     owner: { name: '', timezone: 'Africa/Nairobi', ...(s.owner || {}), location: { label: '', lat: '', lon: '', ...((s.owner || {}).location || {}) } },
     wakeTime: s.wakeTime || '06:00',
-    llm: { provider: 'auto', ollamaUrl: '', model: '', ...(s.llm || {}) },
+    llm: {
+      provider: 'auto', ollamaUrl: '', model: '', recommendedModel: 'qwen2.5:7b', ...llm,
+      openai: { baseUrl: 'https://api.openai.com/v1', apiKey: '', model: 'gpt-4o-mini', ...(llm.openai || {}) }
+    },
+    /* ARIA's speaking voice — MALE unless the owner chose otherwise. */
+    voiceGender: String(s.voiceGender || '').toLowerCase() === 'female' ? 'female' : 'male',
     smtp: { host: '', port: 587, user: '', pass: '', to: '', ...(s.smtp || {}) },
     brief: { email: false, ...(s.brief || {}) },
     discretion: s.discretion !== false,
@@ -699,11 +808,24 @@ async function refreshState() {
     STATE = STATE || normalizeState(null);
     throw e;
   }
+  /* Adopt the server-side voice default on a device that has not chosen one yet. */
+  try { syncVoiceGender((STATE && (STATE.voiceGender || (STATE.cfg && STATE.cfg.voiceGender))) || 'male'); } catch (_) {}
   const high = A(STATE.inbox).filter(e => e && e.priority === 'high' && !e.read).length
     + A(STATE.messages).filter(m => m && m.priority === 'high' && !m.read).length;
   if (lastHighSeen !== null && high > lastHighSeen) Sound.priorityAlert();
   lastHighSeen = high;
   return STATE;
+}
+
+/* A real model answered (local Ollama or a cloud endpoint) vs the built-in offline engine.
+   Engine strings look like 'ollama', 'ollama:qwen2.5:7b', 'openai:gpt-4o-mini', 'tool:openai:…'. */
+const isLiveEngine = (e) => /^(?:tool:)?(?:ollama|openai)\b/i.test(String(e || ''));
+function engineLabel(e) {
+  const s = String(e || '');
+  if (/^tool:/i.test(s)) return `${s.slice(5)} · tool call`;
+  if (/^ollama/i.test(s)) return `local LLM · ${s.split(':').slice(1).join(':') || 'ollama'}`;
+  if (/^openai/i.test(s)) return `cloud LLM · ${s.split(':').slice(1).join(':') || 'openai'}`;
+  return 'offline engine';
 }
 
 function updateSidebar() {
@@ -717,8 +839,9 @@ function updateSidebar() {
 
   const eng = $('#engine-chip');
   if (eng) {
-    const dot = activeEngine === 'ollama' ? '<span class="dot on"></span>' : '<span class="dot off"></span>';
-    eng.innerHTML = `${dot}${activeEngine === 'ollama' ? 'local LLM · ollama' : 'offline engine'}`;
+    const live = isLiveEngine(activeEngine);
+    const dot = live ? '<span class="dot on"></span>' : '<span class="dot off"></span>';
+    eng.innerHTML = `${dot}${engineLabel(activeEngine)}`;
   }
   const sync = $('#sync-chip');
   if (sync) sync.textContent = stats.lastSync ? `synced ${fmtAgo(stats.lastSync)} ago` : 'never synced';
@@ -1049,9 +1172,13 @@ async function viewAssistant(main) {
   const history = A(await api('/api/assistant/history'));
   const ai = (await api('/api/ai/status')) || { activeEngine: 'offline' };
   const hasMic = Speech.supported(), isSecure = Speech.secure();
+  const live = isLiveEngine(ai.activeEngine);
+  const engineChip = live
+    ? `🟢 ${/^openai/i.test(ai.activeEngine || '') ? `cloud LLM · ${esc((ai.openai && ai.openai.model) || 'openai')}` : `local LLM · ${esc(ai.model || 'ollama')}`}`
+    : '🟡 built-in offline engine';
   main.innerHTML = `<div class="view-head"><div><h1>Executive Assistant</h1><div class="sub">Reasons over your real calendar, inbox, messages & brain</div></div>
     <span style="display:flex;gap:9px;align-items:center">
-      <span class="chip ${ai.activeEngine === 'ollama' ? 'green' : 'yellow'}">${ai.activeEngine === 'ollama' ? `🟢 local LLM · ${esc(ai.model || '')}` : '🟡 built-in offline engine'}</span>
+      <span class="chip ${live ? 'green' : 'yellow'}">${engineChip}</span>
       <button class="btn" id="btn-open-agency" title="Hand a complex, multi-step mission to the agent swarm">🤖 Agency Swarm</button>
     </span></div>
     <div class="card chat-wrap">
@@ -1349,18 +1476,36 @@ function chatMsg(c) {
   return `<div class="msg aria"><div class="md">${md(c.content)}</div>${c.engine ? `<div class="engine-tag">${esc(c.engine)}</div>` : ''}</div>`;
 }
 function welcomeMsg(ai) {
+  const live = isLiveEngine(ai && ai.activeEngine);
+  const engineLine = live
+    ? (/^openai/i.test((ai && ai.activeEngine) || '')
+      ? 'Running on your cloud model — the sharpest reasoning ARIA can get.'
+      : 'Running on your local Ollama model — private, free, on-device.')
+    : 'Running my built-in offline engine.';
+  const nudge = live ? '' : ' For full free-form reasoning, install <code>ollama</code> and pull <code>qwen2.5:7b</code> (or add a cloud key) in Settings — then I can also act on what you say: create events, add tasks and search your brain on my own.';
   return `<div class="msg aria"><div class="md">
-    <p><strong>${ai.activeEngine === 'ollama' ? 'Running on your local Ollama model — private, free, on-device.' : 'Running my built-in offline engine.'}</strong> ${ai.activeEngine === 'ollama' ? '' : 'For full free-form reasoning, install <code>ollama</code>, pull a model, and set it in Settings — everything stays on your machine.'}</p>
-    <p>I can brief you on the day, rank priorities, triage your inbox, summarize Slack & WhatsApp, and answer from your second brain.</p>
+    <p><strong>${engineLine}</strong>${nudge}</p>
+    <p>I can brief you on the day, rank priorities, triage your inbox, summarize Slack & WhatsApp, and answer from your second brain. Ask me in plain words — "can you set up a call with the client tomorrow at 11" works.</p>
     <p><em>Try a suggestion below, or just ask.</em></p></div></div>`;
 }
 
 /* ===== SETTINGS ===== */
+/* The voice select shows what THIS device will actually speak with: the per-device choice
+   (localStorage) when there is one, otherwise the server-side default. */
+const voiceGenderHint = () => {
+  const g = storedVoiceGender();
+  return g === 'female'
+    ? 'ARIA speaks with a female voice on this device. Devices without a matching voice name get a slightly higher pitch instead.'
+    : 'ARIA speaks with a male voice on this device. Devices without a matching voice name get a slightly deeper pitch instead.';
+};
+
 async function viewSettings(main) {
   const [rawSettings, rawConns] = await Promise.all([api('/api/settings'), api('/api/connectors')]);
   const s = normalizeSettings(rawSettings);
   const conns = A(rawConns);
   SETTINGS = s; CONNECTORS = conns;
+  syncVoiceGender(s.voiceGender);
+  const voiceGender = storedVoiceGender();
   const connMeta = {
     demo: ['🧪', 'Demo data', 'Sample day, clearly marked DEMO (first-boot seeding is opt-in via ARIA_DEMO=1). Turning it off asks whether to purge the fake data.'],
     google: ['📧', 'Gmail + Google Calendar', 'One-time OAuth setup: Google Cloud project → enable Gmail + Calendar APIs → OAuth client (redirect http://localhost:3111/oauth/google) → generate refresh token → paste below.'],
@@ -1380,11 +1525,15 @@ async function viewSettings(main) {
       </div><p style="color:var(--faint);font-size:12px;margin-top:10px">Every day at wake time ARIA syncs everything, writes your brief, and emails it if SMTP is set.</p></div>
 
       <div class="card"><h3>🧠 AI engine</h3><div class="form-grid">
-        <label class="field">Provider<select id="s-provider"><option value="auto" ${s.llm.provider === 'auto' ? 'selected' : ''}>Auto (Ollama → fallback offline)</option><option value="ollama" ${s.llm.provider === 'ollama' ? 'selected' : ''}>Ollama only</option><option value="offline" ${s.llm.provider === 'offline' ? 'selected' : ''}>Offline engine only</option></select></label>
+        <label class="field">Provider<select id="s-provider"><option value="auto" ${s.llm.provider === 'auto' ? 'selected' : ''}>Auto (cloud → Ollama → offline)</option><option value="openai" ${s.llm.provider === 'openai' ? 'selected' : ''}>Cloud (OpenAI-compatible) only</option><option value="ollama" ${s.llm.provider === 'ollama' ? 'selected' : ''}>Ollama only (local)</option><option value="offline" ${s.llm.provider === 'offline' ? 'selected' : ''}>Offline engine only</option></select></label>
         <label class="field">Ollama URL<input id="s-ourl" value="${esc(s.llm.ollamaUrl)}"></label>
-        <label class="field">Model<input id="s-model" value="${esc(s.llm.model)}" placeholder="llama3.1"></label>
+        <label class="field">Local model<input id="s-model" value="${esc(s.llm.model)}" placeholder="${esc(s.llm.recommendedModel || 'qwen2.5:7b')}"></label>
+        <label class="field">Cloud base URL<input id="s-oai-url" value="${esc(s.llm.openai.baseUrl)}" placeholder="https://api.openai.com/v1"></label>
+        <label class="field">Cloud API key<input id="s-oai-key" type="password" value="${esc(s.llm.openai.apiKey)}" placeholder="sk-… (optional)" autocomplete="off"></label>
+        <label class="field">Cloud model<input id="s-oai-model" value="${esc(s.llm.openai.model)}" placeholder="gpt-4o-mini"></label>
       </div>
-      <p style="color:var(--faint);font-size:12px;margin-top:10px">100% local & private. Setup: install <a href="https://ollama.com" target="_blank" style="color:var(--accent)">Ollama</a> → <code>ollama pull llama3.1</code> → done. ARIA detects it automatically.</p></div>
+      <p style="color:var(--faint);font-size:12px;margin-top:10px"><strong>Local (free & private):</strong> install <a href="https://ollama.com" target="_blank" style="color:var(--accent)">Ollama</a> → <code>ollama pull ${esc(s.llm.recommendedModel || 'qwen2.5:7b')}</code> → set the model above. <strong>${esc(s.llm.recommendedModel || 'qwen2.5:7b')}</strong> is the recommended default (best reasoning on 8&nbsp;GB); <code>llama3.1:8b</code> is a solid alternative. ARIA also understands tool calls with either.</p>
+      <p style="color:var(--faint);font-size:12px;margin-top:6px"><strong>Cloud (optional, off by default):</strong> paste an API key for any OpenAI-compatible endpoint (OpenAI, Groq, OpenRouter, a local vLLM) and ARIA will prefer it — the biggest intelligence jump on small hardware. The key is also read from the <code>OPENAI_API_KEY</code> environment variable, is never logged, and is skipped entirely when empty.</p></div>
 
       <div class="card"><h3>📮 Brief delivery (email)</h3><div class="form-grid">
         <label class="field">SMTP host<input id="s-smtphost" value="${esc(s.smtp.host)}" placeholder="smtp.gmail.com"></label>
@@ -1398,8 +1547,17 @@ async function viewSettings(main) {
         <div style="display:flex;gap:9px;flex-wrap:wrap">
           <button class="btn js-install" data-force="1">📲 Install on this device</button>
           <button class="btn" id="btn-sound-toggle">${Sound.label()}</button>
-          <button class="btn" id="btn-test-voice">▶ Test ARIA's voice</button>
         </div>
+        <div class="form-grid" style="margin-top:12px">
+          <label class="field" title="Which voice ARIA speaks with on this device. Saved here for every device, and instantly on this one.">ARIA's voice
+            <select id="s-voice-gender">
+              <option value="male" ${voiceGender === 'male' ? 'selected' : ''}>Male</option>
+              <option value="female" ${voiceGender === 'female' ? 'selected' : ''}>Female</option>
+            </select>
+          </label>
+          <div style="display:flex;align-items:flex-end"><button class="btn" id="btn-test-voice">▶ Test ARIA's voice</button></div>
+        </div>
+        <p style="color:var(--faint);font-size:12px;margin-top:6px" id="voice-gender-hint">${voiceGenderHint()}</p>
         <div style="display:flex;gap:9px;flex-wrap:wrap;margin-top:10px">
           <button class="btn" id="btn-push">🔔 Enable morning notifications</button>
           <button class="btn ghost" id="btn-push-test">Send test notification</button>
@@ -1408,7 +1566,7 @@ async function viewSettings(main) {
           <input type="checkbox" id="s-discretion" ${s.discretion !== false ? 'checked' : ''}>
           <span>🤫 Discretion mode — keep secrets & long lists off the air</span>
         </label>
-        <p style="color:var(--faint);font-size:12px;margin-top:12px">Install puts ARIA on your home screen / desktop like a native app — full screen, offline access to your latest brief, and her voice every morning. Notifications deliver the brief to your lock screen at ${esc(s.wakeTime)} even before you open the app.</p>
+        <p style="color:var(--faint);font-size:12px;margin-top:12px">Install puts ARIA on your home screen / desktop like a native app — full screen, offline access to your latest brief, and their voice every morning. Notifications deliver the brief to your lock screen at ${esc(s.wakeTime)} even before you open the app.</p>
       </div>
 
       <div class="card"><h3>🔌 Connectors</h3>
@@ -1428,13 +1586,24 @@ async function viewSettings(main) {
     <p style="margin-top:14px;color:var(--faint);font-size:12px">Secrets never leave your machine — stored in <code>data/settings.json</code> on your own disk.</p>`;
 
   $('#set-save').onclick = async () => {
+    const gender = $('#s-voice-gender') ? $('#s-voice-gender').value : storedVoiceGender();
     await POST('/api/settings', {
       owner: { name: $('#s-name').value, timezone: $('#s-tz').value, location: { lat: +$('#s-lat').value, lon: +$('#s-lon').value, label: $('#s-loc-label').value } },
       wakeTime: $('#s-wake').value,
-      llm: { provider: $('#s-provider').value, ollamaUrl: $('#s-ourl').value, model: $('#s-model').value },
+      llm: {
+        provider: $('#s-provider').value, ollamaUrl: $('#s-ourl').value, model: $('#s-model').value,
+        /* Cloud provider (optional): the key is only sent when the field actually holds one. */
+        openai: {
+          baseUrl: ($('#s-oai-url') && $('#s-oai-url').value.trim()) || 'https://api.openai.com/v1',
+          apiKey: ($('#s-oai-key') && $('#s-oai-key').value.trim()) || '',
+          model: ($('#s-oai-model') && $('#s-oai-model').value.trim()) || 'gpt-4o-mini'
+        }
+      },
+      voiceGender: gender === 'female' ? 'female' : 'male',
       smtp: { host: $('#s-smtphost').value, port: +$('#s-smtpport').value || 587, user: $('#s-smtpuser').value, pass: $('#s-smtppass').value, to: $('#s-smtpto').value },
       discretion: $('#s-discretion').checked
     });
+    Speech.setGender(gender);          // this device switches over immediately
     for (const c of conns) {
       const enabled = $(`input[data-conn="${c.id}"]`).checked;
       const cfg = configValues(c.id);
@@ -1466,7 +1635,28 @@ async function viewSettings(main) {
     }
   };
   $('#btn-sound-toggle').onclick = () => { Sound.toggle(); $('#btn-sound-toggle').textContent = Sound.label(); toast(Sound.label()); };
-  $('#btn-test-voice').onclick = () => Sound.morning();
+  /* Voice gender: switching re-picks the voice on the spot (Speech.setGender clears the cache). */
+  const genderSel = $('#s-voice-gender');
+  if (genderSel) genderSel.onchange = () => {
+    const g = Speech.setGender(genderSel.value);
+    const hint = $('#voice-gender-hint'); if (hint) hint.textContent = voiceGenderHint();
+    toast(g === 'female' ? 'ARIA will speak with a female voice — hit "Save all" to make it your default everywhere' : 'ARIA will speak with a male voice — hit "Save all" to make it your default everywhere');
+    if (Sound.on) Speech.speak(g === 'female' ? "Hello, I'm ARIA. This is how I'll sound from now on." : "Hello, I'm ARIA. This is how I'll sound from now on.");
+  };
+  /* Preview the CURRENT voice through the real speech pipeline (not a canned audio file). */
+  $('#btn-test-voice').onclick = () => {
+    Speech.prime(true);
+    const line = Speech.gender() === 'female'
+      ? "Good morning. I'm ARIA, your executive assistant. This is my voice on this device."
+      : "Good morning boss. I'm ARIA, your executive assistant. This is my voice on this device.";
+    Speech.speak(line).then((spoken) => {
+      if (!spoken) {
+        if (!Sound.on) toast('🔇 Sound is off — unmute to hear ARIA.');
+        else if (!Speech.tts()) { Sound.morning(); toast('This browser has no speech synthesis — played the chime instead.'); }
+        else toast('No voice available on this device yet — your OS installs them under Accessibility → Spoken Content.');
+      }
+    }).catch(() => {});
+  };
   $('#btn-push').onclick = () => PushClient.subscribe();
   $('#btn-push-test').onclick = () => PushClient.test();
 }
@@ -1638,7 +1828,13 @@ window.addEventListener('asst-speak-start', () => WakeWord.release());
 window.addEventListener('asst-speak-done', () => WakeWord.rearm());
 window.AriaWakeWord = WakeWord;
 Speech.cleanForSpeech = cleanForSpeech;
+/* Exported for the verification suite (jsdom has no real voices, so the picker is unit-tested
+   with a fake list) and reused by the Settings preview button. */
+Speech.pickVoice = pickVoice;
+Speech.voiceGenderOf = voiceGenderOf;
 window.AriaSpeech = Speech;
+window.AriaPickVoice = pickVoice;
+window.AriaVoiceGenderOf = voiceGenderOf;
 
 /* Opt-in only (localStorage aria.wake = '1'). Enabling it unprompted would hold the
    microphone permanently and lock out the assistant mic button. */

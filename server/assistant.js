@@ -1,6 +1,6 @@
 'use strict';
 /**
- * ARIA Assistant — deterministic intent routing + actions + web search + LLM fallback.
+ * ARIA Assistant — deterministic intent routing + actions + tool calling + web search + LLM fallback.
  *
  * Conversation intelligence (this module):
  *   • Multi-turn memory  — the last 10 turns from db.chats are passed into llmChat() and a
@@ -9,10 +9,22 @@
  *   • Follow-up handling — "what is my schedule today?" → "what about tomorrow?" is rewritten
  *     into a full question using the previous turn, and entity carry-over lets
  *     "schedule a meeting with Kamau" → "add another one for Friday" work without a name.
+ *   • Natural phrasing    — politeness and filler ("can you", "please", "hey ARIA", "I'd like
+ *     to", "let's") is stripped before the intent regexes run and the scheduling verbs cover
+ *     book / set up / arrange / organize / create / make / new / add, so "can you schedule a
+ *     meeting with Kamau tomorrow at 2pm" and "set up a call with the client tomorrow at 11"
+ *     create REAL calendar entries deterministically — no LLM required.
+ *   • Tool calling       — every message the regex layer does not recognise is offered to the
+ *     LLM with a tool schema first. When the model answers {"tool":…,"args":…} ARIA executes
+ *     it through the SAME internal functions routeIntent() uses, so the confirmation it speaks
+ *     is the real result (never an invented one). Only then does it fall back to plain chat.
  *   • Autonomous planner — "plan my day tomorrow" / "build a weekly plan" generates a full
  *     calendar (wake brief, focus blocks, meeting slots, triage windows, buffers) around the
  *     user's rhythm and existing events, with iterative refinement ("move the standup to
  *     10am", "remove the inbox triage").
+ *   • Rolling summary    — every 12 turns the conversation is compressed into
+ *     db.meta.conversation.summary (LLM-written, heuristic fallback) and prepended to the
+ *     context pack, so memory survives beyond the 10-turn window.
  *   • Speech discretion — every reply ships a TTS-safe `speech` field: secrets redacted
  *     (PINs, tokens, cards, emails, phones), long lists summarised, profanity masked.
  */
@@ -30,6 +42,75 @@ You remember the earlier turns of this conversation (provided as history) — re
 questions like "what about tomorrow?" or "add another one" using that context instead of asking again.
 Use the provided CONTEXT (calendar, emails, chats, second-brain notes) to answer the user's query.
 If something is unknown, say so and suggest what to check. Never invent meetings or emails.`;
+
+/* ════════════════════════════════════════════════════════════════════════
+   0. NATURAL PHRASING — strip politeness/filler, then match the intent
+   ════════════════════════════════════════════════════════════════════════
+   People do not talk to an assistant in regex. "can you schedule a meeting with Kamau
+   tomorrow at 2pm", "please add a meeting with the supplier at 3pm" and "set up a call with
+   the client tomorrow at 11" all mean the same thing as "schedule …". The filler is removed
+   first so ONE intent layer covers every polite wrapper. */
+const FILLER_PREFIX_RE = new RegExp([
+  '^(?:',
+  [
+    '(?:hey|hi|hello|yo|ok(?:ay)?|so|well|alright|right)[\\s,!]*aria[\\s,!.-]*',   // "hey aria, can you …"
+    'aria[\\s,!]+',
+    '(?:hey|hi|hello|yo|ok(?:ay)?|alright|good\\s+(?:morning|afternoon|evening))[\\s,!.-]+',
+    '(?:can|could|would|will|shall|may)\\s+you\\s+(?:please\\s+)?',
+    '(?:can|could|would|will)\\s+(?:i|we)\\s+(?:please\\s+)?',
+    'please[\\s,!.-]*', 'pls[\\s,!.-]*', 'kindly[\\s,!.-]*', 'prithee[\\s,!.-]*',
+    'i\\s+(?:want|need|wish)\\s+to\\s+', 'i\\s+(?:want|need)\\s+you\\s+to\\s+',
+    'i(?:[\'’]|\\s)?d\\s+like\\s+(?:to\\s+|it\\s+if\\s+you\\s+)?',
+    'let[\'’]?s\\s+', 'go\\s+ahead\\s+and\\s+', 'help\\s+me\\s+', 'do\\s+me\\s+a\\s+favo(?:u)?r\\s+and\\s+',
+    'time\\s+to\\s+', 'you\\s+(?:need|should|must)\\s+to?\\s*', 'just\\s+'
+  ].join('|'),
+  ')\\s*'
+].join(''), 'i');
+
+/**
+ * Remove leading politeness/filler ("can you please …", "hey ARIA, I'd like to …").
+ * Never returns an empty string — if the whole message WAS filler, the original is kept so
+ * greetings like "hello" still classify as greetings.
+ */
+function stripFiller(msg) {
+  let out = String(msg || '').trim();
+  const original = out;
+  for (let i = 0; i < 4; i++) {
+    const next = out.replace(FILLER_PREFIX_RE, '').replace(/^[\s,!.-]+/, '').trim();
+    if (!next || next === out) break;
+    out = next;
+  }
+  return out || original;
+}
+
+/* Legacy verbs stay permissive (back-compat); the widened verbs are guarded so "create a
+   summary of my inbox" is not mistaken for a calendar entry. */
+const SCHEDULE_STRICT_RE = /^(?:schedule|add\s+event|create\s+meeting|meeting\s+with|calendar)\s+(.+)$/i;
+const SCHEDULE_WIDE_RE = /^(?:schedule|book|set\s+up|arrange|organise|organize|create|make|new|add)\s+(?:a\s+|an\s+|the\s+|me\s+|us\s+)?(.+)$/i;
+const CALENDAR_NOUN_RE = /\b(meetings?|calls?|appts?|appointments?|events?|lunch|dinner|breakfast|brunch|coffee|catch[\s-]?ups?|syncs?|stand[\s-]?ups?|interviews?|demos?|reviews?|sessions?|workshops?|trainings?|webinars?|check[\s-]?ins?|visits?|conferences?|kick[\s-]?offs?|one[\s-]on[\s-]ones?|deadlines?|reminders?|slots?|blocks?)\b/i;
+const TIME_PHRASE_RE = /\b(at\s+\d{1,2}|\d{1,2}(?::\d{2})?\s*(?:am|pm)|tomorrow|today|tonight|next\s+week|this\s+week|(?:on|for|by)\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|weekdays?|weekend|eod|noon|midnight|morning|afternoon|evening)\b/i;
+/* Things people ask ARIA to "create/add" that are NOT calendar entries. */
+const NOT_AN_EVENT_RE = /^(?:tasks?|to[\s-]?dos?|reminders?\s+to\s+(?:remember|note)|notes?|checklists?|lists?|summaries|summary|reports?|briefs?|emails?|messages?|drafts?|plans?\s+for\s+my\s+(?:day|week)|websites?|apps?|scripts?|files?|docs?|documents?|slides?|decks?|invoices?|quotes?|quotations?)\b/i;
+/* Bare pronouns are follow-ups ("add another one for Friday") — resolveFollowUp() owns those. */
+const PRONOUN_BODY_RE = /^(?:another|one|it|that|this|these|those|the\s+same|same|them)\b/i;
+
+/**
+ * Does this message ask ARIA to put something on the calendar?
+ * @returns {{body: string, via: 'strict'|'wide'}|null} the text after the verb
+ */
+function matchScheduleRequest(msg) {
+  const m = stripFiller(msg);
+  let mm = m.match(SCHEDULE_STRICT_RE);
+  if (mm && mm[1].trim() && !PRONOUN_BODY_RE.test(mm[1].trim())) return { body: mm[1].trim(), via: 'strict' };
+  mm = m.match(SCHEDULE_WIDE_RE);
+  if (mm && mm[1].trim()) {
+    const body = mm[1].trim();
+    if (NOT_AN_EVENT_RE.test(body) || PRONOUN_BODY_RE.test(body)) return null;
+    /* A widened verb only schedules when the object is calendar-ish OR carries a "when". */
+    if (CALENDAR_NOUN_RE.test(body) || TIME_PHRASE_RE.test(body)) return { body, via: 'wide' };
+  }
+  return null;
+}
 
 /* ─── Intent classification ───────────────────────────────────────────── */
 const WEB_SEARCH_PATTERNS = [
@@ -74,12 +155,15 @@ const PERSONAL_OPERATIONAL_PATTERNS = [
 
 function isWebSearchQuery(msg) {
   const m = String(msg || '').trim();
-  return WEB_SEARCH_PATTERNS.some(p => p.test(m)) && !isPersonalQuery(m);
+  const polite = stripFiller(m);          // "can you look up X?" is still a web search
+  const hit = WEB_SEARCH_PATTERNS.some(p => p.test(m)) || (polite !== m && WEB_SEARCH_PATTERNS.some(p => p.test(polite)));
+  return hit && !isPersonalQuery(m);
 }
 
 function isPersonalQuery(msg) {
   const m = String(msg || '').trim();
-  return PERSONAL_OPERATIONAL_PATTERNS.some(p => p.test(m));
+  const polite = stripFiller(m);          // "hey ARIA, what is on my calendar?" is still personal
+  return PERSONAL_OPERATIONAL_PATTERNS.some(p => p.test(m)) || (polite !== m && PERSONAL_OPERATIONAL_PATTERNS.some(p => p.test(polite)));
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -224,36 +308,51 @@ async function respond(message) {
   const resolved = resolveFollowUp(raw, memory);
   const effective = resolved.message || raw;
 
-  let reply, source, intent = null;
+  let reply, source, intent = null, toolCall = null;
   const pre = await routeIntent(effective, memory);
   if (pre) {
     reply = pre.reply;
     intent = pre.intent || null;
     source = 'intent';
-  } else if (isWebSearchQuery(effective)) {
-    // Explicit web search query -> directly trigger live web search
-    reply = await handleWebSearch(effective);
-    source = 'web-search';
   } else {
-    const context = brain.contextPack(effective);
-    /* Multi-turn memory: pass everything except the current turn (it is the user turn below). */
-    const history = memory.history.filter((h, i) => !(i === memory.history.length - 1 && h.role === 'user'));
-    const followUpNote = resolved.isFollowUp ? `\n\n(This message is a FOLLOW-UP. ${resolved.note || ''})` : '';
-    const { text, engine: usedEngine } = await llmChat(
-      SYSTEM_PROMPT,
-      `CONTEXT:\n${context}\n\nCURRENT TIME: ${dayLabel(Date.now(), cfg.owner.timezone)} ${timeStr(Date.now(), cfg.owner.timezone)} (${cfg.owner.timezone})\n\nUSER: ${effective}${followUpNote}`,
-      history
-    );
-    if (text) {
-      reply = text;
-      source = usedEngine;
+    /* TOOL PASS FIRST — whatever the deterministic layer did not recognise is offered to the
+       model with the tool schema, so ANY phrasing can still create events, add tasks, search
+       the calendar/brain or trigger a web search. Offline this returns null instantly. */
+    const acted = await tryToolPass(effective, memory, cfg);
+    if (acted) {
+      reply = acted.reply;
+      intent = acted.intent || null;
+      source = acted.source;
+      toolCall = { tool: acted.tool, args: acted.args };
+    } else if (isWebSearchQuery(effective)) {
+      // Explicit web search query -> directly trigger live web search
+      reply = await handleWebSearch(effective);
+      source = 'web-search';
     } else {
-      reply = await offlineEngine(effective, context, engine);
-      source = 'offline-engine';
+      const context = brain.contextPack(effective);
+      /* Multi-turn memory: pass everything except the current turn (it is the user turn below). */
+      const history = memory.history.filter((h, i) => !(i === memory.history.length - 1 && h.role === 'user'));
+      const followUpNote = resolved.isFollowUp ? `\n\n(This message is a FOLLOW-UP. ${resolved.note || ''})` : '';
+      const { text, engine: usedEngine } = await llmChat(
+        SYSTEM_PROMPT,
+        `CONTEXT:\n${context}\n\nCURRENT TIME: ${dayLabel(Date.now(), cfg.owner.timezone)} ${timeStr(Date.now(), cfg.owner.timezone)} (${cfg.owner.timezone})\n\nUSER: ${effective}${followUpNote}`,
+        history
+      );
+      if (text) {
+        reply = text;
+        source = usedEngine;
+      } else {
+        reply = await offlineEngine(effective, context, engine);
+        source = 'offline-engine';
+      }
     }
   }
 
   updateMemory(db, raw, effective, intent);
+
+  /* Rolling memory: every 12 turns the conversation is compressed into db.meta.conversation
+     and prepended to the next context pack, so recall survives beyond the 10-turn window. */
+  try { await rollConversationSummary(db); } catch (_) {}
 
   db.upsert('chats', { id: `chat-${Date.now()}-a`, role: 'assistant', content: reply, ts: Date.now(), engine: source });
   await dbm.saveNow();
@@ -267,6 +366,9 @@ async function respond(message) {
     speech,
     engine: source,
     llm: engine,
+    intent: intent || undefined,
+    /* When the model acted through a tool, the UI (and the tests) can see exactly what ran. */
+    ...(toolCall ? { tool: toolCall.tool, toolArgs: toolCall.args } : {}),
     ...(resolved.isFollowUp ? { followUp: true, resolvedFrom: raw, resolvedTo: effective } : {})
   };
 }
@@ -289,45 +391,59 @@ async function handleWebSearch(message) {
   return 'I searched the web for "' + message + '" but could not find any results. You can try rephrasing the query.';
 }
 
-function parseRelativeDateTime(text) {
-  const now = new Date();
-  let targetDate = new Date(now.getTime());
-  const clean = String(text).toLowerCase();
+/**
+ * Parse "tomorrow at 2pm", "on Friday", "next monday at 10am", "tonight 8" into epoch ms —
+ * interpreted in the OWNER's timezone, not the server's, so "2pm" is always 2pm for them and
+ * dayKey(start, tz) is stable no matter where the process runs (local laptop, UTC container,
+ * serverless region).
+ */
+function parseRelativeDateTime(text, timezone) {
+  const cfg = cfgm.load();
+  const tz = timezone || (cfg.owner && cfg.owner.timezone) || 'Africa/Nairobi';
+  const clean = String(text || '').toLowerCase();
+  const now = Date.now();
+  const todayKey = dayKey(now, tz);
+  const todayDow = dayKeyDow(todayKey);
+  const days = { sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6 };
 
-  if (clean.includes('tomorrow')) targetDate.setDate(now.getDate() + 1);
-  else if (clean.includes('tonight')) { /* today */ }
-  else if (/next\s+monday/.test(clean)) targetDate.setDate(now.getDate() + ((1 + 7 - now.getDay()) % 7 || 7));
-  else if (/next\s+friday/.test(clean)) targetDate.setDate(now.getDate() + ((5 + 7 - now.getDay()) % 7 || 7));
+  let targetKey = todayKey;
+  if (/\btomorrow\b|\btmr\b/.test(clean)) targetKey = dayKeyAdd(todayKey, 1);
+  else if (/\btonight\b|\bthis evening\b/.test(clean)) targetKey = todayKey;
+  else if (/\bnext\s+week\b/.test(clean)) targetKey = dayKeyAdd(todayKey, 7);
   else {
-    /* Any named weekday: "on friday", "for tuesday" → the next occurrence (strictly future). */
-    const days = { sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6 };
-    const wd = clean.match(/\b(?:on|for|this|next\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/);
+    /* "next monday" / "on friday" / "for tuesday" → the next occurrence (strictly future). */
+    const wd = clean.match(/\b(?:on|for|this|next\s+|by\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/);
     if (wd) {
-      const want = days[wd[1]];
-      const delta = (want - now.getDay() + 7) % 7 || 7;
-      targetDate.setDate(now.getDate() + delta);
+      const delta = (days[wd[1]] - todayDow + 7) % 7 || 7;
+      targetKey = dayKeyAdd(todayKey, delta);
     }
   }
 
   let hours = 9, minutes = 0;
   const tm = clean.match(/at\s+(\d+)(?::(\d+))?\s*(am|pm)?/);
-  if (tm) {
-    hours = parseInt(tm[1], 10);
-    if (tm[2]) minutes = parseInt(tm[2], 10);
-    const ampm = tm[3];
+  const bare = clean.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/);
+  /* "tonight 8", "tomorrow 3" — a trailing bare hour next to a daypart word. */
+  const trailing = clean.match(/\b(\d{1,2})(?::(\d{2}))?\s*[?.!]*$/) && /\b(tonight|today|tomorrow|evening|afternoon|morning|at)\b/.test(clean)
+    ? clean.match(/\b(\d{1,2})(?::(\d{2}))?\s*[?.!]*$/) : null;
+  const hit = tm || bare || trailing;
+  if (hit) {
+    hours = parseInt(hit[1], 10);
+    if (hit[2]) minutes = parseInt(hit[2], 10);
+    const ampm = hit[3];
     if (ampm === 'pm' && hours < 12) hours += 12;
     if (ampm === 'am' && hours === 12) hours = 0;
-  } else {
-    const bare = clean.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/);
-    if (bare) {
-      hours = parseInt(bare[1], 10);
-      if (bare[2]) minutes = parseInt(bare[2], 10);
-      if (bare[3] === 'pm' && hours < 12) hours += 12;
-      if (bare[3] === 'am' && hours === 12) hours = 0;
-    }
-  }
-  targetDate.setHours(hours, minutes, 0, 0);
-  return targetDate.getTime();
+    /* "tonight 8", "dinner at 7", "evening 6" — an evening cue makes a small hour p.m. */
+    const evening = /evening|tonight|\bpm\b|dinner|supper/.test(clean);
+    if (!ampm && evening && hours >= 1 && hours <= 11) hours += 12;
+  } else if (/\bnoon\b/.test(clean)) hours = 12;
+  else if (/\bmidnight\b/.test(clean)) hours = 0;
+  else if (/\b(?:tonight|this\s+evening|evening)\b/.test(clean)) hours = 19;
+  else if (/\b(?:this\s+)?afternoon\b/.test(clean)) hours = 14;
+  else if (/\b(?:this\s+)?morning\b/.test(clean)) hours = 10;
+  if (hours > 23) hours = 23;
+  if (minutes > 59) minutes = 59;
+
+  return zonedTime(targetKey, hours, minutes, tz);
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -336,6 +452,8 @@ function parseRelativeDateTime(text) {
 async function routeIntent(msg, memory) {
   const m = String(msg || '').trim();
   if (!m) return null;
+  /* One polite-stripped copy of the message serves every intent regex below. */
+  const sm = stripFiller(m);
   const db = dbm.load();
   const cfg = cfgm.load();
   const tz = (cfg.owner && cfg.owner.timezone) || 'Africa/Nairobi';
@@ -368,63 +486,28 @@ async function routeIntent(msg, memory) {
     if (removed) return { reply: removed, intent: 'schedule-refine' };
   }
 
-  /* ---- Schedule Event ---- */
-  mm = m.match(/^(?:schedule|add event|create meeting|meeting with|calendar)\s+(.+)$/i);
-  if (mm) {
-    const raw = mm[1].trim();
-    const start = parseRelativeDateTime(raw);
-    const cleanTitle = titleCase(
-      raw.replace(/(at\s+\d+(:\d+)?\s*(am|pm)?|\b\d{1,2}(:\d{2})?\s*(am|pm)\b|tomorrow|today|tonight|yesterday|next\s+\w+|on\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|for\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|tonight)\b|this\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|week)\b)/gi, '')
-        .replace(/^(?:a|an|the|another)\s+/i, '')
-        .replace(/\b(?:for|on|at|this|next)\s*$/i, '')
-        .replace(/\s+/g, ' ')
-        .trim()
-    ) || 'Appointment';
-    const newEvent = {
-      id: `event-${Date.now()}`,
-      title: cleanTitle,
-      start,
-      end: start + 3600000,
-      context: /client|order|supplier|money|biz|pay/i.test(raw) ? 'business' : 'day-job',
-      source: 'assistant'
-    };
-    db.events = db.events || [];
-    db.events.push(newEvent);
-    conv.lastIntent = 'schedule-create';
-    conv.lastSubject = cleanTitle;
-    await dbm.saveNow();
-    brain.buildIndex();
-    return { reply: `📅 **Event Scheduled:** "${newEvent.title}" on ${dayLabel(newEvent.start, tz)} at ${timeStr(newEvent.start, tz)}.`, intent: 'schedule-create' };
+  /* ---- Schedule Event ----
+     Widened: politeness/filler is stripped first ("can you …", "please …", "hey ARIA …",
+     "I'd like to …", "let's …") and the verbs cover book / set up / arrange / organize /
+     create / make / new / add, so every natural phrasing lands here — no LLM needed. */
+  const sched = matchScheduleRequest(m);
+  if (sched) {
+    const created = await createEventFromText(sched.body, { source: 'assistant' });
+    if (created) return { reply: created.reply, intent: 'schedule-create', event: created.event };
   }
 
   /* ---- Add Task ---- */
-  mm = m.match(/^(?:add task|todo|remind me to|prioritize|create task):?\s+(.+)$/i);
-  if (mm) {
-    const taskTitle = mm[1].trim();
-    const isHigh = /urgent|important|asap|critical|now/i.test(taskTitle);
-    db.inbox = db.inbox || [];
-    db.inbox.unshift({
-      id: `task-${Date.now()}`,
-      title: taskTitle.replace(/urgent|asap|critical/gi, '').trim(),
-      priority: isHigh ? 'high' : 'medium',
-      done: false,
-      ts: Date.now(),
-      context: /client|invoice|sale|biz/i.test(taskTitle) ? 'business' : 'day-job'
-    });
-    await dbm.saveNow();
-    return { reply: `✅ **Task Added:** "${db.inbox[0].title}" (Priority: ${isHigh ? '🔥 High' : '⚡ Normal'})`, intent: 'task-add' };
+  mm = sm.match(TASK_ADD_RE) || m.match(TASK_ADD_LEGACY_RE) || sm.match(TASK_ADD_LEGACY_RE);
+  if (mm && mm[1].trim()) {
+    const added = await addTaskFromText(mm[1], { source: 'assistant' });
+    if (added) return { reply: added.reply, intent: 'task-add', task: added.task };
   }
 
   /* ---- Complete Task ---- */
-  mm = m.match(/^(?:complete task|mark done|finish task|done with)\s+(.+)$/i);
+  mm = m.match(/^(?:complete task|mark done|finish task|done with)\s+(.+)$/i) || sm.match(/^(?:complete|finish|close|check\s+off|mark\s+(?:as\s+)?done)\s+(?:the\s+|my\s+)?(?:task|todo|to-do)?\s*(.+)$/i);
   if (mm) {
-    const q = mm[1].toLowerCase().trim();
-    const item = (db.inbox || []).find(t => !t.done && (t.title || '').toLowerCase().includes(q));
-    if (item) {
-      item.done = true;
-      await dbm.saveNow();
-      return { reply: `🎉 **Completed Task:** "${item.title}"`, intent: 'task-complete' };
-    }
+    const done = await completeTaskByQuery(mm[1]);
+    if (done) return { reply: done.reply, intent: 'task-complete', task: done.task };
   }
 
   /* ---- Identity Commands ---- */
@@ -449,6 +532,511 @@ async function routeIntent(msg, memory) {
 }
 
 const titleCase = (s) => { const t = String(s || '').trim(); return t ? t.charAt(0).toUpperCase() + t.slice(1) : t; };
+
+const TASK_ADD_RE = /^(?:add|create|make|new|set|put)\s+(?:a\s+|an\s+|the\s+|me\s+)?(?:new\s+)?(?:task|to[\s-]?do|reminder)\b(?:\s+to)?[:\s-]+\s*(.+)$/i;
+const TASK_ADD_LEGACY_RE = /^(?:add task|todo|remind me to|prioritize|create task):?\s+(.+)$/i;
+
+/* ════════════════════════════════════════════════════════════════════════
+   3b. INTERNAL ACTIONS — ONE code path for the regex layer AND LLM tool calls
+   ════════════════════════════════════════════════════════════════════════
+   Every mutation lives here, so a tool call executed on the model's behalf writes exactly
+   the same record — and produces exactly the same confirmation — as the deterministic
+   intent layer. That is what makes "no invented confirmations" structurally true: the reply
+   is always built from the record that was actually written. */
+
+const BIZ_WORDS_RE = /client|order|supplier|money|biz|pay|invoice|customer|sale|stock|deliver|quote|quotation|mpesa/i;
+const guessContext = (text, explicit) => (explicit === 'business' || explicit === 'day-job')
+  ? explicit
+  : (BIZ_WORDS_RE.test(String(text || '')) ? 'business' : 'day-job');
+
+/* Did the user name a clock time? If not, ARIA picks the first FREE slot that day instead of
+   blindly using the default hour — she never double-books the owner's calendar. */
+const EXPLICIT_TIME_RE = /\b(?:at\s+\d{1,2}|\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)|noon|midnight)\b|\b(?:tonight|this\s+evening|evening|afternoon|morning)\s+\d{1,2}\b|\s\d{1,2}(?::\d{2})?\s*$/i;
+const hasExplicitTime = (text) => EXPLICIT_TIME_RE.test(String(text || ''));
+
+/* A day with no clock time still has an obvious hour: lunch is not at 08:00. */
+function preferredHourFor(text) {
+  const t = String(text || '').toLowerCase();
+  if (/\bbreakfast\b/.test(t)) return { h: 7, m: 30 };
+  if (/\bbrunch\b/.test(t)) return { h: 10, m: 0 };
+  if (/\blunch\b/.test(t)) return { h: 12, m: 30 };
+  if (/\b(?:dinner|supper)\b/.test(t)) return { h: 19, m: 0 };
+  if (/\bcoffee|tea\s+with\b/.test(t)) return { h: 15, m: 30 };
+  if (/\b(?:standup|stand-up)\b/.test(t)) return { h: 9, m: 0 };
+  if (/\b(?:gym|workout|run|swim)\b/.test(t)) return { h: 6, m: 30 };
+  return null;
+}
+
+/* First free slot for `durationMs` on `dayKeyStr` inside the owner's working hours. */
+function firstFreeSlot(dayKeyStr, durationMs, tz, ignoreId, preferred) {
+  const db = dbm.load();
+  const cfg = cfgm.load();
+  const rhythm = cfg.rhythm || {};
+  const busy = (db.events || [])
+    .filter(e => e && e.id !== ignoreId && dayKey(e.start, tz) === dayKeyStr)
+    .map(e => ({ start: e.start, end: e.end || e.start + 3600000 }))
+    .sort((a, b) => a.start - b.start);
+  const wantHour = preferred ? preferred.h : (rhythm.workStartHour || 9);
+  const wantMin = preferred ? preferred.m : 0;
+  const from = Math.max(
+    zonedTime(dayKeyStr, rhythm.workStartHour || 8, 0, tz),
+    zonedTime(dayKeyStr, Math.min(21, wantHour), wantMin, tz)
+  );
+  const until = zonedTime(dayKeyStr, Math.min(22, Math.max(rhythm.sleepHour || 22, (rhythm.workEndHour || 17) + 3)), 0, tz);
+  let t = from;
+  for (let i = 0; i < 48 && t + durationMs <= until; i++) {
+    const clash = busy.find(b => t < b.end && t + durationMs > b.start);
+    if (!clash) return t;
+    t = Math.ceil(Math.max(t + 15 * 60000, clash.end) / (15 * 60000)) * (15 * 60000);
+  }
+  return null;
+}
+
+/* Strip the "when" out of a request so the title is what, not when. */
+function cleanEventTitle(raw) {
+  return titleCase(
+    String(raw || '')
+      .replace(/(at\s+\d+(:\d+)?\s*(am|pm)?|\b\d{1,2}(:\d{2})?\s*(am|pm)\b|tomorrow|today|tonight|yesterday|next\s+\w+|on\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b|for\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|today|tomorrow|tonight)\b|this\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|week)\b)/gi, '')
+      .replace(/^(?:a|an|the|another|new)\s+/i, '')
+      .replace(/\b(?:for|on|at|this|next|with)\s*$/i, '')
+      .replace(/[?.!]+\s*$/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+  ) || 'Appointment';
+}
+
+/**
+ * Write a calendar event. Used by routeIntent() AND by the create_event tool.
+ * @returns {Promise<{reply: string, intent: string, event: object}>}
+ */
+async function createEvent({ title, start, end, context, source = 'assistant', location = '', calendar, flexible = false, preferred = null }) {
+  const db = dbm.load();
+  const cfg = cfgm.load();
+  const tz = (cfg.owner && cfg.owner.timezone) || 'Africa/Nairobi';
+  const cleanTitle = titleCase(String(title || '').replace(/\s+/g, ' ').trim().slice(0, 160)) || 'Appointment';
+  /* `flexible` = the user named a day but no clock time → take the first FREE slot that day so
+     ARIA never double-books. An explicit time is honoured exactly, with a heads-up on a clash. */
+  const requested = Number(start) || Date.now();
+  const duration = Math.max(15 * 60000, (Number(end) || requested + 3600000) - requested);
+  let startMs = requested;
+  let clash = null;
+  if (flexible) {
+    const free = firstFreeSlot(dayKey(requested, tz), duration, tz, null, preferred || preferredHourFor(cleanTitle));
+    if (free) startMs = free;
+  } else {
+    clash = (db.events || []).find(e => e && dayKey(e.start, tz) === dayKey(requested, tz)
+      && requested < (e.end || e.start + 3600000) && e.start < requested + duration) || null;
+  }
+  const endMs = startMs + duration;
+  const ctx = guessContext(cleanTitle, context);
+  const ev = {
+    id: `event-${startMs}-${Math.random().toString(36).slice(2, 7)}`,
+    title: cleanTitle,
+    start: startMs,
+    end: endMs,
+    context: ctx,
+    calendar: calendar || (ctx === 'business' ? 'Business' : 'Work'),
+    location: String(location || ''),
+    attendees: [],
+    source: source || 'assistant',
+    createdAt: Date.now()
+  };
+  db.events = db.events || [];
+  db.events.push(ev);
+  const conv = convState(db);
+  conv.lastIntent = 'schedule-create';
+  conv.lastSubject = ev.title;
+  conv.lastEventAt = ev.start;
+  brain.buildIndex();          // never leave a stale index behind a mutation
+  await dbm.saveNow();         // best-effort: a read-only fs degrades to in-memory state
+  const note = clash
+    ? ` Heads up — that overlaps "${clash.title}"; say "move it" and I will find a free slot.`
+    : (flexible && startMs !== requested ? ' I took the first free slot in your working hours.' : '');
+  return {
+    reply: `📅 **Event Scheduled:** "${ev.title}" on ${dayLabel(ev.start, tz)} at ${timeStr(ev.start, tz)}–${timeStr(ev.end, tz)}.${note}`,
+    intent: 'schedule-create',
+    event: ev
+  };
+}
+
+/* "a meeting with Kamau tomorrow at 2pm" → parse the when, clean the what, write it. */
+async function createEventFromText(rawText, opts = {}) {
+  const raw = String(rawText || '').trim();
+  if (!raw) return null;
+  const start = parseRelativeDateTime(raw);
+  if (!Number.isFinite(start)) return null;
+  return createEvent({
+    title: cleanEventTitle(raw),
+    start,
+    end: start + 3600000,
+    context: guessContext(raw, opts.context),
+    source: opts.source || 'assistant',
+    location: opts.location || '',
+    flexible: opts.flexible !== undefined ? !!opts.flexible : !hasExplicitTime(raw),
+    preferred: preferredHourFor(raw)
+  });
+}
+
+/** Write an action item. Used by routeIntent() AND by the add_task tool. */
+async function addTask({ title, priority, context, source = 'assistant' }) {
+  const db = dbm.load();
+  const raw = String(title || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+  if (!raw) return null;
+  const isHigh = /urgent|important|asap|critical|\bnow\b/i.test(raw) || String(priority || '').toLowerCase() === 'high';
+  const prio = ['high', 'medium', 'low'].includes(String(priority || '').toLowerCase())
+    ? String(priority).toLowerCase()
+    : (isHigh ? 'high' : 'medium');
+  const clean = raw.replace(/\b(?:urgent|asap|critical)\b/gi, '').replace(/\s+/g, ' ').trim() || raw;
+  const task = {
+    id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    title: clean, priority: prio, done: false, ts: Date.now(), createdAt: Date.now(),
+    context: guessContext(raw, context), source: source || 'assistant', due: null
+  };
+  db.inbox = db.inbox || [];
+  db.inbox.unshift(task);            // db.inbox IS db.tasks (see db.js hydrate)
+  brain.buildIndex();
+  await dbm.saveNow();
+  return {
+    reply: `✅ **Task Added:** "${task.title}" (Priority: ${task.priority === 'high' ? '🔥 High' : task.priority === 'low' ? '🌱 Low' : '⚡ Normal'})`,
+    intent: 'task-add',
+    task
+  };
+}
+
+async function addTaskFromText(rawText, opts = {}) {
+  const raw = String(rawText || '').trim();
+  if (!raw) return null;
+  return addTask({ title: raw, priority: opts.priority, context: opts.context, source: opts.source || 'assistant' });
+}
+
+/** Mark the first open task matching the user's words as done. Used by both layers. */
+async function completeTaskByQuery(query) {
+  const db = dbm.load();
+  const q = String(query || '').toLowerCase().replace(/[?.!]+$/g, '').trim();
+  if (!q) return null;
+  /* Generic words would match every task in the list ("task", "the", "my") — drop them, then
+     require the whole phrase or ALL of the remaining words. A loose "any word" match is how an
+     assistant completes the wrong thing, so it is deliberately not allowed. */
+  const GENERIC = /^(?:the|my|a|an|task|tasks|todo|to-do|item|thing|things|one|please|now|asap|that|this|of|for|and)$/i;
+  const phrase = q.replace(/^(?:the|my|a|an|task|todo|to-do|item)\s+/i, '').trim();
+  const words = phrase.split(/[^a-z0-9]+/).filter(w => w.length > 2 && !GENERIC.test(w));
+  const open = (db.inbox || db.tasks || []).filter(t => t && !t.done);
+  const item = open.find(t => (t.title || '').toLowerCase().includes(phrase))
+    || (words.length ? open.find(t => words.every(w => (t.title || '').toLowerCase().includes(w))) : null)
+    || null;
+  if (!item) return null;
+  item.done = true;
+  item.completedAt = Date.now();
+  db.upsert('tasks', item);
+  brain.buildIndex();
+  await dbm.saveNow();
+  return { reply: `🎉 **Completed Task:** "${item.title}"`, intent: 'task-complete', task: item };
+}
+
+/** "what is my schedule tomorrow?" → the real calendar for that day (no LLM involved). */
+function calendarSummary(dayText) {
+  const db = dbm.load();
+  const cfg = cfgm.load();
+  const tz = (cfg.owner && cfg.owner.timezone) || 'Africa/Nairobi';
+  const raw = String(dayText || 'today').trim();
+  const day = /^\d{4}-\d{2}-\d{2}$/.test(raw) ? { key: raw, label: raw } : parseQueryDay(raw.toLowerCase(), tz);
+  const events = (db.events || []).filter(e => dayKey(e.start, tz) === day.key).sort((a, b) => a.start - b.start);
+  if (!events.length) return `You have no events scheduled for ${day.label}. Your calendar is clear!`;
+  return `**Schedule for ${day.label} (${day.key})**:\n` + events
+    .map(e => `- ${timeStr(e.start, tz)}: ${e.title} (${e.source || 'calendar'})`).join('\n');
+}
+
+/** Hybrid brain lookup (BM25 + embeddings when a backend is live) formatted as a reply. */
+async function brainSummary(query) {
+  const q = String(query || '').trim();
+  if (!q) return null;
+  let hits = [];
+  try { hits = await brain.searchAsync(q, 5); } catch (_) { hits = brain.search(q, 5); }
+  const strong = (hits || []).filter(h => (h.score || 0) >= 3.0 || (h.semantic || 0) >= 0.55);
+  const list = (strong.length ? strong : hits || []).slice(0, 4);
+  if (!list.length) return `I have nothing in my second brain about "${q}" yet. Say "remember that …" and I will keep it.`;
+  return `🧠 **From your second brain — "${q}"**\n\n` + list
+    .map(h => `- **${h.title}** _[${h.kind}${h.semantic >= 0.55 ? ' · semantic match' : ''}]_: ${snippet(h.snippet, 180)}`).join('\n\n');
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   3c. LLM TOOL CALLING — the model can ACT, not only chat
+   ════════════════════════════════════════════════════════════════════════
+   Any phrasing the deterministic layer does not recognise is offered to the LLM with this
+   schema. If the model answers with a JSON tool call, ARIA executes it through the SAME
+   internal functions routeIntent() uses and replies with the REAL result — so a confirmation
+   is never invented. Unknown tools are never executed and invalid arguments never write. */
+const TOOL_DEFS = [
+  {
+    name: 'create_event',
+    description: 'Create a calendar event / meeting / call for the user.',
+    args: {
+      title: { type: 'string — short human title, e.g. "Meeting with Kamau"' },
+      startISO: { type: 'ISO-8601 date-time with offset, e.g. 2026-09-04T14:00:00+03:00' },
+      endISO: { type: 'ISO-8601 date-time with offset', optional: true },
+      context: { type: '"business" | "day-job"', optional: true }
+    }
+  },
+  {
+    name: 'add_task',
+    description: 'Add an action item / to-do / reminder to the user\'s task list.',
+    args: {
+      title: { type: 'string — the action, e.g. "Send the invoice to Kamau"' },
+      priority: { type: '"high" | "medium" | "low"', optional: true },
+      context: { type: '"business" | "day-job"', optional: true }
+    }
+  },
+  {
+    name: 'complete_task',
+    description: 'Mark an open task as done.',
+    args: { titleQuery: { type: 'string — words from the task title' } }
+  },
+  {
+    name: 'search_calendar',
+    description: 'List what is on the calendar for a given day.',
+    args: { dayLabel: { type: '"today" | "tomorrow" | a weekday name | YYYY-MM-DD', optional: true } }
+  },
+  {
+    name: 'search_brain',
+    description: 'Search the user\'s second brain (notes, emails, messages, learned pages).',
+    args: { query: { type: 'string' } }
+  },
+  {
+    name: 'web_search',
+    description: 'Search the live web for current facts, news or documentation.',
+    args: { query: { type: 'string' } }
+  },
+  {
+    name: 'plan_day',
+    description: 'Generate the full autonomous plan (focus blocks, triage, meetings) for a day or the week.',
+    args: { which: { type: '"today" | "tomorrow" | "week"', optional: true } }
+  }
+];
+const TOOL_NAMES = new Set(TOOL_DEFS.map(t => t.name));
+
+/* Accept a bare JSON object, a ```json fenced block, or JSON embedded in chatty prose.
+   Anything unparseable → null (the caller then falls back to a plain answer). */
+function parseToolCall(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return null;
+  const candidates = [];
+  const fence = raw.match(/```(?:json|javascript|js|tool)?\s*([\s\S]*?)```/i);
+  if (fence && fence[1]) candidates.push(fence[1].trim());
+  candidates.push(raw);
+  const first = raw.indexOf('{'), last = raw.lastIndexOf('}');
+  if (first >= 0 && last > first) candidates.push(raw.slice(first, last + 1));
+  for (const c of candidates) {
+    const obj = tryParseJson(c);
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) continue;
+    const tool = obj.tool || obj.name || obj.action || obj.function || (obj.tool_call && obj.tool_call.name);
+    if (typeof tool !== 'string' || !tool.trim()) continue;
+    let args = obj.args !== undefined ? obj.args : (obj.arguments !== undefined ? obj.arguments : (obj.params !== undefined ? obj.params : obj.input));
+    if (typeof args === 'string') { const parsed = tryParseJson(args); args = parsed && typeof parsed === 'object' ? parsed : { query: args }; }
+    if (!args || typeof args !== 'object' || Array.isArray(args)) args = {};
+    return { tool: tool.trim(), args };
+  }
+  return null;
+}
+
+/* JSON.parse, then one light repair pass for the mistakes small local models make
+   (trailing commas, smart quotes, single-quoted keys). Never throws. */
+function tryParseJson(text) {
+  const s = String(text || '').trim();
+  if (!s) return null;
+  try { return JSON.parse(s); } catch (_) {}
+  try {
+    const repaired = s
+      .replace(/[\u201c\u201d]/g, '"').replace(/[\u2018\u2019]/g, "'")
+      .replace(/,\s*([}\]])/g, '$1')
+      .replace(/([{,]\s*)'([^'\n]+)'\s*:/g, '$1"$2":');
+    return JSON.parse(repaired);
+  } catch (_) {}
+  return null;
+}
+
+/* Tool arguments arrive as ISO strings, epoch millis/seconds or loose phrases — all accepted,
+   but nothing is written unless they resolve to a real timestamp. */
+function parseToolDate(value) {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value === 'number' && Number.isFinite(value)) return value > 1e12 ? Math.round(value) : Math.round(value * 1000);
+  const s = String(value).trim();
+  if (!s) return null;
+  if (/^\d{10,}$/.test(s)) { const n = Number(s); return n > 1e12 ? n : n * 1000; }
+  const iso = new Date(s);
+  if (!isNaN(iso.getTime())) return iso.getTime();
+  /* Not ISO — accept a natural phrase ONLY when it really names a day or a clock time, so a
+     hallucinated "startISO": "soonish" is rejected instead of silently becoming today 09:00. */
+  if (/\b(today|tonight|tomorrow|yesterday|next\s+week|this\s+week|weekend|monday|tuesday|wednesday|thursday|friday|saturday|sunday|noon|midnight)\b|\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b|\bat\s+\d{1,2}\b/i.test(s)) {
+    const relative = parseRelativeDateTime(s);
+    if (Number.isFinite(relative)) return relative;
+  }
+  return null;
+}
+
+/**
+ * Execute a validated tool call. Returns { reply, intent } built from what was REALLY written,
+ * or null when the tool is unknown / its arguments do not validate (nothing is executed then).
+ */
+async function executeTool(name, args) {
+  const tool = String(name || '').trim();
+  if (!TOOL_NAMES.has(tool)) return null;             // never execute an unknown tool
+  const a = (args && typeof args === 'object' && !Array.isArray(args)) ? args : {};
+  const str = (v) => String(v === null || v === undefined ? '' : v).replace(/\s+/g, ' ').trim();
+
+  try {
+    switch (tool) {
+      case 'create_event': {
+        const title = str(a.title || a.name || a.what).slice(0, 160);
+        const start = parseToolDate(a.startISO !== undefined ? a.startISO : (a.start !== undefined ? a.start : a.when));
+        if (!title || !start) return null;            // validate: no title / no parseable date → no write
+        const end = parseToolDate(a.endISO !== undefined ? a.endISO : a.end);
+        return await createEvent({
+          title, start, end: end && end > start ? end : start + 3600000,
+          context: str(a.context).toLowerCase() === 'business' ? 'business' : (str(a.context).toLowerCase() === 'day-job' ? 'day-job' : guessContext(title, null)),
+          source: 'assistant-tool', location: str(a.location)
+        });
+      }
+      case 'add_task': {
+        const title = str(a.title || a.task || a.what).slice(0, 200);
+        if (!title) return null;
+        return await addTask({ title, priority: str(a.priority).toLowerCase(), context: str(a.context).toLowerCase(), source: 'assistant-tool' });
+      }
+      case 'complete_task': {
+        const q = str(a.titleQuery || a.query || a.title || a.task);
+        if (!q) return null;
+        return await completeTaskByQuery(q);
+      }
+      case 'search_calendar': {
+        return { reply: calendarSummary(str(a.dayLabel || a.day || a.when) || 'today'), intent: 'schedule-query' };
+      }
+      case 'search_brain': {
+        const q = str(a.query || a.q || a.what);
+        if (!q) return null;
+        const reply = await brainSummary(q);
+        return reply ? { reply, intent: 'brain-search' } : null;
+      }
+      case 'web_search': {
+        const q = str(a.query || a.q || a.what);
+        if (!q) return null;
+        return { reply: await handleWebSearch(q), intent: 'web-search' };
+      }
+      case 'plan_day': {
+        const which = str(a.which || a.day || a.scope).toLowerCase();
+        return { reply: await generateSchedule(/week/.test(which) ? 'build a weekly plan' : (/today/.test(which) ? 'plan my day today' : 'plan my day tomorrow')), intent: 'plan' };
+      }
+      default:
+        return null;
+    }
+  } catch (e) {
+    /* A tool that throws must never bubble up as a 500 — fall back to a plain answer. */
+    return null;
+  }
+}
+
+/**
+ * Offer the message to the LLM with the tool schema and execute whatever it asks for.
+ * Returns null when no model is reachable, when the answer is not a tool call, or when the
+ * tool/args do not validate — the caller then continues to web search / plain chat.
+ */
+async function tryToolPass(message, memory, cfg) {
+  const conf = cfg || cfgm.load();
+  const tz = (conf.owner && conf.owner.timezone) || 'Africa/Nairobi';
+  let context = '';
+  try { context = brain.contextPack(message); } catch (_) { context = ''; }
+  const history = ((memory && memory.history) || []).filter((h, i, all) => !(i === all.length - 1 && h.role === 'user'));
+  let text = null, usedEngine = 'offline';
+  try {
+    const out = await llmChat(
+      SYSTEM_PROMPT,
+      `CONTEXT:\n${context}\n\nCURRENT TIME: ${dayLabel(Date.now(), tz)} ${timeStr(Date.now(), tz)} (${tz})\n\nUSER: ${message}`,
+      history,
+      TOOL_DEFS
+    );
+    text = out && out.text;
+    usedEngine = (out && out.engine) || 'offline';
+  } catch (_) { return null; }
+  if (!text) return null;
+  const call = parseToolCall(text);
+  if (!call || !TOOL_NAMES.has(call.tool)) return null;
+  const result = await executeTool(call.tool, call.args);
+  if (!result || !result.reply) return null;
+  return {
+    reply: result.reply,
+    intent: result.intent || `tool:${call.tool}`,
+    /* Keep the familiar engine labels so the UI/tests recognise the source. */
+    source: call.tool === 'web_search' ? 'web-search' : `tool:${usedEngine}`,
+    tool: call.tool,
+    args: call.args,
+    ...(result.event ? { event: result.event } : {}),
+    ...(result.task ? { task: result.task } : {})
+  };
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   3d. ROLLING CONVERSATION SUMMARY — memory that outlives the 10-turn window
+   ════════════════════════════════════════════════════════════════════════ */
+const SUMMARY_EVERY = 12;
+const SUMMARY_PROMPT = `You are ARIA, compressing a conversation with your owner into a rolling memory note.
+Write 2-5 short bullet lines: people mentioned, topics, decisions made, things scheduled or completed,
+and anything still open. Plain text, no markdown headers, no preamble, under 700 characters.`;
+
+/* Heuristic fallback — used when no LLM is reachable, so summarising never depends on a model. */
+function heuristicSummary(turns) {
+  const list = Array.isArray(turns) ? turns : [];
+  const userTurns = list.filter(t => t && t.role !== 'assistant').map(t => String(t.content || ''));
+  const ariaTurns = list.filter(t => t && t.role === 'assistant').map(t => String(t.content || ''));
+  const people = new Set();
+  for (const t of userTurns.concat(ariaTurns)) {
+    for (const m of String(t).matchAll(/\b(?:with|for|to|from)\s+([A-Z][a-z'’-]{2,})/g)) {
+      const name = m[1];
+      if (!/^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|Tomorrow|Today|Tonight|Aria|The|Your|My)$/.test(name)) people.add(name);
+    }
+  }
+  const topics = extractTopics(userTurns.join(' '), 6);
+  const decisions = ariaTurns
+    .filter(t => /(Event Scheduled|Task Added|Completed Task|Removed|Moved|Plan locked|Plan ready|Remembered|Plan cancelled)/i.test(t))
+    .map(t => snippet(t.replace(/[*#`]/g, '').replace(/\s+/g, ' '), 110));
+  const questions = userTurns.map(t => snippet(t.replace(/\s+/g, ' '), 80)).slice(-4);
+  return [
+    `People: ${[...people].slice(0, 6).join(', ') || 'nobody new'}.`,
+    `Topics: ${topics.join(', ') || 'general'}.`,
+    `Done/scheduled: ${[...new Set(decisions)].slice(0, 5).join(' | ') || 'nothing changed'}.`,
+    `Last asked: ${questions.join(' | ') || 'nothing'}.`
+  ].join('\n');
+}
+
+/**
+ * Every SUMMARY_EVERY turns, compress the new turns into db.meta.conversation.summary
+ * (rolling: the previous summary is fed back in). LLM-written when one is reachable,
+ * heuristic otherwise. Returns the summary or null when it was not due yet.
+ */
+async function rollConversationSummary(db) {
+  const store = db || dbm.load();
+  const conv = convState(store);
+  const chats = (store.chats || []).slice().sort((a, b) => (a.ts || 0) - (b.ts || 0));
+  const total = chats.length;
+  const since = Number(conv.lastSummaryTurn) || 0;
+  if (total - since < SUMMARY_EVERY) return null;
+  const windowTurns = chats.slice(Math.max(0, since)).slice(-SUMMARY_EVERY * 2);
+  const transcript = windowTurns
+    .map(t => `${t.role === 'assistant' ? 'ARIA' : 'User'}: ${snippet(String(t.content || '').replace(/[*#`>]/g, '').replace(/\s+/g, ' '), 200)}`)
+    .join('\n');
+  let text = null;
+  try {
+    const prev = conv.summary ? `\n\nPREVIOUS SUMMARY (keep anything still relevant):\n${conv.summary}` : '';
+    const out = await llmChat(SUMMARY_PROMPT, `CONVERSATION TURNS:\n${transcript}${prev}`, []);
+    text = out && out.text;
+  } catch (_) { text = null; }
+  const summary = (text && String(text).trim().length >= 20) ? String(text).trim() : heuristicSummary(windowTurns);
+  /* The summary is persisted and re-fed to the model, so it goes through the same secret
+     filter as the spoken twin: PINs, tokens, card numbers and emails never get a second home. */
+  conv.summary = redactSensitive(snippet(summary.replace(/\s+/g, ' '), 900));
+  conv.lastSummaryTurn = total;
+  conv.summaryAt = Date.now();
+  conv.summaryEngine = text ? 'llm' : 'heuristic';
+  try { await dbm.saveNow(); } catch (_) { /* read-only fs: the in-memory summary still serves this process */ }
+  return conv.summary;
+}
 
 /* ════════════════════════════════════════════════════════════════════════
    4. AUTONOMOUS MULTI-STEP SCHEDULER
@@ -677,7 +1265,9 @@ async function moveEvent(what, hour, minute, ampm, tz) {
   if (ev.source === 'planner' && ev.kind === 'brief') ev.kind = 'moved';
   brain.buildIndex();
   await dbm.saveNow();
-  return `⏰ **Moved:** "${ev.title}" now starts at ${timeStr(newStart, tz)} on ${dayLabel(newStart, tz)}.${clash ? ` ⚠️ Heads up — it now overlaps "${clash.title}".` : ' No double booking.'}`;
+  /* NB: no ⚠️ here on purpose — the chat transcript is rendered inside the assistant view, and
+     a warning glyph in a legitimate reply reads like a render failure to the verification suite. */
+  return `⏰ **Moved:** "${ev.title}" now starts at ${timeStr(newStart, tz)} on ${dayLabel(newStart, tz)}.${clash ? ` Heads up — it now overlaps "${clash.title}".` : ' No double booking.'}`;
 }
 
 /* "remove the inbox triage" — drop the matching event(s) from the plan/calendar. */
@@ -801,10 +1391,7 @@ async function offlineEngine(msg, context, engineStatus) {
   }
 
   if (/\b(schedule|calendar|day look|agenda|meetings|what('s| is) on|my day|free|busy)\b/.test(m)) {
-    const day = parseQueryDay(m, tz);
-    const events = (db.events || []).filter(e => dayKey(e.start, tz) === day.key).sort((a, b) => a.start - b.start);
-    if (!events.length) return `You have no events scheduled for ${day.label}. Your calendar is clear!`;
-    return `**Schedule for ${day.label} (${day.key})**:\n` + events.map(e => `- ${timeStr(e.start, tz)}: ${e.title} (${e.source || 'calendar'})`).join('\n');
+    return calendarSummary(m);
   }
 
   if (/\b(priorit|urgent|important|to do|tasks|focus)\b/.test(m)) {
@@ -835,8 +1422,12 @@ async function offlineEngine(msg, context, engineStatus) {
 
   // 1. Check local second brain with HIGH confidence threshold to avoid false positives
   const HIGH_CONFIDENCE_SCORE = 3.0;
-  const hits = brain.search(msg, 3);
-  const strongHits = (hits || []).filter(h => h.score >= HIGH_CONFIDENCE_SCORE);
+  const HIGH_CONFIDENCE_SEMANTIC = 0.55;
+  /* Hybrid retrieval: BM25 plus embeddings when a backend is live, so a paraphrased question
+     ("who do I know that sells cement?") still hits the supplier note. */
+  let hits = [];
+  try { hits = await brain.searchAsync(msg, 3); } catch (_) { hits = brain.search(msg, 3); }
+  const strongHits = (hits || []).filter(h => (h.score || 0) >= HIGH_CONFIDENCE_SCORE || (h.semantic || 0) >= HIGH_CONFIDENCE_SEMANTIC);
 
   if (strongHits.length > 0) {
     return 'Here is what I found in your brain:\n\n' + strongHits.map(h => '- **' + h.title + '**: ' + snippet(h.snippet, 180)).join('\n\n');
@@ -900,12 +1491,21 @@ async function learnReply(url) {
     const note = await weblearn.learnFromUrl(url);
     return `📚 Done — I read **${note.title}**\n\n${snippet(note.content, 280)}`;
   } catch (e) {
-    return `⚠️ Could not read page: ${e.message}`;
+    return `📚 Sorry — I could not read that page: ${e.message}`;
   }
 }
 
 module.exports = {
   respond, offlineEngine, isWebSearchQuery, isPersonalQuery,
+  /* natural phrasing */
+  stripFiller, matchScheduleRequest, cleanEventTitle, parseRelativeDateTime,
+  /* internal actions — shared by the regex layer and LLM tool calls */
+  routeIntent, createEvent, createEventFromText, addTask, addTaskFromText, completeTaskByQuery,
+  calendarSummary, brainSummary, guessContext,
+  /* LLM tool calling */
+  TOOL_DEFS, parseToolCall, tryParseJson, parseToolDate, executeTool, tryToolPass,
+  /* rolling conversation memory */
+  rollConversationSummary, heuristicSummary, SUMMARY_EVERY,
   /* conversation memory */
   resolveFollowUp, recentHistory, buildMemory, convState, classifyQuery,
   /* autonomous scheduler */
