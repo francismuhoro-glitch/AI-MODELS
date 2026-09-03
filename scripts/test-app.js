@@ -65,7 +65,11 @@ function check(name, cond, detail) {
   check('POST /api/inbox → 200 with id', task.status === 200 && !!(task.json || {}).id);
   const afterTask = await get('/api/inbox');
   check('new task visible in /api/inbox', (afterTask.json || []).some(t => t.id === task.json.id));
-  const ev = await post('/api/events', { title: 'Verification event', start: Date.now() + 3600000 });
+  /* +5h, not +1h: the DB seed already puts 'Strategy & Growth Sync' at now+1h and 'Team Standup'
+     at now+3h, so a +1h fixture sits on top of a seeded entry — and when the run happens between
+     23:00 and 24:00 local time both land on the planner's target day, which trips the
+     "no double booking with existing calendar entries" check below (it fails on main too). */
+  const ev = await post('/api/events', { title: 'Verification event', start: Date.now() + 5 * 3600000 });
   check('POST /api/events → 200 with id', ev.status === 200 && !!(ev.json || {}).id);
   const asst = await post('/api/assistant', { message: 'what are my priorities?' });
   check('POST /api/assistant → 200 with reply', asst.status === 200 && typeof (asst.json || {}).reply === 'string');
@@ -331,17 +335,28 @@ function check(name, cond, detail) {
   const evAfter1 = await evList();
   check('  …and wrote a NEW event to db.events', kamauTomorrow(evAfter1).length === kamauTomorrowBefore + 1, JSON.stringify(kamauTomorrow(evAfter1).map(e => e.title)));
   check('  …titled with the person, on tomorrow\'s day key', kamauTomorrow(evAfter1).some(e => /kamau/i.test(e.title) && dk(e.start, ARIA_TZ) === tomorrowKey), JSON.stringify(kamauTomorrow(evAfter1).map(e => [e.title, dk(e.start, ARIA_TZ)])));
-  check('  …at 14:00 in the owner\'s timezone', kamauTomorrow(evAfter1).some(e => wallTime(e.start) === '14:00'), JSON.stringify(kamauTomorrow(evAfter1).map(e => wallTime(e.start))));
+  /* Hour-independent invariants: the requested time is honoured unless something already sat
+     there, in which case ARIA moves it and says so — and she NEVER double-books. */
+  const newOnes = (before, after) => after.filter(a => !before.some(b => b.id === a.id));
+  const overlapsAny = (list, ev) => list.some(o => o.id !== ev.id && ev.start < (o.end || o.start + 36e5) && o.start < ev.end);
+  const keptOrExplained = (evs, hhmm, reply) => evs.some(e => wallTime(e.start) === hhmm) || /already taken|instead|first free slot/i.test(reply || '');
+  const freshKamau = newOnes(evBeforeG, evAfter1).filter(e => /kamau/i.test(e.title || ''));
+  check('  …at 14:00 in the owner\'s timezone (or it says which clash it avoided)', keptOrExplained(freshKamau, '14:00', (nl1.json || {}).reply), JSON.stringify(freshKamau.map(e => wallTime(e.start))) + ' | ' + ((nl1.json || {}).reply || '').slice(-90));
+  check('  …and never double-books the calendar', freshKamau.length === 1 && !overlapsAny(evAfter1, freshKamau[0]), JSON.stringify(evAfter1.filter(e => dk(e.start, ARIA_TZ) === tomorrowKey).map(e => [wallTime(e.start), wallTime(e.end)])));
 
   const nl2 = await post('/api/assistant', { message: 'please add a meeting with the supplier at 3pm' });
   check('"please add a meeting with the supplier at 3pm" confirms', nl2.status === 200 && /Scheduled/i.test((nl2.json || {}).reply || ''), (nl2.json || {}).reply);
   const supplier = (await evList()).filter(e => /supplier/i.test(e.title || '') && dk(e.start, ARIA_TZ) === todayKeyNow);
-  check('  …and wrote today\'s supplier meeting at 15:00', supplier.some(e => wallTime(e.start) === '15:00'), JSON.stringify(supplier.map(e => [e.title, wallTime(e.start)])));
+  const freshSupplier = supplier.filter(e => !evBeforeG.some(b => b.id === e.id) && !evAfter1.some(b => b.id === e.id));
+  check('  …and wrote today\'s supplier meeting at 15:00 (or explained the move)', keptOrExplained(freshSupplier, '15:00', (nl2.json || {}).reply), JSON.stringify(supplier.map(e => [e.title, wallTime(e.start)])));
+  check('  …and the supplier meeting is not double-booked', freshSupplier.length === 1 && !overlapsAny(await evList(), freshSupplier[0]));
 
   const nl3 = await post('/api/assistant', { message: 'set up a call with the client tomorrow at 11' });
   check('"set up a call with the client tomorrow at 11" confirms', nl3.status === 200 && /Scheduled/i.test((nl3.json || {}).reply || ''), (nl3.json || {}).reply);
   const clientEv = (await evList()).filter(e => /client/i.test(e.title || '') && dk(e.start, ARIA_TZ) === tomorrowKey);
-  check('  …and wrote tomorrow\'s client call at 11:00', clientEv.some(e => wallTime(e.start) === '11:00'), JSON.stringify(clientEv.map(e => [e.title, wallTime(e.start)])));
+  const freshClient = clientEv.filter(e => !evAfter1.some(b => b.id === e.id));
+  check('  …and wrote tomorrow\'s client call at 11:00 (or explained the move)', keptOrExplained(freshClient, '11:00', (nl3.json || {}).reply), JSON.stringify(clientEv.map(e => [e.title, wallTime(e.start)])));
+  check('  …and the client call is not double-booked', freshClient.length === 1 && !overlapsAny(await evList(), freshClient[0]));
 
   const nl4 = await post('/api/assistant', { message: 'please schedule lunch with Amina on Friday' });
   check('"please schedule lunch with Amina on Friday" confirms', nl4.status === 200 && /Scheduled/i.test((nl4.json || {}).reply || ''), (nl4.json || {}).reply);
@@ -355,12 +370,10 @@ function check(name, cond, detail) {
   check('  …and wrote a NEW Kamau event for tomorrow', kamauTomorrow(evAfter5).length === kamauTomorrow(evBefore5).length + 1, JSON.stringify(kamauTomorrow(evAfter5).map(e => e.title)));
   /* No clock time was given, so ARIA must take a FREE slot instead of stacking it on the day. */
   check('  …without double-booking (an un-timed request takes a free slot)', (() => {
-    const fresh = kamauTomorrow(evAfter5).filter(e => !evBefore5.some(b => b.id === e.id));
-    if (fresh.length !== 1) return false;
-    const mine = fresh[0];
-    return !evAfter5.some(e => e.id !== mine.id && mine.start < (e.end || e.start + 36e5) && e.start < mine.end);
-  })(), JSON.stringify(kamauTomorrow(evAfter5).filter(e => !evBefore5.some(b => b.id === e.id)).map(e => [wallTime(e.start), wallTime(e.end)])));
-  check('  …and says so when it picks the slot itself', /first free slot/i.test((nl5.json || {}).reply || ''), (nl5.json || {}).reply);
+    const fresh = newOnes(evBefore5, evAfter5).filter(e => /kamau/i.test(e.title || ''));
+    return fresh.length === 1 && !overlapsAny(evAfter5, fresh[0]);
+  })(), JSON.stringify(newOnes(evBefore5, evAfter5).map(e => [e.title, wallTime(e.start), wallTime(e.end)])));
+  check('  …and says so when it picks the slot itself', /first free slot|already taken/i.test((nl5.json || {}).reply || ''), (nl5.json || {}).reply);
   /* The transcript is rendered inside the assistant view, where a warning glyph reads like a
      render failure — clashes are reported in words instead. */
   check('replies carry no warning glyph into the transcript', [nl1, nl2, nl3, nl4, nl5].every(r => !/⚠️/.test((r.json || {}).reply || '')));
@@ -416,7 +429,13 @@ function check(name, cond, detail) {
   check('create_event returns a real confirmation', !!toolEvent && /Scheduled/i.test(toolEvent.reply) && /Investor sync/.test(toolEvent.reply), toolEvent && toolEvent.reply);
   const evAfterTool = await evList();
   check('create_event actually wrote the event', evAfterTool.length === evBeforeTool + 1 && evAfterTool.some(e => /investor sync/i.test(e.title) && dk(e.start, ARIA_TZ) === tomorrowKey), JSON.stringify(evAfterTool.map(e => e.title).slice(0, 3)));
-  check('the written event kept the requested wall-clock time', evAfterTool.some(e => /investor sync/i.test(e.title) && wallTime(e.start) === '16:00'));
+  const written = evAfterTool.filter(e => /investor sync/i.test(e.title));
+  check('the written event kept the requested time (or moved off a clash and said so)',
+    written.some(e => wallTime(e.start) === '16:00') || /already taken|instead/i.test((toolEvent || {}).reply || ''),
+    JSON.stringify(written.map(e => [wallTime(e.start), wallTime(e.end)])) + ' | ' + ((toolEvent || {}).reply || ''));
+  check('the tool-written event does not double-book the calendar',
+    written.length === 1 && !evAfterTool.some(o => o.id !== written[0].id && written[0].start < (o.end || o.start + 36e5) && o.start < written[0].end),
+    JSON.stringify(evAfterTool.filter(e => dk(e.start, ARIA_TZ) === tomorrowKey).map(e => [wallTime(e.start), e.title])));
   check('create_event rejects an empty title (nothing written)', (await asstMod.executeTool('create_event', { title: '  ', startISO: isoStart })) === null && (await evList()).length === evAfterTool.length);
   check('create_event rejects an unparseable date (nothing written)', (await asstMod.executeTool('create_event', { title: 'Ghost meeting', startISO: 'sometime soon' })) === null && !(await evList()).some(e => /ghost meeting/i.test(e.title || '')));
   check('create_event accepts a natural-language date', !!await asstMod.executeTool('create_event', { title: 'Site visit', startISO: 'tomorrow at 9am' }));
@@ -758,7 +777,16 @@ function check(name, cond, detail) {
   check('the reply is the REAL confirmation', /Scheduled/i.test(actedJson.reply || '') && /Plumber — water heater repair/.test(actedJson.reply || ''), actedJson.reply);
   const heater = (await evList()).filter(e => /water heater/i.test(e.title || ''));
   check('the tool call actually wrote the event', heater.length === 1, JSON.stringify(heater.map(e => e.title)));
-  check('the written event honours the model\'s ISO date (Saturday 09:00 local)', heater.length === 1 && dk(heater[0].start, ARIA_TZ) === satKey && wallTime(heater[0].start) === '09:00', heater.length ? `${dk(heater[0].start, ARIA_TZ)} ${wallTime(heater[0].start)}` : 'none');
+  const heaterOnSat = heater.length === 1 && dk(heater[0].start, ARIA_TZ) === satKey;
+  check('the written event honours the model\'s ISO day (Saturday)', heaterOnSat, heater.length ? `${dk(heater[0].start, ARIA_TZ)} ${wallTime(heater[0].start)}` : 'none');
+  /* Hour-independent: 09:00 is kept unless a REAL entry already owned it, in which case ARIA
+     books the next free slot and says so in the reply. */
+  check('the written event honours 09:00 — or moved off a real clash and said so',
+    heaterOnSat && (wallTime(heater[0].start) === '09:00' || /already taken|instead/i.test(actedJson.reply || '')),
+    heaterOnSat ? `${wallTime(heater[0].start)} | ${(actedJson.reply || '').slice(-110)}` : 'none');
+  check('the tool-written event does not overlap anything else that day', heaterOnSat
+    && !(await evList()).some(o => o.id !== heater[0].id && heater[0].start < (o.end || o.start + 36e5) && o.start < heater[0].end),
+    JSON.stringify((await evList()).filter(e => dk(e.start, ARIA_TZ) === satKey).map(e => [wallTime(e.start), e.title])));
   check('the event was tagged as coming from a tool call', heater.length === 1 && heater[0].source === 'assistant-tool', heater.length ? heater[0].source : 'none');
   check('the mutation was persisted (db.events on disk/in store)', (await get('/api/events')).json.some(e => /water heater/i.test(e.title || '')));
 

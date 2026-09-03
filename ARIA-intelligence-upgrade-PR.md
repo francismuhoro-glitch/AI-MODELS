@@ -27,7 +27,7 @@ book a meeting with Kamau tomorrow                      → Meeting with Kamau  
 - `stripFiller()` removes *"can you", "could you", "please", "hey ARIA", "I want to", "I'd like to", "let's", "go ahead and", "kindly"…* before the intent regexes; verbs now cover `book|set up|arrange|organize|create|make|new|add` — guarded so *"create a summary of my inbox"* and *"add a task to call the supplier"* are **not** hijacked into the calendar.
 - `parseRelativeDateTime()` is now **timezone-aware** (owner tz, not server tz): `tomorrow at 2pm`, `on Friday`, `next monday at 10am`, `tonight 8`, `noon`, `this afternoon`. `dayKey(start,'Africa/Nairobi')` is now stable no matter where the process runs — previously "2pm" meant 2pm *server* time and displayed as 17:00 in Nairobi.
 - Mutations live in shared internals (`createEvent`, `addTask`, `completeTaskByQuery`, `calendarSummary`, `brainSummary`) used by **both** the regex layer and tool calls; each one calls `brain.buildIndex()` + `dbm.saveNow()`.
-- Never double-books: an un-timed request takes the first free slot in the owner's working hours (lunch → 12:30, not 08:00); an explicit time is honoured exactly and a clash is reported **in words**.
+- Never double-books a real commitment: an un-timed request takes the first free slot in the owner's working hours (lunch → 12:30, not 08:00); an explicit time is kept **unless a real entry already owns it**, in which case ARIA books the next free slot and explains the move in words. Her own unconfirmed plan blocks are suggestions, so `parkDraftsAround()` re-parks them instead of blocking (or being double-booked by) an explicit request; `moveEvent` still forces the exact slot.
 - `complete_task` no longer fuzzy-matches on any single generic word (it used to be able to complete the wrong task via the word "task").
 
 ## Issue 2 — a male voice, by default
@@ -49,7 +49,7 @@ book a meeting with Kamau tomorrow                      → Meeting with Kamau  
 
 | Section | Covers |
 |---|---|
-| `[3g]` | the five natural phrasings → `/Scheduled/i` + a real event with the right title **and** day key; no double-booking; recall on *"what is my schedule tomorrow"*; `stripFiller` / `matchScheduleRequest` / `parseRelativeDateTime` units |
+| `[3g]` | the five natural phrasings → `/Scheduled/i` + a real event with the right title **and** day key; the requested hour is kept *or* the reply explains the move; nothing overlaps; recall on *"what is my schedule tomorrow"*; `stripFiller` / `matchScheduleRequest` / `parseRelativeDateTime` units |
 | `[3h]` | tool schema; parser (valid JSON, ` ```json ` fences, prose-wrapped, repaired, invalid → `null`); `create_event`/`add_task`/`complete_task`/`search_calendar`/`search_brain` execute for real; unknown tools and bad args write nothing |
 | `[3i]` | blend ordering with `fallbackVector` (exact-term > paraphrase > unrelated), `blendScore` weights, cosine guards, offline stays lexical, `primeEmbeddings` no-ops without a backend |
 | `[3j]` | `DEFAULTS`/`normalize()` (voiceGender, llm.openai, recommended model, clamping), provider resolution incl. **openai key unset → falls through to offline without throwing**, key never leaked by `llmStatus()`/`/api/ai/status` |
@@ -57,13 +57,21 @@ book a meeting with Kamau tomorrow                      → Meeting with Kamau  
 | `[5c]` | jsdom: `localStorage 'aria.voiceGender'` defaults to `male`; `pickVoice` → David for male / Zira for female; neutral-name + empty-list paths; the Settings select renders, switches instantly and persists via **Save all** |
 | `[6]` | end-to-end tool loop against a **mock model server**: the schema/context/history really reach the model, a tool call is executed and confirmed with the real record, and a prose-only answer writes nothing |
 
-### One pre-existing flake fixed at the source
+### Pre-existing hour-of-day flakes fixed at the source
 
-`view "assistant" renders` asserted that the rendered view contains no `⚠️`. `"move the standup to 10am"` legitimately warns about overlapping a seed event — but only during certain hours of the day (the seed event sits at *now + 1h*), so `npm test` failed on `main` when run in the morning and passed at night. Assistant replies now report clashes in words instead of with a warning glyph, so the transcript can never look like a render failure. **No existing check was modified.**
+`npm test` on `main` is time-dependent: three separate checks pass or fail depending on the wall-clock hour the suite happens to run at. All three are fixed here **without weakening a single existing assertion**.
+
+1. **`view "assistant" renders`** asserted the rendered view contains no `⚠️`. `"move the standup to 10am"` legitimately warns about overlapping a seed event — but only during certain hours (the seed sits at *now + 1h*), so the suite failed on `main` when run in the morning and passed at night. Assistant replies now report clashes **in words** instead of with a warning glyph, so a transcript can never look like a render failure.
+2. **`no double booking with existing calendar entries`** (`[3e]`) compares *every* entry on the planner's target day. The suite's own fixture posted `Verification event` at `now + 1h` — exactly where `server/db.js` seeds `Strategy & Growth Sync` (`now + 1h … + 2h`). Between **23:00 and 24:00 local time** both land on the same day as `now + 24h`, so the two manual entries overlap and the check fails. Reproduced on a clean clone of `main` (`fcbb7e0`) at that hour: `179 passed, 1 failed`. The fixture now posts at `now + 5h`, clear of both seeds; the assertion itself is untouched.
+3. **The planner collapsed around a mid-morning meeting.** `placeBlocks()` walked a single monotonic cursor: one real entry at ~10:47 pushed the 2-hour focus block to 15:15, which pushed every later block past the work window, so the plan came back with **2 blocks** and `plan created multiple calendar blocks` / `plan includes inbox triage windows` / `plan includes a meeting slot` failed — purely a function of the hour. It now fits each block into the earliest gap that can hold it, shrinking a block to the gap (45-min floor for long blocks) rather than losing it, and the wake-up brief is placed **last** so it yields to a real 06:00 entry instead of sitting on it.
+
+Also hardened on the assistant side, because "honour the requested hour exactly" and "never double-book" cannot both hold at every hour: `firstFreeSlot()` can no longer return `null` (a wall-to-wall day stacks the event after the last entry instead of dropping it on top of something), and it only treats the owner's **real** entries as blockers.
+
+**Verified hour-independent:** the suite was run at **34 simulated clock offsets** — every whole hour `+0h … +23h`, plus `+30m`, `+1h30`, `+5h25`, `+23h30`, `+36h`, `+48h`, `+60h`, `+100h`, `−7h30`, `−13h50` (the multi-day offsets also shift the weekday the plan targets) — using a `node -r` preload that shifts `Date.now()`. Every run: **335 passed, 0 failed**.
 
 ## Acceptance criteria
 
-1. ✅ `npm test` → `329 passed, 0 failed`, including all 180 pre-existing checks (verified twice, and again in a fresh clone of `main` with the patch applied).
+1. ✅ `npm test` → `335 passed, 0 failed`, including all 180 pre-existing checks — and green at **34 simulated clock offsets** (every hour of the day plus multi-day shifts), so the suite no longer depends on when it runs. Verified again in a fresh clone of `main` with the patch applied.
 2. ✅ All five phrasings create real events in `db.events` and confirm in the reply; *"what is my schedule tomorrow"* then lists them.
 3. ✅ `pickVoice` honours gender; default male; Settings exposes and persists it.
 4. ✅ Tool calls execute for real (events/tasks actually written); no invented confirmations.

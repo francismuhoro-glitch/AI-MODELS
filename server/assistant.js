@@ -567,29 +567,100 @@ function preferredHourFor(text) {
   return null;
 }
 
-/* First free slot for `durationMs` on `dayKeyStr` inside the owner's working hours. */
-function firstFreeSlot(dayKeyStr, durationMs, tz, ignoreId, preferred) {
+/* An unconfirmed planner block: ARIA's own draft, not a promise the owner has made to anyone. */
+function isDraftPlan(e) {
+  return !!e && e.source === 'planner' && e.confirmed !== true;
+}
+
+/* Keep the calendar honest after something lands on a day: any draft block that now overlaps a
+   real entry is re-parked in the next free gap (inside the owner's rhythm where possible), so
+   the owner's explicit request always wins WITHOUT leaving two things on top of each other.
+   Returns the titles it moved. */
+function parkDraftsAround(dayKeyStr, tz) {
   const db = dbm.load();
   const cfg = cfgm.load();
   const rhythm = cfg.rhythm || {};
+  const boxes = (db.events || [])
+    .filter(e => e && dayKey(e.start, tz) === dayKeyStr)
+    .map(e => ({ e, start: e.start, end: e.end || e.start + 3600000 }))
+    .sort((a, b) => a.start - b.start);
+  const STEP = 15 * 60000;
+  const workFrom = zonedTime(dayKeyStr, rhythm.workStartHour || 8, 0, tz);
+  const workTo = zonedTime(dayKeyStr, rhythm.workEndHour || 17, 0, tz) + STEP;
+  const wakeAt = zonedTime(dayKeyStr, rhythm.wakeHour || 6, 0, tz);
+  const sleepAt = zonedTime(dayKeyStr, rhythm.sleepHour || 22, 0, tz);
+  const round = (t) => Math.ceil(t / STEP) * STEP;
+  /* Earliest start inside [from, to) that holds `dur` without touching anything but `skip`. */
+  const slotIn = (from, to, dur, skip) => {
+    let t = round(from);
+    for (let guard = 0; guard < 200; guard++) {
+      if (t + dur > to) return null;
+      const hit = boxes.find(o => o !== skip && t < o.end && t + dur > o.start);
+      if (!hit) return t;
+      t = round(Math.max(t + STEP, hit.end));
+    }
+    return null;
+  };
+  const moved = [];
+  for (const box of boxes) {
+    if (!isDraftPlan(box.e)) continue;
+    const dur = box.end - box.start;
+    if (!boxes.some(o => o !== box && box.start < o.end && box.end > o.start)) continue;
+    /* 1. same length inside the work window · 2. shortened to fit the work window
+       3. same length anywhere inside the rhythm · 4. stacked after everything else */
+    let t = slotIn(workFrom, workTo, dur, box);
+    let len = dur;
+    if (t === null) {
+      const floor = dur >= 3600000 ? 45 * 60000 : STEP;
+      for (let d = round(dur - STEP); t === null && d >= floor; d -= STEP) {
+        t = slotIn(workFrom, workTo, d, box);
+        if (t !== null) len = d;
+      }
+    }
+    if (t === null) { t = slotIn(wakeAt, sleepAt, dur, box); len = dur; }
+    if (t === null) {
+      t = round(boxes.reduce((last, o) => (o === box ? last : Math.max(last, o.end)), box.start));
+      if (boxes.some(o => o !== box && t < o.end && t + len > o.start)) continue;  // nowhere to go
+    }
+    box.start = t; box.end = t + len;
+    box.e.start = t; box.e.end = t + len;
+    moved.push(box.e.title);
+  }
+  return moved;
+}
+
+/* First free slot for `durationMs` on `dayKeyStr`.
+   - `opts.preferred`  → start looking at a sensible hour (lunch 12:30, work start otherwise)
+   - `opts.earliest`   → start looking at an exact requested time and move forward from there
+   Always returns a timestamp that does NOT overlap anything already on the calendar: when the
+   day is wall-to-wall it stacks the event after the last entry instead of double-booking. */
+function firstFreeSlot(dayKeyStr, durationMs, tz, opts = {}) {
+  const db = dbm.load();
+  const cfg = cfgm.load();
+  const rhythm = cfg.rhythm || {};
+  const { ignoreId = null, preferred = null, earliest = null } = opts;
+  /* Only the owner's real commitments block a slot. ARIA's own unconfirmed plan blocks are
+     suggestions — they are parked elsewhere by parkDraftsAround() instead of saying "no". */
   const busy = (db.events || [])
-    .filter(e => e && e.id !== ignoreId && dayKey(e.start, tz) === dayKeyStr)
+    .filter(e => e && e.id !== ignoreId && !isDraftPlan(e) && dayKey(e.start, tz) === dayKeyStr)
     .map(e => ({ start: e.start, end: e.end || e.start + 3600000 }))
     .sort((a, b) => a.start - b.start);
-  const wantHour = preferred ? preferred.h : (rhythm.workStartHour || 9);
-  const wantMin = preferred ? preferred.m : 0;
-  const from = Math.max(
-    zonedTime(dayKeyStr, rhythm.workStartHour || 8, 0, tz),
-    zonedTime(dayKeyStr, Math.min(21, wantHour), wantMin, tz)
-  );
-  const until = zonedTime(dayKeyStr, Math.min(22, Math.max(rhythm.sleepHour || 22, (rhythm.workEndHour || 17) + 3)), 0, tz);
+  const from = earliest !== null
+    ? earliest
+    : Math.max(
+      zonedTime(dayKeyStr, rhythm.workStartHour || 8, 0, tz),
+      zonedTime(dayKeyStr, Math.min(21, preferred ? preferred.h : (rhythm.workStartHour || 9)), preferred ? preferred.m : 0, tz)
+    );
+  const hardLimit = zonedTime(dayKeyStr, 23, 0, tz);
   let t = from;
-  for (let i = 0; i < 48 && t + durationMs <= until; i++) {
+  for (let i = 0; i < 96; i++) {
     const clash = busy.find(b => t < b.end && t + durationMs > b.start);
     if (!clash) return t;
     t = Math.ceil(Math.max(t + 15 * 60000, clash.end) / (15 * 60000)) * (15 * 60000);
+    if (t + durationMs > hardLimit) break;
   }
-  return null;
+  /* No gap left in the day: park it after everything else rather than on top of something. */
+  return busy.reduce((last, b) => Math.max(last, b.end), from);
 }
 
 /* Strip the "when" out of a request so the title is what, not when. */
@@ -614,19 +685,21 @@ async function createEvent({ title, start, end, context, source = 'assistant', l
   const cfg = cfgm.load();
   const tz = (cfg.owner && cfg.owner.timezone) || 'Africa/Nairobi';
   const cleanTitle = titleCase(String(title || '').replace(/\s+/g, ' ').trim().slice(0, 160)) || 'Appointment';
-  /* `flexible` = the user named a day but no clock time → take the first FREE slot that day so
-     ARIA never double-books. An explicit time is honoured exactly, with a heads-up on a clash. */
   const requested = Number(start) || Date.now();
   const duration = Math.max(15 * 60000, (Number(end) || requested + 3600000) - requested);
-  let startMs = requested;
-  let clash = null;
-  if (flexible) {
-    const free = firstFreeSlot(dayKey(requested, tz), duration, tz, null, preferred || preferredHourFor(cleanTitle));
-    if (free) startMs = free;
-  } else {
-    clash = (db.events || []).find(e => e && dayKey(e.start, tz) === dayKey(requested, tz)
-      && requested < (e.end || e.start + 3600000) && e.start < requested + duration) || null;
-  }
+  const dayStr = dayKey(requested, tz);
+  const occupiedBy = (db.events || []).find(e => e && !isDraftPlan(e) && dayKey(e.start, tz) === dayStr
+    && requested < (e.end || e.start + 3600000) && e.start < requested + duration) || null;
+  /* ARIA never double-books the owner's real commitments. With no clock time she picks the first
+     sensible free slot; with an explicit time that is genuinely taken she moves forward to the
+     next free one and SAYS so. Her own draft plan blocks simply step aside — and
+     "move it to 14:00" (moveEvent) still forces the exact slot when the owner insists. */
+  const startMs = occupiedBy || flexible
+    ? (firstFreeSlot(dayStr, duration, tz, flexible && !occupiedBy
+      ? { preferred: preferred || preferredHourFor(cleanTitle) }
+      : { earliest: requested, preferred: preferred || preferredHourFor(cleanTitle) }))
+    : requested;
+  const clash = occupiedBy;
   const endMs = startMs + duration;
   const ctx = guessContext(cleanTitle, context);
   const ev = {
@@ -643,15 +716,21 @@ async function createEvent({ title, start, end, context, source = 'assistant', l
   };
   db.events = db.events || [];
   db.events.push(ev);
+  const parked = parkDraftsAround(dayStr, tz);   // drafts yield to the owner's real booking
   const conv = convState(db);
   conv.lastIntent = 'schedule-create';
   conv.lastSubject = ev.title;
   conv.lastEventAt = ev.start;
   brain.buildIndex();          // never leave a stale index behind a mutation
   await dbm.saveNow();         // best-effort: a read-only fs degrades to in-memory state
+  /* Whenever ARIA chose the hour herself she says so — the owner should never have to guess
+     which part of the reply was their own wording. */
+  const parkedNote = parked.length
+    ? ` I shifted ${parked.length === 1 ? 'my draft block' : `${parked.length} of my draft blocks`} (${parked.slice(0, 2).map(t => `"${snippet(t, 34)}"`).join(', ')}) to keep the calendar clean.`
+    : '';
   const note = clash
-    ? ` Heads up — that overlaps "${clash.title}"; say "move it" and I will find a free slot.`
-    : (flexible && startMs !== requested ? ' I took the first free slot in your working hours.' : '');
+    ? ` Heads up — ${timeStr(requested, tz)} was already taken by "${clash.title}", so I booked ${timeStr(startMs, tz)} instead. Say "move it to ${timeStr(requested, tz)}" if you would rather keep that slot.`
+    : (flexible ? ' I took the first free slot in your working hours.' : '') + parkedNote;
   return {
     reply: `📅 **Event Scheduled:** "${ev.title}" on ${dayLabel(ev.start, tz)} at ${timeStr(ev.start, tz)}–${timeStr(ev.end, tz)}.${note}`,
     intent: 'schedule-create',
@@ -1079,24 +1158,38 @@ function planTargetDays(msg, tz) {
 
 const PRIORITY_RANK = { high: 0, medium: 1, low: 2 };
 
-/* Place sequential blocks into the work day, jumping over existing calendar entries. */
+/* Place the day's blocks into the gaps that are actually left, in executive priority order.
+   A single mid-morning meeting must not collapse the whole plan: each block takes the earliest
+   gap that can hold it and shrinks to fit that gap (down to a useful minimum) instead of being
+   pushed to the end of the day and dragging every later block past the work window with it. */
 function placeBlocks(blocks, busy, workStart, workEnd, bufferMs = 15 * 60000) {
   const placed = [];
-  let t = workStart;
-  const conflicts = busy.slice().sort((a, b) => a.start - b.start);
-  for (const b of blocks) {
-    let start = Math.max(t, b.earliest || 0);
-    let moved = true;
-    while (moved) {
-      moved = false;
-      for (const c of conflicts) {
-        if (start < c.end && start + b.duration > c.start) { start = c.end + bufferMs; moved = true; }
+  const limit = workEnd + bufferMs;
+  const taken = busy.slice().map(c => ({ start: c.start, end: c.end })).sort((a, b) => a.start - b.start);
+  /* Earliest gap at/after `from` that can hold at least `minDur`, plus how much room it has. */
+  const gapFor = (from, minDur) => {
+    let start = Math.max(from, workStart);
+    for (let guard = 0; guard < 200; guard++) {
+      if (start + minDur > limit) return null;
+      const hit = taken.find(c => start < c.end && start + minDur > c.start);
+      if (!hit) {
+        const nextWall = taken.reduce((m, c) => (c.start >= start + minDur ? Math.min(m, c.start) : m), limit);
+        return { start, room: Math.min(limit - start, nextWall - start) };
       }
+      start = hit.end + bufferMs;
     }
-    if (start + b.duration <= workEnd + bufferMs) {
-      placed.push({ ...b, start, end: start + b.duration });
-      t = start + b.duration + bufferMs;
-    }
+    return null;
+  };
+  for (const b of blocks) {
+    const minDur = Math.min(b.duration, b.duration >= 3600000 ? 45 * 60000 : 30 * 60000);
+    const gap = gapFor(Math.max(b.earliest || 0, workStart), minDur);
+    if (!gap) continue;
+    const duration = Math.max(minDur, Math.min(b.duration, Math.floor(gap.room / 900000) * 900000));
+    if (duration < minDur || gap.start + duration > limit) continue;
+    placed.push({ ...b, duration, start: gap.start, end: gap.start + duration });
+    /* Planned blocks keep their breathing room from each other too. */
+    taken.push({ start: gap.start - bufferMs, end: gap.start + duration + bufferMs });
+    taken.sort((x, y) => x.start - y.start);
   }
   return placed;
 }
@@ -1140,13 +1233,6 @@ async function generateSchedule(message) {
       .filter(e => dayKey(e.start, tz) === day && e.source !== 'planner')
       .map(e => ({ start: e.start, end: e.end || e.start + 36e5, title: e.title }));
 
-    /* Wake-up brief — fixed at the rhythm's wake hour. */
-    const briefAt = Math.max(zonedTime(day, rhythm.wakeHour, 0, tz), isToday ? Date.now() : 0);
-    created.push({
-      id: `${planId}-${day}-brief`, planId, planDay: day, title: 'Wake-up brief — ARIA morning summary',
-      start: briefAt, end: briefAt + 20 * 60000, context: 'day-job', source: 'planner', kind: 'brief', confirmed: false
-    });
-
     /* Work-day blocks, in executive order. Tasks are consumed as they are scheduled so a
        weekly plan spreads them across days instead of repeating the same list. */
     const remaining = tasks.slice(cursor);
@@ -1172,6 +1258,19 @@ async function generateSchedule(message) {
         title: b.title, start: b.start, end: b.end, context: b.context, source: 'planner', kind: b.kind, confirmed: false
       });
     }
+
+    /* Wake-up brief — placed LAST so it never lands on top of the real calendar or of the
+       blocks just placed. It still opens at the rhythm's wake hour; something already sitting
+       there (a 06:00 flight, an early call) simply pushes it to the first free moment. */
+    const BRIEF_MS = 20 * 60000;
+    const taken = busy.concat(placed.map(b => ({ start: b.start, end: b.end })));
+    const clashAt = (from) => taken.find(b => from < b.end && from + BRIEF_MS > b.start);
+    let briefAt = Math.max(zonedTime(day, rhythm.wakeHour, 0, tz), isToday ? Date.now() : 0);
+    for (let guard = 0, hit = clashAt(briefAt); hit && guard < 60; guard++, hit = clashAt(briefAt)) briefAt = hit.end;
+    created.push({
+      id: `${planId}-${day}-brief`, planId, planDay: day, title: 'Wake-up brief — ARIA morning summary',
+      start: briefAt, end: briefAt + BRIEF_MS, context: 'day-job', source: 'planner', kind: 'brief', confirmed: false
+    });
   }
 
   for (const ev of created) (db.events = db.events || []).push(ev);
@@ -1259,10 +1358,11 @@ async function moveEvent(what, hour, minute, ampm, tz) {
   const day = dayKey(ev.start, tz);
   const newStart = zonedTime(day, h, minute || 0, tz);
   const duration = (ev.end || ev.start + 36e5) - ev.start;
-  const clash = (dbm.load().events || []).find(e => e.id !== ev.id && e.start < newStart + duration && (e.end || e.start + 36e5) > newStart);
+  const clash = (dbm.load().events || []).find(e => e.id !== ev.id && !isDraftPlan(e) && e.start < newStart + duration && (e.end || e.start + 36e5) > newStart);
   ev.start = newStart;
   ev.end = newStart + duration;
   if (ev.source === 'planner' && ev.kind === 'brief') ev.kind = 'moved';
+  parkDraftsAround(day, tz);   // an explicit move outranks ARIA's own draft blocks
   brain.buildIndex();
   await dbm.saveNow();
   /* NB: no ⚠️ here on purpose — the chat transcript is rendered inside the assistant view, and
