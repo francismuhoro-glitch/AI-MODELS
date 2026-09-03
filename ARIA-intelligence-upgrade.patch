@@ -1,5 +1,5 @@
 diff --git a/README.md b/README.md
-index 848dfd3..b6ea0f1 100644
+index 848dfd3..3a0b240 100644
 --- a/README.md
 +++ b/README.md
 @@ -22,7 +22,9 @@ Installed, it runs full-screen, works **offline** (your latest brief stays reada
@@ -13,7 +13,7 @@ index 848dfd3..b6ea0f1 100644
  
  ## 🔔 Morning notifications on your lock screen
  
-@@ -36,9 +38,9 @@ Install the app, then **Settings → Enable morning notifications**. At wake tim
+@@ -36,10 +38,10 @@ Install the app, then **Settings → Enable morning notifications**. At wake tim
  | **📅 Calendar** | Google Calendar + Outlook + personal — one unified timeline. |
  | **📥 Inbox** | Gmail + Outlook unified, priority-scored, auto-tagged *work* vs *business*. |
  | **💬 Messages** | Slack + WhatsApp in one feed. |
@@ -21,11 +21,13 @@ index 848dfd3..b6ea0f1 100644
 +| **🧠 Second Brain** | An ever-evolving library. It **automatically captures** priority emails, important messages, every brief and a rolling day-log — then indexes everything with **hybrid retrieval** (BM25 + embeddings, 50/50) so you can ask *"what do I know about ___?"* in your own words. Capture anything manually too. |
  | **🎯 Action items** | Asks inside emails/messages ("by Friday", "please send", invoices…) become trackable tasks automatically. |
 -| **🤖 Executive Assistant** | Chat that reasons over your **real** schedule, inbox, messages and brain — and **remembers the conversation**: follow-ups like *"what about tomorrow?"* and *"add another one for Friday"* just work, with people and topics carried across turns. |
+-| **🗓️ Autonomous Scheduler** | Say *"plan my day tomorrow"*, *"build a weekly plan"* or *"organize this week"* and ARIA drafts a full calendar around your rhythm — wake-up brief, 2-hour deep-work blocks for high-priority tasks, a meeting window that never double-books, morning & end-of-day inbox triage, business vs day-job blocks, 15-minute buffers — then refines on command (*"move the standup to 10am"*, *"remove the inbox triage"*, *"confirm the plan"*). |
 +| **🤖 Executive Assistant** | Chat that reasons over your **real** schedule, inbox, messages and brain — and **remembers the conversation**: follow-ups like *"what about tomorrow?"* and *"add another one for Friday"* just work, with people and topics carried across turns, plus a **rolling summary** every 12 turns so memory outlives the 10-turn window. Ask in plain words (*"can you set up a call with the client tomorrow at 11"*) and it **acts**: with a model reachable it tool-calls `create_event`, `add_task`, `complete_task`, `search_calendar`, `search_brain`, `web_search` and `plan_day`, then confirms with the record it really wrote. |
- | **🗓️ Autonomous Scheduler** | Say *"plan my day tomorrow"*, *"build a weekly plan"* or *"organize this week"* and ARIA drafts a full calendar around your rhythm — wake-up brief, 2-hour deep-work blocks for high-priority tasks, a meeting window that never double-books, morning & end-of-day inbox triage, business vs day-job blocks, 15-minute buffers — then refines on command (*"move the standup to 10am"*, *"remove the inbox triage"*, *"confirm the plan"*). |
++| **🗓️ Autonomous Scheduler** | Say *"plan my day tomorrow"*, *"build a weekly plan"* or *"organize this week"* and ARIA drafts a full calendar around your rhythm — wake-up brief, 2-hour deep-work blocks for high-priority tasks, a meeting window that never double-books, morning & end-of-day inbox triage, business vs day-job blocks, 15-minute buffers — each block fitted into the gaps your real calendar actually leaves (a busy morning shrinks a focus block instead of collapsing the plan) — then refines on command (*"move the standup to 10am"*, *"remove the inbox triage"*, *"confirm the plan"*). |
  | **🤖 Agency Swarm** | ARIA becomes your **Executive Chief of Staff**: hand her a complex, multi-step mission and she decomposes it and delegates to background specialists — **ResearcherAgent** (second brain + web), **AnalystAgent** (priorities, inbox, financial records), **CopywriterAgent** (emails, proposals, daily summaries) — then signs off one executive report. Every step is replayed live in the UI. |
  | **🔌 Connectors** | Opt-in **demo mode** + real adapters: **Gmail/Google Calendar**, **Outlook**, **Slack** (works with a token today), **WhatsApp Business Cloud API** + a universal `/api/ingest` endpoint (iOS Shortcuts, Zapier, n8n…). |
-@@ -104,10 +106,38 @@ ARIA's brain runs on **Ollama** — free and fully on-device:
+ 
+@@ -104,10 +106,40 @@ ARIA's brain runs on **Ollama** — free and fully on-device:
  
  ```bash
  # install from https://ollama.com then:
@@ -33,8 +35,9 @@ index 848dfd3..b6ea0f1 100644
 +ollama pull qwen2.5:7b        # recommended: best reasoning on ~8 GB of RAM
 +# ollama pull llama3.1:8b     # solid alternative
 +ollama pull nomic-embed-text  # optional: turns on SEMANTIC memory (see below)
-+```
-+
+ ```
+ 
+-That's it. ARIA detects it automatically (Settings → AI Engine). Until then, the built-in **offline engine** answers using intent routing + retrieval over your real data.
 +That's it. ARIA detects it automatically (Settings → AI engine). Until then, the built-in **offline engine** answers using intent routing + retrieval over your real data — nothing stops working.
 +
 +### ☁️ Optional cloud provider (off by default)
@@ -59,14 +62,15 @@ index 848dfd3..b6ea0f1 100644
 +add a meeting with the supplier at 3pm
 +set up a call with the client tomorrow at 11
 +book a meeting with Kamau tomorrow
- ```
- 
--That's it. ARIA detects it automatically (Settings → AI Engine). Until then, the built-in **offline engine** answers using intent routing + retrieval over your real data.
++```
++
 +Dates are parsed in **your** timezone (`tomorrow at 2pm`, `on Friday`, `next monday at 10am`, `tonight 8`), and when you name a day but no hour ARIA takes the **first free slot** in your working hours instead of double-booking you (lunch lands at 12:30, not 08:00).
++
++She never double-books a real commitment either: if the hour you asked for is already taken, she books the next free slot and **tells you** which entry owned it (*“Heads up — 14:00 was already taken by …, so I booked 15:00 instead”*). Her own unconfirmed plan blocks are only suggestions, so they step aside for something you actually asked for. `"move it to 14:00"` still forces the exact slot when you insist.
  
  ## ☀️ Morning brief delivery
  
-@@ -130,16 +160,18 @@ server/
+@@ -130,16 +162,18 @@ server/
    index.js        API + static hosting (port 3000)
    scheduler.js    cron: brief at wake time, sync every 30 min
    brief.js        morning brief composer (weather via open-meteo, fail-safe)
@@ -488,10 +492,23 @@ index 71420c2..5668b45 100644
  /* Opt-in only (localStorage aria.wake = '1'). Enabling it unprompted would hold the
     microphone permanently and lock out the assistant mic button. */
 diff --git a/scripts/test-app.js b/scripts/test-app.js
-index 0616379..bbf1c8f 100644
+index 0616379..45e4872 100644
 --- a/scripts/test-app.js
 +++ b/scripts/test-app.js
-@@ -308,6 +308,226 @@ function check(name, cond, detail) {
+@@ -65,7 +65,11 @@ function check(name, cond, detail) {
+   check('POST /api/inbox → 200 with id', task.status === 200 && !!(task.json || {}).id);
+   const afterTask = await get('/api/inbox');
+   check('new task visible in /api/inbox', (afterTask.json || []).some(t => t.id === task.json.id));
+-  const ev = await post('/api/events', { title: 'Verification event', start: Date.now() + 3600000 });
++  /* +5h, not +1h: the DB seed already puts 'Strategy & Growth Sync' at now+1h and 'Team Standup'
++     at now+3h, so a +1h fixture sits on top of a seeded entry — and when the run happens between
++     23:00 and 24:00 local time both land on the planner's target day, which trips the
++     "no double booking with existing calendar entries" check below (it fails on main too). */
++  const ev = await post('/api/events', { title: 'Verification event', start: Date.now() + 5 * 3600000 });
+   check('POST /api/events → 200 with id', ev.status === 200 && !!(ev.json || {}).id);
+   const asst = await post('/api/assistant', { message: 'what are my priorities?' });
+   check('POST /api/assistant → 200 with reply', asst.status === 200 && typeof (asst.json || {}).reply === 'string');
+@@ -308,6 +312,241 @@ function check(name, cond, detail) {
    const follow = assistantModule2.resolveFollowUp('what about tomorrow?', { conv: { lastIntent: 'schedule-query', lastQuery: 'what is my schedule today', entities: {} } });
    check('resolveFollowUp rewrites "what about tomorrow?"', follow.isFollowUp === true && /tomorrow/i.test(follow.message), follow.message);
  
@@ -518,17 +535,28 @@ index 0616379..bbf1c8f 100644
 +  const evAfter1 = await evList();
 +  check('  …and wrote a NEW event to db.events', kamauTomorrow(evAfter1).length === kamauTomorrowBefore + 1, JSON.stringify(kamauTomorrow(evAfter1).map(e => e.title)));
 +  check('  …titled with the person, on tomorrow\'s day key', kamauTomorrow(evAfter1).some(e => /kamau/i.test(e.title) && dk(e.start, ARIA_TZ) === tomorrowKey), JSON.stringify(kamauTomorrow(evAfter1).map(e => [e.title, dk(e.start, ARIA_TZ)])));
-+  check('  …at 14:00 in the owner\'s timezone', kamauTomorrow(evAfter1).some(e => wallTime(e.start) === '14:00'), JSON.stringify(kamauTomorrow(evAfter1).map(e => wallTime(e.start))));
++  /* Hour-independent invariants: the requested time is honoured unless something already sat
++     there, in which case ARIA moves it and says so — and she NEVER double-books. */
++  const newOnes = (before, after) => after.filter(a => !before.some(b => b.id === a.id));
++  const overlapsAny = (list, ev) => list.some(o => o.id !== ev.id && ev.start < (o.end || o.start + 36e5) && o.start < ev.end);
++  const keptOrExplained = (evs, hhmm, reply) => evs.some(e => wallTime(e.start) === hhmm) || /already taken|instead|first free slot/i.test(reply || '');
++  const freshKamau = newOnes(evBeforeG, evAfter1).filter(e => /kamau/i.test(e.title || ''));
++  check('  …at 14:00 in the owner\'s timezone (or it says which clash it avoided)', keptOrExplained(freshKamau, '14:00', (nl1.json || {}).reply), JSON.stringify(freshKamau.map(e => wallTime(e.start))) + ' | ' + ((nl1.json || {}).reply || '').slice(-90));
++  check('  …and never double-books the calendar', freshKamau.length === 1 && !overlapsAny(evAfter1, freshKamau[0]), JSON.stringify(evAfter1.filter(e => dk(e.start, ARIA_TZ) === tomorrowKey).map(e => [wallTime(e.start), wallTime(e.end)])));
 +
 +  const nl2 = await post('/api/assistant', { message: 'please add a meeting with the supplier at 3pm' });
 +  check('"please add a meeting with the supplier at 3pm" confirms', nl2.status === 200 && /Scheduled/i.test((nl2.json || {}).reply || ''), (nl2.json || {}).reply);
 +  const supplier = (await evList()).filter(e => /supplier/i.test(e.title || '') && dk(e.start, ARIA_TZ) === todayKeyNow);
-+  check('  …and wrote today\'s supplier meeting at 15:00', supplier.some(e => wallTime(e.start) === '15:00'), JSON.stringify(supplier.map(e => [e.title, wallTime(e.start)])));
++  const freshSupplier = supplier.filter(e => !evBeforeG.some(b => b.id === e.id) && !evAfter1.some(b => b.id === e.id));
++  check('  …and wrote today\'s supplier meeting at 15:00 (or explained the move)', keptOrExplained(freshSupplier, '15:00', (nl2.json || {}).reply), JSON.stringify(supplier.map(e => [e.title, wallTime(e.start)])));
++  check('  …and the supplier meeting is not double-booked', freshSupplier.length === 1 && !overlapsAny(await evList(), freshSupplier[0]));
 +
 +  const nl3 = await post('/api/assistant', { message: 'set up a call with the client tomorrow at 11' });
 +  check('"set up a call with the client tomorrow at 11" confirms', nl3.status === 200 && /Scheduled/i.test((nl3.json || {}).reply || ''), (nl3.json || {}).reply);
 +  const clientEv = (await evList()).filter(e => /client/i.test(e.title || '') && dk(e.start, ARIA_TZ) === tomorrowKey);
-+  check('  …and wrote tomorrow\'s client call at 11:00', clientEv.some(e => wallTime(e.start) === '11:00'), JSON.stringify(clientEv.map(e => [e.title, wallTime(e.start)])));
++  const freshClient = clientEv.filter(e => !evAfter1.some(b => b.id === e.id));
++  check('  …and wrote tomorrow\'s client call at 11:00 (or explained the move)', keptOrExplained(freshClient, '11:00', (nl3.json || {}).reply), JSON.stringify(clientEv.map(e => [e.title, wallTime(e.start)])));
++  check('  …and the client call is not double-booked', freshClient.length === 1 && !overlapsAny(await evList(), freshClient[0]));
 +
 +  const nl4 = await post('/api/assistant', { message: 'please schedule lunch with Amina on Friday' });
 +  check('"please schedule lunch with Amina on Friday" confirms', nl4.status === 200 && /Scheduled/i.test((nl4.json || {}).reply || ''), (nl4.json || {}).reply);
@@ -542,12 +570,10 @@ index 0616379..bbf1c8f 100644
 +  check('  …and wrote a NEW Kamau event for tomorrow', kamauTomorrow(evAfter5).length === kamauTomorrow(evBefore5).length + 1, JSON.stringify(kamauTomorrow(evAfter5).map(e => e.title)));
 +  /* No clock time was given, so ARIA must take a FREE slot instead of stacking it on the day. */
 +  check('  …without double-booking (an un-timed request takes a free slot)', (() => {
-+    const fresh = kamauTomorrow(evAfter5).filter(e => !evBefore5.some(b => b.id === e.id));
-+    if (fresh.length !== 1) return false;
-+    const mine = fresh[0];
-+    return !evAfter5.some(e => e.id !== mine.id && mine.start < (e.end || e.start + 36e5) && e.start < mine.end);
-+  })(), JSON.stringify(kamauTomorrow(evAfter5).filter(e => !evBefore5.some(b => b.id === e.id)).map(e => [wallTime(e.start), wallTime(e.end)])));
-+  check('  …and says so when it picks the slot itself', /first free slot/i.test((nl5.json || {}).reply || ''), (nl5.json || {}).reply);
++    const fresh = newOnes(evBefore5, evAfter5).filter(e => /kamau/i.test(e.title || ''));
++    return fresh.length === 1 && !overlapsAny(evAfter5, fresh[0]);
++  })(), JSON.stringify(newOnes(evBefore5, evAfter5).map(e => [e.title, wallTime(e.start), wallTime(e.end)])));
++  check('  …and says so when it picks the slot itself', /first free slot|already taken/i.test((nl5.json || {}).reply || ''), (nl5.json || {}).reply);
 +  /* The transcript is rendered inside the assistant view, where a warning glyph reads like a
 +     render failure — clashes are reported in words instead. */
 +  check('replies carry no warning glyph into the transcript', [nl1, nl2, nl3, nl4, nl5].every(r => !/⚠️/.test((r.json || {}).reply || '')));
@@ -603,7 +629,13 @@ index 0616379..bbf1c8f 100644
 +  check('create_event returns a real confirmation', !!toolEvent && /Scheduled/i.test(toolEvent.reply) && /Investor sync/.test(toolEvent.reply), toolEvent && toolEvent.reply);
 +  const evAfterTool = await evList();
 +  check('create_event actually wrote the event', evAfterTool.length === evBeforeTool + 1 && evAfterTool.some(e => /investor sync/i.test(e.title) && dk(e.start, ARIA_TZ) === tomorrowKey), JSON.stringify(evAfterTool.map(e => e.title).slice(0, 3)));
-+  check('the written event kept the requested wall-clock time', evAfterTool.some(e => /investor sync/i.test(e.title) && wallTime(e.start) === '16:00'));
++  const written = evAfterTool.filter(e => /investor sync/i.test(e.title));
++  check('the written event kept the requested time (or moved off a clash and said so)',
++    written.some(e => wallTime(e.start) === '16:00') || /already taken|instead/i.test((toolEvent || {}).reply || ''),
++    JSON.stringify(written.map(e => [wallTime(e.start), wallTime(e.end)])) + ' | ' + ((toolEvent || {}).reply || ''));
++  check('the tool-written event does not double-book the calendar',
++    written.length === 1 && !evAfterTool.some(o => o.id !== written[0].id && written[0].start < (o.end || o.start + 36e5) && o.start < written[0].end),
++    JSON.stringify(evAfterTool.filter(e => dk(e.start, ARIA_TZ) === tomorrowKey).map(e => [wallTime(e.start), e.title])));
 +  check('create_event rejects an empty title (nothing written)', (await asstMod.executeTool('create_event', { title: '  ', startISO: isoStart })) === null && (await evList()).length === evAfterTool.length);
 +  check('create_event rejects an unparseable date (nothing written)', (await asstMod.executeTool('create_event', { title: 'Ghost meeting', startISO: 'sometime soon' })) === null && !(await evList()).some(e => /ghost meeting/i.test(e.title || '')));
 +  check('create_event accepts a natural-language date', !!await asstMod.executeTool('create_event', { title: 'Site visit', startISO: 'tomorrow at 9am' }));
@@ -718,7 +750,7 @@ index 0616379..bbf1c8f 100644
    console.log('\n[4] Frontend render (jsdom)');
    const errors = [];
    const vc = new VirtualConsole();
-@@ -411,6 +631,153 @@ function check(name, cond, detail) {
+@@ -411,6 +650,162 @@ function check(name, cond, detail) {
    check('hub card routes the mission to the swarm', w.location.hash === '#/agency');
    await sleep(1200);
  
@@ -849,7 +881,16 @@ index 0616379..bbf1c8f 100644
 +  check('the reply is the REAL confirmation', /Scheduled/i.test(actedJson.reply || '') && /Plumber — water heater repair/.test(actedJson.reply || ''), actedJson.reply);
 +  const heater = (await evList()).filter(e => /water heater/i.test(e.title || ''));
 +  check('the tool call actually wrote the event', heater.length === 1, JSON.stringify(heater.map(e => e.title)));
-+  check('the written event honours the model\'s ISO date (Saturday 09:00 local)', heater.length === 1 && dk(heater[0].start, ARIA_TZ) === satKey && wallTime(heater[0].start) === '09:00', heater.length ? `${dk(heater[0].start, ARIA_TZ)} ${wallTime(heater[0].start)}` : 'none');
++  const heaterOnSat = heater.length === 1 && dk(heater[0].start, ARIA_TZ) === satKey;
++  check('the written event honours the model\'s ISO day (Saturday)', heaterOnSat, heater.length ? `${dk(heater[0].start, ARIA_TZ)} ${wallTime(heater[0].start)}` : 'none');
++  /* Hour-independent: 09:00 is kept unless a REAL entry already owned it, in which case ARIA
++     books the next free slot and says so in the reply. */
++  check('the written event honours 09:00 — or moved off a real clash and said so',
++    heaterOnSat && (wallTime(heater[0].start) === '09:00' || /already taken|instead/i.test(actedJson.reply || '')),
++    heaterOnSat ? `${wallTime(heater[0].start)} | ${(actedJson.reply || '').slice(-110)}` : 'none');
++  check('the tool-written event does not overlap anything else that day', heaterOnSat
++    && !(await evList()).some(o => o.id !== heater[0].id && heater[0].start < (o.end || o.start + 36e5) && o.start < heater[0].end),
++    JSON.stringify((await evList()).filter(e => dk(e.start, ARIA_TZ) === satKey).map(e => [wallTime(e.start), e.title])));
 +  check('the event was tagged as coming from a tool call', heater.length === 1 && heater[0].source === 'assistant-tool', heater.length ? heater[0].source : 'none');
 +  check('the mutation was persisted (db.events on disk/in store)', (await get('/api/events')).json.some(e => /water heater/i.test(e.title || '')));
 +
@@ -946,7 +987,7 @@ index 481e162..772a2d8 100644
  
  /* ---------------- briefs ---------------- */
 diff --git a/server/assistant.js b/server/assistant.js
-index 227f16a..4c6a32f 100644
+index 227f16a..fe7314d 100644
 --- a/server/assistant.js
 +++ b/server/assistant.js
 @@ -1,6 +1,6 @@
@@ -1333,7 +1374,7 @@ index 227f16a..4c6a32f 100644
    }
  
    /* ---- Identity Commands ---- */
-@@ -450,6 +533,511 @@ async function routeIntent(msg, memory) {
+@@ -450,6 +533,590 @@ async function routeIntent(msg, memory) {
  
  const titleCase = (s) => { const t = String(s || '').trim(); return t ? t.charAt(0).toUpperCase() + t.slice(1) : t; };
  
@@ -1371,29 +1412,100 @@ index 227f16a..4c6a32f 100644
 +  return null;
 +}
 +
-+/* First free slot for `durationMs` on `dayKeyStr` inside the owner's working hours. */
-+function firstFreeSlot(dayKeyStr, durationMs, tz, ignoreId, preferred) {
++/* An unconfirmed planner block: ARIA's own draft, not a promise the owner has made to anyone. */
++function isDraftPlan(e) {
++  return !!e && e.source === 'planner' && e.confirmed !== true;
++}
++
++/* Keep the calendar honest after something lands on a day: any draft block that now overlaps a
++   real entry is re-parked in the next free gap (inside the owner's rhythm where possible), so
++   the owner's explicit request always wins WITHOUT leaving two things on top of each other.
++   Returns the titles it moved. */
++function parkDraftsAround(dayKeyStr, tz) {
 +  const db = dbm.load();
 +  const cfg = cfgm.load();
 +  const rhythm = cfg.rhythm || {};
++  const boxes = (db.events || [])
++    .filter(e => e && dayKey(e.start, tz) === dayKeyStr)
++    .map(e => ({ e, start: e.start, end: e.end || e.start + 3600000 }))
++    .sort((a, b) => a.start - b.start);
++  const STEP = 15 * 60000;
++  const workFrom = zonedTime(dayKeyStr, rhythm.workStartHour || 8, 0, tz);
++  const workTo = zonedTime(dayKeyStr, rhythm.workEndHour || 17, 0, tz) + STEP;
++  const wakeAt = zonedTime(dayKeyStr, rhythm.wakeHour || 6, 0, tz);
++  const sleepAt = zonedTime(dayKeyStr, rhythm.sleepHour || 22, 0, tz);
++  const round = (t) => Math.ceil(t / STEP) * STEP;
++  /* Earliest start inside [from, to) that holds `dur` without touching anything but `skip`. */
++  const slotIn = (from, to, dur, skip) => {
++    let t = round(from);
++    for (let guard = 0; guard < 200; guard++) {
++      if (t + dur > to) return null;
++      const hit = boxes.find(o => o !== skip && t < o.end && t + dur > o.start);
++      if (!hit) return t;
++      t = round(Math.max(t + STEP, hit.end));
++    }
++    return null;
++  };
++  const moved = [];
++  for (const box of boxes) {
++    if (!isDraftPlan(box.e)) continue;
++    const dur = box.end - box.start;
++    if (!boxes.some(o => o !== box && box.start < o.end && box.end > o.start)) continue;
++    /* 1. same length inside the work window · 2. shortened to fit the work window
++       3. same length anywhere inside the rhythm · 4. stacked after everything else */
++    let t = slotIn(workFrom, workTo, dur, box);
++    let len = dur;
++    if (t === null) {
++      const floor = dur >= 3600000 ? 45 * 60000 : STEP;
++      for (let d = round(dur - STEP); t === null && d >= floor; d -= STEP) {
++        t = slotIn(workFrom, workTo, d, box);
++        if (t !== null) len = d;
++      }
++    }
++    if (t === null) { t = slotIn(wakeAt, sleepAt, dur, box); len = dur; }
++    if (t === null) {
++      t = round(boxes.reduce((last, o) => (o === box ? last : Math.max(last, o.end)), box.start));
++      if (boxes.some(o => o !== box && t < o.end && t + len > o.start)) continue;  // nowhere to go
++    }
++    box.start = t; box.end = t + len;
++    box.e.start = t; box.e.end = t + len;
++    moved.push(box.e.title);
++  }
++  return moved;
++}
++
++/* First free slot for `durationMs` on `dayKeyStr`.
++   - `opts.preferred`  → start looking at a sensible hour (lunch 12:30, work start otherwise)
++   - `opts.earliest`   → start looking at an exact requested time and move forward from there
++   Always returns a timestamp that does NOT overlap anything already on the calendar: when the
++   day is wall-to-wall it stacks the event after the last entry instead of double-booking. */
++function firstFreeSlot(dayKeyStr, durationMs, tz, opts = {}) {
++  const db = dbm.load();
++  const cfg = cfgm.load();
++  const rhythm = cfg.rhythm || {};
++  const { ignoreId = null, preferred = null, earliest = null } = opts;
++  /* Only the owner's real commitments block a slot. ARIA's own unconfirmed plan blocks are
++     suggestions — they are parked elsewhere by parkDraftsAround() instead of saying "no". */
 +  const busy = (db.events || [])
-+    .filter(e => e && e.id !== ignoreId && dayKey(e.start, tz) === dayKeyStr)
++    .filter(e => e && e.id !== ignoreId && !isDraftPlan(e) && dayKey(e.start, tz) === dayKeyStr)
 +    .map(e => ({ start: e.start, end: e.end || e.start + 3600000 }))
 +    .sort((a, b) => a.start - b.start);
-+  const wantHour = preferred ? preferred.h : (rhythm.workStartHour || 9);
-+  const wantMin = preferred ? preferred.m : 0;
-+  const from = Math.max(
-+    zonedTime(dayKeyStr, rhythm.workStartHour || 8, 0, tz),
-+    zonedTime(dayKeyStr, Math.min(21, wantHour), wantMin, tz)
-+  );
-+  const until = zonedTime(dayKeyStr, Math.min(22, Math.max(rhythm.sleepHour || 22, (rhythm.workEndHour || 17) + 3)), 0, tz);
++  const from = earliest !== null
++    ? earliest
++    : Math.max(
++      zonedTime(dayKeyStr, rhythm.workStartHour || 8, 0, tz),
++      zonedTime(dayKeyStr, Math.min(21, preferred ? preferred.h : (rhythm.workStartHour || 9)), preferred ? preferred.m : 0, tz)
++    );
++  const hardLimit = zonedTime(dayKeyStr, 23, 0, tz);
 +  let t = from;
-+  for (let i = 0; i < 48 && t + durationMs <= until; i++) {
++  for (let i = 0; i < 96; i++) {
 +    const clash = busy.find(b => t < b.end && t + durationMs > b.start);
 +    if (!clash) return t;
 +    t = Math.ceil(Math.max(t + 15 * 60000, clash.end) / (15 * 60000)) * (15 * 60000);
++    if (t + durationMs > hardLimit) break;
 +  }
-+  return null;
++  /* No gap left in the day: park it after everything else rather than on top of something. */
++  return busy.reduce((last, b) => Math.max(last, b.end), from);
 +}
 +
 +/* Strip the "when" out of a request so the title is what, not when. */
@@ -1418,19 +1530,21 @@ index 227f16a..4c6a32f 100644
 +  const cfg = cfgm.load();
 +  const tz = (cfg.owner && cfg.owner.timezone) || 'Africa/Nairobi';
 +  const cleanTitle = titleCase(String(title || '').replace(/\s+/g, ' ').trim().slice(0, 160)) || 'Appointment';
-+  /* `flexible` = the user named a day but no clock time → take the first FREE slot that day so
-+     ARIA never double-books. An explicit time is honoured exactly, with a heads-up on a clash. */
 +  const requested = Number(start) || Date.now();
 +  const duration = Math.max(15 * 60000, (Number(end) || requested + 3600000) - requested);
-+  let startMs = requested;
-+  let clash = null;
-+  if (flexible) {
-+    const free = firstFreeSlot(dayKey(requested, tz), duration, tz, null, preferred || preferredHourFor(cleanTitle));
-+    if (free) startMs = free;
-+  } else {
-+    clash = (db.events || []).find(e => e && dayKey(e.start, tz) === dayKey(requested, tz)
-+      && requested < (e.end || e.start + 3600000) && e.start < requested + duration) || null;
-+  }
++  const dayStr = dayKey(requested, tz);
++  const occupiedBy = (db.events || []).find(e => e && !isDraftPlan(e) && dayKey(e.start, tz) === dayStr
++    && requested < (e.end || e.start + 3600000) && e.start < requested + duration) || null;
++  /* ARIA never double-books the owner's real commitments. With no clock time she picks the first
++     sensible free slot; with an explicit time that is genuinely taken she moves forward to the
++     next free one and SAYS so. Her own draft plan blocks simply step aside — and
++     "move it to 14:00" (moveEvent) still forces the exact slot when the owner insists. */
++  const startMs = occupiedBy || flexible
++    ? (firstFreeSlot(dayStr, duration, tz, flexible && !occupiedBy
++      ? { preferred: preferred || preferredHourFor(cleanTitle) }
++      : { earliest: requested, preferred: preferred || preferredHourFor(cleanTitle) }))
++    : requested;
++  const clash = occupiedBy;
 +  const endMs = startMs + duration;
 +  const ctx = guessContext(cleanTitle, context);
 +  const ev = {
@@ -1447,15 +1561,21 @@ index 227f16a..4c6a32f 100644
 +  };
 +  db.events = db.events || [];
 +  db.events.push(ev);
++  const parked = parkDraftsAround(dayStr, tz);   // drafts yield to the owner's real booking
 +  const conv = convState(db);
 +  conv.lastIntent = 'schedule-create';
 +  conv.lastSubject = ev.title;
 +  conv.lastEventAt = ev.start;
 +  brain.buildIndex();          // never leave a stale index behind a mutation
 +  await dbm.saveNow();         // best-effort: a read-only fs degrades to in-memory state
++  /* Whenever ARIA chose the hour herself she says so — the owner should never have to guess
++     which part of the reply was their own wording. */
++  const parkedNote = parked.length
++    ? ` I shifted ${parked.length === 1 ? 'my draft block' : `${parked.length} of my draft blocks`} (${parked.slice(0, 2).map(t => `"${snippet(t, 34)}"`).join(', ')}) to keep the calendar clean.`
++    : '';
 +  const note = clash
-+    ? ` Heads up — that overlaps "${clash.title}"; say "move it" and I will find a free slot.`
-+    : (flexible && startMs !== requested ? ' I took the first free slot in your working hours.' : '');
++    ? ` Heads up — ${timeStr(requested, tz)} was already taken by "${clash.title}", so I booked ${timeStr(startMs, tz)} instead. Say "move it to ${timeStr(requested, tz)}" if you would rather keep that slot.`
++    : (flexible ? ' I took the first free slot in your working hours.' : '') + parkedNote;
 +  return {
 +    reply: `📅 **Event Scheduled:** "${ev.title}" on ${dayLabel(ev.start, tz)} at ${timeStr(ev.start, tz)}–${timeStr(ev.end, tz)}.${note}`,
 +    intent: 'schedule-create',
@@ -1845,8 +1965,103 @@ index 227f16a..4c6a32f 100644
  /* ════════════════════════════════════════════════════════════════════════
     4. AUTONOMOUS MULTI-STEP SCHEDULER
     ════════════════════════════════════════════════════════════════════════ */
-@@ -677,7 +1265,9 @@ async function moveEvent(what, hour, minute, ampm, tz) {
+@@ -491,24 +1158,38 @@ function planTargetDays(msg, tz) {
+ 
+ const PRIORITY_RANK = { high: 0, medium: 1, low: 2 };
+ 
+-/* Place sequential blocks into the work day, jumping over existing calendar entries. */
++/* Place the day's blocks into the gaps that are actually left, in executive priority order.
++   A single mid-morning meeting must not collapse the whole plan: each block takes the earliest
++   gap that can hold it and shrinks to fit that gap (down to a useful minimum) instead of being
++   pushed to the end of the day and dragging every later block past the work window with it. */
+ function placeBlocks(blocks, busy, workStart, workEnd, bufferMs = 15 * 60000) {
+   const placed = [];
+-  let t = workStart;
+-  const conflicts = busy.slice().sort((a, b) => a.start - b.start);
+-  for (const b of blocks) {
+-    let start = Math.max(t, b.earliest || 0);
+-    let moved = true;
+-    while (moved) {
+-      moved = false;
+-      for (const c of conflicts) {
+-        if (start < c.end && start + b.duration > c.start) { start = c.end + bufferMs; moved = true; }
++  const limit = workEnd + bufferMs;
++  const taken = busy.slice().map(c => ({ start: c.start, end: c.end })).sort((a, b) => a.start - b.start);
++  /* Earliest gap at/after `from` that can hold at least `minDur`, plus how much room it has. */
++  const gapFor = (from, minDur) => {
++    let start = Math.max(from, workStart);
++    for (let guard = 0; guard < 200; guard++) {
++      if (start + minDur > limit) return null;
++      const hit = taken.find(c => start < c.end && start + minDur > c.start);
++      if (!hit) {
++        const nextWall = taken.reduce((m, c) => (c.start >= start + minDur ? Math.min(m, c.start) : m), limit);
++        return { start, room: Math.min(limit - start, nextWall - start) };
+       }
++      start = hit.end + bufferMs;
+     }
+-    if (start + b.duration <= workEnd + bufferMs) {
+-      placed.push({ ...b, start, end: start + b.duration });
+-      t = start + b.duration + bufferMs;
+-    }
++    return null;
++  };
++  for (const b of blocks) {
++    const minDur = Math.min(b.duration, b.duration >= 3600000 ? 45 * 60000 : 30 * 60000);
++    const gap = gapFor(Math.max(b.earliest || 0, workStart), minDur);
++    if (!gap) continue;
++    const duration = Math.max(minDur, Math.min(b.duration, Math.floor(gap.room / 900000) * 900000));
++    if (duration < minDur || gap.start + duration > limit) continue;
++    placed.push({ ...b, duration, start: gap.start, end: gap.start + duration });
++    /* Planned blocks keep their breathing room from each other too. */
++    taken.push({ start: gap.start - bufferMs, end: gap.start + duration + bufferMs });
++    taken.sort((x, y) => x.start - y.start);
+   }
+   return placed;
+ }
+@@ -552,13 +1233,6 @@ async function generateSchedule(message) {
+       .filter(e => dayKey(e.start, tz) === day && e.source !== 'planner')
+       .map(e => ({ start: e.start, end: e.end || e.start + 36e5, title: e.title }));
+ 
+-    /* Wake-up brief — fixed at the rhythm's wake hour. */
+-    const briefAt = Math.max(zonedTime(day, rhythm.wakeHour, 0, tz), isToday ? Date.now() : 0);
+-    created.push({
+-      id: `${planId}-${day}-brief`, planId, planDay: day, title: 'Wake-up brief — ARIA morning summary',
+-      start: briefAt, end: briefAt + 20 * 60000, context: 'day-job', source: 'planner', kind: 'brief', confirmed: false
+-    });
+-
+     /* Work-day blocks, in executive order. Tasks are consumed as they are scheduled so a
+        weekly plan spreads them across days instead of repeating the same list. */
+     const remaining = tasks.slice(cursor);
+@@ -584,6 +1258,19 @@ async function generateSchedule(message) {
+         title: b.title, start: b.start, end: b.end, context: b.context, source: 'planner', kind: b.kind, confirmed: false
+       });
+     }
++
++    /* Wake-up brief — placed LAST so it never lands on top of the real calendar or of the
++       blocks just placed. It still opens at the rhythm's wake hour; something already sitting
++       there (a 06:00 flight, an early call) simply pushes it to the first free moment. */
++    const BRIEF_MS = 20 * 60000;
++    const taken = busy.concat(placed.map(b => ({ start: b.start, end: b.end })));
++    const clashAt = (from) => taken.find(b => from < b.end && from + BRIEF_MS > b.start);
++    let briefAt = Math.max(zonedTime(day, rhythm.wakeHour, 0, tz), isToday ? Date.now() : 0);
++    for (let guard = 0, hit = clashAt(briefAt); hit && guard < 60; guard++, hit = clashAt(briefAt)) briefAt = hit.end;
++    created.push({
++      id: `${planId}-${day}-brief`, planId, planDay: day, title: 'Wake-up brief — ARIA morning summary',
++      start: briefAt, end: briefAt + BRIEF_MS, context: 'day-job', source: 'planner', kind: 'brief', confirmed: false
++    });
+   }
+ 
+   for (const ev of created) (db.events = db.events || []).push(ev);
+@@ -671,13 +1358,16 @@ async function moveEvent(what, hour, minute, ampm, tz) {
+   const day = dayKey(ev.start, tz);
+   const newStart = zonedTime(day, h, minute || 0, tz);
+   const duration = (ev.end || ev.start + 36e5) - ev.start;
+-  const clash = (dbm.load().events || []).find(e => e.id !== ev.id && e.start < newStart + duration && (e.end || e.start + 36e5) > newStart);
++  const clash = (dbm.load().events || []).find(e => e.id !== ev.id && !isDraftPlan(e) && e.start < newStart + duration && (e.end || e.start + 36e5) > newStart);
+   ev.start = newStart;
+   ev.end = newStart + duration;
    if (ev.source === 'planner' && ev.kind === 'brief') ev.kind = 'moved';
++  parkDraftsAround(day, tz);   // an explicit move outranks ARIA's own draft blocks
    brain.buildIndex();
    await dbm.saveNow();
 -  return `⏰ **Moved:** "${ev.title}" now starts at ${timeStr(newStart, tz)} on ${dayLabel(newStart, tz)}.${clash ? ` ⚠️ Heads up — it now overlaps "${clash.title}".` : ' No double booking.'}`;
@@ -1856,7 +2071,7 @@ index 227f16a..4c6a32f 100644
  }
  
  /* "remove the inbox triage" — drop the matching event(s) from the plan/calendar. */
-@@ -801,10 +1391,7 @@ async function offlineEngine(msg, context, engineStatus) {
+@@ -801,10 +1491,7 @@ async function offlineEngine(msg, context, engineStatus) {
    }
  
    if (/\b(schedule|calendar|day look|agenda|meetings|what('s| is) on|my day|free|busy)\b/.test(m)) {
@@ -1868,7 +2083,7 @@ index 227f16a..4c6a32f 100644
    }
  
    if (/\b(priorit|urgent|important|to do|tasks|focus)\b/.test(m)) {
-@@ -835,8 +1422,12 @@ async function offlineEngine(msg, context, engineStatus) {
+@@ -835,8 +1522,12 @@ async function offlineEngine(msg, context, engineStatus) {
  
    // 1. Check local second brain with HIGH confidence threshold to avoid false positives
    const HIGH_CONFIDENCE_SCORE = 3.0;
@@ -1883,7 +2098,7 @@ index 227f16a..4c6a32f 100644
  
    if (strongHits.length > 0) {
      return 'Here is what I found in your brain:\n\n' + strongHits.map(h => '- **' + h.title + '**: ' + snippet(h.snippet, 180)).join('\n\n');
-@@ -900,12 +1491,21 @@ async function learnReply(url) {
+@@ -900,12 +1591,21 @@ async function learnReply(url) {
      const note = await weblearn.learnFromUrl(url);
      return `📚 Done — I read **${note.title}**\n\n${snippet(note.content, 280)}`;
    } catch (e) {
