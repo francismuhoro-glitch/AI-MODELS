@@ -65,7 +65,11 @@ function check(name, cond, detail) {
   check('POST /api/inbox → 200 with id', task.status === 200 && !!(task.json || {}).id);
   const afterTask = await get('/api/inbox');
   check('new task visible in /api/inbox', (afterTask.json || []).some(t => t.id === task.json.id));
-  const ev = await post('/api/events', { title: 'Verification event', start: Date.now() + 3600000 });
+  /* +5h, not +1h: the DB seed already puts 'Strategy & Growth Sync' at now+1h and 'Team Standup'
+     at now+3h, so a +1h fixture sits on top of a seeded entry — and when the run happens between
+     23:00 and 24:00 local time both land on the planner's target day, which trips the
+     "no double booking with existing calendar entries" check below (it fails on main too). */
+  const ev = await post('/api/events', { title: 'Verification event', start: Date.now() + 5 * 3600000 });
   check('POST /api/events → 200 with id', ev.status === 200 && !!(ev.json || {}).id);
   const asst = await post('/api/assistant', { message: 'what are my priorities?' });
   check('POST /api/assistant → 200 with reply', asst.status === 200 && typeof (asst.json || {}).reply === 'string');
@@ -308,6 +312,241 @@ function check(name, cond, detail) {
   const follow = assistantModule2.resolveFollowUp('what about tomorrow?', { conv: { lastIntent: 'schedule-query', lastQuery: 'what is my schedule today', entities: {} } });
   check('resolveFollowUp rewrites "what about tomorrow?"', follow.isFollowUp === true && /tomorrow/i.test(follow.message), follow.message);
 
+  console.log('\n[3g] Natural phrasing → real calendar entries (Issue 1)');
+  /* These five phrasings used to create NOTHING (the schedule regex only matched messages that
+     STARTED with "schedule|add event|create meeting|meeting with|calendar"). There is no Ollama
+     in the test environment, so the widened DETERMINISTIC layer is what must make them pass. */
+  const asstMod = require('../server/assistant');
+  const brainMod = require('../server/brain');
+  const dbMod = require('../server/db');
+  const embMod = require('../server/embeddings');
+  const llmMod = require('../server/llm');
+  const cfgMod = require('../server/config');
+  const tomorrowKey = dk(Date.now() + 864e5, ARIA_TZ);
+  const todayKeyNow = dk(Date.now(), ARIA_TZ);
+  const evList = async () => (await get('/api/events')).json || [];
+  const kamauTomorrow = (list) => list.filter(e => /kamau/i.test(e.title || '') && dk(e.start, ARIA_TZ) === tomorrowKey);
+
+  const evBeforeG = await evList();
+  const kamauTomorrowBefore = kamauTomorrow(evBeforeG).length;
+  const nl1 = await post('/api/assistant', { message: 'can you schedule a meeting with Kamau tomorrow at 2pm' });
+  check('"can you schedule a meeting with Kamau tomorrow at 2pm" confirms', nl1.status === 200 && /Scheduled/i.test((nl1.json || {}).reply || ''), (nl1.json || {}).reply);
+  check('  …routed by the deterministic intent layer (no LLM needed)', (nl1.json || {}).engine === 'intent', (nl1.json || {}).engine);
+  const evAfter1 = await evList();
+  check('  …and wrote a NEW event to db.events', kamauTomorrow(evAfter1).length === kamauTomorrowBefore + 1, JSON.stringify(kamauTomorrow(evAfter1).map(e => e.title)));
+  check('  …titled with the person, on tomorrow\'s day key', kamauTomorrow(evAfter1).some(e => /kamau/i.test(e.title) && dk(e.start, ARIA_TZ) === tomorrowKey), JSON.stringify(kamauTomorrow(evAfter1).map(e => [e.title, dk(e.start, ARIA_TZ)])));
+  /* Hour-independent invariants: the requested time is honoured unless something already sat
+     there, in which case ARIA moves it and says so — and she NEVER double-books. */
+  const newOnes = (before, after) => after.filter(a => !before.some(b => b.id === a.id));
+  const overlapsAny = (list, ev) => list.some(o => o.id !== ev.id && ev.start < (o.end || o.start + 36e5) && o.start < ev.end);
+  const keptOrExplained = (evs, hhmm, reply) => evs.some(e => wallTime(e.start) === hhmm) || /already taken|instead|first free slot/i.test(reply || '');
+  const freshKamau = newOnes(evBeforeG, evAfter1).filter(e => /kamau/i.test(e.title || ''));
+  check('  …at 14:00 in the owner\'s timezone (or it says which clash it avoided)', keptOrExplained(freshKamau, '14:00', (nl1.json || {}).reply), JSON.stringify(freshKamau.map(e => wallTime(e.start))) + ' | ' + ((nl1.json || {}).reply || '').slice(-90));
+  check('  …and never double-books the calendar', freshKamau.length === 1 && !overlapsAny(evAfter1, freshKamau[0]), JSON.stringify(evAfter1.filter(e => dk(e.start, ARIA_TZ) === tomorrowKey).map(e => [wallTime(e.start), wallTime(e.end)])));
+
+  const nl2 = await post('/api/assistant', { message: 'please add a meeting with the supplier at 3pm' });
+  check('"please add a meeting with the supplier at 3pm" confirms', nl2.status === 200 && /Scheduled/i.test((nl2.json || {}).reply || ''), (nl2.json || {}).reply);
+  const supplier = (await evList()).filter(e => /supplier/i.test(e.title || '') && dk(e.start, ARIA_TZ) === todayKeyNow);
+  const freshSupplier = supplier.filter(e => !evBeforeG.some(b => b.id === e.id) && !evAfter1.some(b => b.id === e.id));
+  check('  …and wrote today\'s supplier meeting at 15:00 (or explained the move)', keptOrExplained(freshSupplier, '15:00', (nl2.json || {}).reply), JSON.stringify(supplier.map(e => [e.title, wallTime(e.start)])));
+  check('  …and the supplier meeting is not double-booked', freshSupplier.length === 1 && !overlapsAny(await evList(), freshSupplier[0]));
+
+  const nl3 = await post('/api/assistant', { message: 'set up a call with the client tomorrow at 11' });
+  check('"set up a call with the client tomorrow at 11" confirms', nl3.status === 200 && /Scheduled/i.test((nl3.json || {}).reply || ''), (nl3.json || {}).reply);
+  const clientEv = (await evList()).filter(e => /client/i.test(e.title || '') && dk(e.start, ARIA_TZ) === tomorrowKey);
+  const freshClient = clientEv.filter(e => !evAfter1.some(b => b.id === e.id));
+  check('  …and wrote tomorrow\'s client call at 11:00 (or explained the move)', keptOrExplained(freshClient, '11:00', (nl3.json || {}).reply), JSON.stringify(clientEv.map(e => [e.title, wallTime(e.start)])));
+  check('  …and the client call is not double-booked', freshClient.length === 1 && !overlapsAny(await evList(), freshClient[0]));
+
+  const nl4 = await post('/api/assistant', { message: 'please schedule lunch with Amina on Friday' });
+  check('"please schedule lunch with Amina on Friday" confirms', nl4.status === 200 && /Scheduled/i.test((nl4.json || {}).reply || ''), (nl4.json || {}).reply);
+  const amina = (await evList()).filter(e => /amina/i.test(e.title || ''));
+  check('  …and wrote the lunch on Friday\'s day key', amina.some(e => dk(e.start, ARIA_TZ) === friKey), JSON.stringify(amina.map(e => [e.title, dk(e.start, ARIA_TZ)])));
+
+  const evBefore5 = await evList();
+  const nl5 = await post('/api/assistant', { message: 'book a meeting with Kamau tomorrow' });
+  check('"book a meeting with Kamau tomorrow" confirms', nl5.status === 200 && /Scheduled/i.test((nl5.json || {}).reply || ''), (nl5.json || {}).reply);
+  const evAfter5 = await evList();
+  check('  …and wrote a NEW Kamau event for tomorrow', kamauTomorrow(evAfter5).length === kamauTomorrow(evBefore5).length + 1, JSON.stringify(kamauTomorrow(evAfter5).map(e => e.title)));
+  /* No clock time was given, so ARIA must take a FREE slot instead of stacking it on the day. */
+  check('  …without double-booking (an un-timed request takes a free slot)', (() => {
+    const fresh = newOnes(evBefore5, evAfter5).filter(e => /kamau/i.test(e.title || ''));
+    return fresh.length === 1 && !overlapsAny(evAfter5, fresh[0]);
+  })(), JSON.stringify(newOnes(evBefore5, evAfter5).map(e => [e.title, wallTime(e.start), wallTime(e.end)])));
+  check('  …and says so when it picks the slot itself', /first free slot|already taken/i.test((nl5.json || {}).reply || ''), (nl5.json || {}).reply);
+  /* The transcript is rendered inside the assistant view, where a warning glyph reads like a
+     render failure — clashes are reported in words instead. */
+  check('replies carry no warning glyph into the transcript', [nl1, nl2, nl3, nl4, nl5].every(r => !/⚠️/.test((r.json || {}).reply || '')));
+
+  /* Conversation memory: the same day now lists what was just created. */
+  const recall = await post('/api/assistant', { message: 'what is my schedule tomorrow' });
+  const recallReply = (recall.json || {}).reply || '';
+  check('"what is my schedule tomorrow" lists the new meetings', /tomorrow/i.test(recallReply) && /kamau/i.test(recallReply) && /client/i.test(recallReply), recallReply.slice(0, 200));
+
+  /* The intent helpers themselves. */
+  check('stripFiller removes politeness wrappers', asstMod.stripFiller('can you please schedule a meeting with Kamau') === 'schedule a meeting with Kamau', asstMod.stripFiller('can you please schedule a meeting with Kamau'));
+  check('stripFiller never empties a greeting', asstMod.stripFiller('hello') === 'hello');
+  check('matchScheduleRequest accepts "set up a call with the client tomorrow"', !!asstMod.matchScheduleRequest('set up a call with the client tomorrow'));
+  check('matchScheduleRequest accepts "hey aria, arrange a meeting with the bank on monday"', !!asstMod.matchScheduleRequest('hey aria, arrange a meeting with the bank on monday'));
+  check('matchScheduleRequest rejects non-calendar asks', asstMod.matchScheduleRequest('create a summary of my inbox') === null);
+  check('matchScheduleRequest rejects task asks', asstMod.matchScheduleRequest('add a task to call the supplier') === null);
+  check('parseRelativeDateTime resolves "tomorrow at 2pm" in the owner tz', dk(asstMod.parseRelativeDateTime('tomorrow at 2pm', ARIA_TZ), ARIA_TZ) === tomorrowKey);
+  check('parseRelativeDateTime resolves "next monday at 10am"', wallTime(asstMod.parseRelativeDateTime('next monday at 10am', ARIA_TZ)) === '10:00');
+  check('parseRelativeDateTime resolves "tonight 8"', wallTime(asstMod.parseRelativeDateTime('dinner tonight 8', ARIA_TZ)) === '20:00', wallTime(asstMod.parseRelativeDateTime('dinner tonight 8', ARIA_TZ)));
+  check('parseRelativeDateTime resolves "on Friday"', dk(asstMod.parseRelativeDateTime('lunch on Friday', ARIA_TZ), ARIA_TZ) === friKey);
+
+  console.log('\n[3h] LLM tool calling — parse, validate, execute for real');
+  const TOOL_NAMES_EXPECTED = ['create_event', 'add_task', 'complete_task', 'search_calendar', 'search_brain', 'web_search', 'plan_day'];
+  check('the tool schema defines all seven tools', TOOL_NAMES_EXPECTED.every(n => asstMod.TOOL_DEFS.some(t => t.name === n)), asstMod.TOOL_DEFS.map(t => t.name).join(','));
+  check('every tool documents its arguments', asstMod.TOOL_DEFS.every(t => t.args && typeof t.args === 'object' && Object.keys(t.args).length > 0));
+  check('parseToolCall reads a bare JSON object', (() => {
+    const c = asstMod.parseToolCall('{"tool":"create_event","args":{"title":"Board sync","startISO":"2026-09-04T14:00:00+03:00"}}');
+    return !!c && c.tool === 'create_event' && c.args.title === 'Board sync';
+  })());
+  check('parseToolCall reads JSON inside ```json fences', (() => {
+    const c = asstMod.parseToolCall('```json\n{"tool":"add_task","args":{"title":"Pay the supplier"}}\n```');
+    return !!c && c.tool === 'add_task' && c.args.title === 'Pay the supplier';
+  })());
+  check('parseToolCall extracts JSON wrapped in chatty prose', (() => {
+    const c = asstMod.parseToolCall('Sure — doing that now. {"tool":"web_search","args":{"query":"cement prices nairobi"}} Hope that helps!');
+    return !!c && c.tool === 'web_search' && c.args.query === 'cement prices nairobi';
+  })());
+  check('parseToolCall tolerates trailing commas / smart quotes', (() => {
+    const c = asstMod.parseToolCall('{“tool”:“search_brain”,“args”:{“query”:“cement”,}}');
+    return !!c && c.tool === 'search_brain';
+  })(), JSON.stringify(asstMod.parseToolCall('{“tool”:“search_brain”,“args”:{“query”:“cement”,}}')));
+  check('parseToolCall returns null for plain prose', asstMod.parseToolCall('I cannot help with that.') === null);
+  check('parseToolCall returns null for broken JSON', asstMod.parseToolCall('{"tool": }') === null);
+  check('parseToolCall returns null for an empty reply', asstMod.parseToolCall('') === null && asstMod.parseToolCall(null) === null);
+  check('parseToolCall ignores JSON that names no tool', asstMod.parseToolCall('{"answer": 42}') === null);
+  check('toolPrompt instructs a JSON-only reply', /ONLY a compact JSON object/i.test(llmMod.toolPrompt(asstMod.TOOL_DEFS)) && /create_event/.test(llmMod.toolPrompt(asstMod.TOOL_DEFS)));
+
+  /* Execution — the tool path must write the SAME records the regex path writes. */
+  const evBeforeTool = (await evList()).length;
+  const isoStart = new Date(require('../server/util').zonedTime(tomorrowKey, 16, 0, ARIA_TZ)).toISOString();
+  const isoEnd = new Date(require('../server/util').zonedTime(tomorrowKey, 17, 0, ARIA_TZ)).toISOString();
+  const toolEvent = await asstMod.executeTool('create_event', { title: 'Investor sync', startISO: isoStart, endISO: isoEnd, context: 'business' });
+  check('create_event returns a real confirmation', !!toolEvent && /Scheduled/i.test(toolEvent.reply) && /Investor sync/.test(toolEvent.reply), toolEvent && toolEvent.reply);
+  const evAfterTool = await evList();
+  check('create_event actually wrote the event', evAfterTool.length === evBeforeTool + 1 && evAfterTool.some(e => /investor sync/i.test(e.title) && dk(e.start, ARIA_TZ) === tomorrowKey), JSON.stringify(evAfterTool.map(e => e.title).slice(0, 3)));
+  const written = evAfterTool.filter(e => /investor sync/i.test(e.title));
+  check('the written event kept the requested time (or moved off a clash and said so)',
+    written.some(e => wallTime(e.start) === '16:00') || /already taken|instead/i.test((toolEvent || {}).reply || ''),
+    JSON.stringify(written.map(e => [wallTime(e.start), wallTime(e.end)])) + ' | ' + ((toolEvent || {}).reply || ''));
+  check('the tool-written event does not double-book the calendar',
+    written.length === 1 && !evAfterTool.some(o => o.id !== written[0].id && written[0].start < (o.end || o.start + 36e5) && o.start < written[0].end),
+    JSON.stringify(evAfterTool.filter(e => dk(e.start, ARIA_TZ) === tomorrowKey).map(e => [wallTime(e.start), e.title])));
+  check('create_event rejects an empty title (nothing written)', (await asstMod.executeTool('create_event', { title: '  ', startISO: isoStart })) === null && (await evList()).length === evAfterTool.length);
+  check('create_event rejects an unparseable date (nothing written)', (await asstMod.executeTool('create_event', { title: 'Ghost meeting', startISO: 'sometime soon' })) === null && !(await evList()).some(e => /ghost meeting/i.test(e.title || '')));
+  check('create_event accepts a natural-language date', !!await asstMod.executeTool('create_event', { title: 'Site visit', startISO: 'tomorrow at 9am' }));
+  check('unknown tools are never executed', (await asstMod.executeTool('launch_missiles', { target: 'the moon' })) === null && (await asstMod.executeTool('delete_everything', {})) === null);
+  check('parseToolDate reads ISO, epoch millis and epoch seconds', (() => {
+    const { parseToolDate } = asstMod;
+    return parseToolDate('2026-09-04T14:00:00+03:00') === new Date('2026-09-04T14:00:00+03:00').getTime()
+      && parseToolDate(1800000000000) === 1800000000000
+      && parseToolDate(1800000000) === 1800000000000;
+  })());
+
+  const tasksBefore = ((await get('/api/tasks')).json || []).length;
+  const toolTask = await asstMod.executeTool('add_task', { title: 'Chase the cement invoice', priority: 'high' });
+  const tasksAfter = (await get('/api/tasks')).json || [];
+  check('add_task writes a real task with the requested priority', !!toolTask && /Task Added/i.test(toolTask.reply) && tasksAfter.length === tasksBefore + 1 && tasksAfter.some(t => /cement invoice/i.test(t.title) && t.priority === 'high' && t.done === false), JSON.stringify(tasksAfter.map(t => t.title).slice(0, 3)));
+  const toolDone = await asstMod.executeTool('complete_task', { titleQuery: 'cement invoice' });
+  check('complete_task marks the real task done', !!toolDone && /Completed/i.test(toolDone.reply) && ((await get('/api/tasks')).json || []).some(t => /cement invoice/i.test(t.title) && t.done === true), toolDone && toolDone.reply);
+  check('complete_task on a missing task changes nothing', (await asstMod.executeTool('complete_task', { titleQuery: 'zzz-no-such-task-zzz' })) === null);
+  const toolCal = await asstMod.executeTool('search_calendar', { dayLabel: 'tomorrow' });
+  check('search_calendar answers from the real calendar', !!toolCal && /tomorrow/i.test(toolCal.reply) && /investor sync/i.test(toolCal.reply), toolCal && toolCal.reply.slice(0, 120));
+  const toolBrain = await asstMod.executeTool('search_brain', { query: 'cement' });
+  check('search_brain answers from the second brain', !!toolBrain && typeof toolBrain.reply === 'string' && toolBrain.reply.length > 20, toolBrain && toolBrain.reply.slice(0, 100));
+  check('tools with missing required args are refused', (await asstMod.executeTool('search_brain', {})) === null && (await asstMod.executeTool('web_search', {})) === null);
+  check('a tool call never throws out of executeTool', typeof (await asstMod.executeTool('create_event', null)) === 'object' || (await asstMod.executeTool('create_event', null)) === null);
+
+  console.log('\n[3i] Semantic memory — BM25 blended with embeddings');
+  brainMod.ingestNote({ title: 'Cement supplier — Mwangi Hardware', content: 'Mwangi Hardware sells cement and ballast. Wholesale cement prices in Nairobi; I know them from the trade.', source: 'test', kind: 'note', tags: ['supplier', 'business'] });
+  brainMod.ingestNote({ title: 'Contacts in the building trade', content: 'Who supplies building materials around here? A ballast vendor I know, a steel stockist, and a hardware shop that delivers to contractors — and he sells by the truckload.', source: 'test', kind: 'note', tags: ['contacts'] });
+  brainMod.ingestNote({ title: 'Sprint review notes', content: 'Weekly review of the release plan, the KPIs and the blockers for the platform team.', source: 'test', kind: 'note', tags: ['work'] });
+  brainMod.buildIndex();
+  const paraQuery = 'who do I know that sells cement?';
+  const noteDocs = (await get('/api/notes')).json || [];
+  const docVecs = new Map(noteDocs.map(n => [n.id, embMod.fallbackVector(`${n.title}\n${n.content}`)]));
+  const blended = brainMod.blendSearch(paraQuery, { queryVector: embMod.fallbackVector(paraQuery), docVectors: docVecs, limit: 10 });
+  const rankOf = (re) => blended.findIndex(h => re.test(h.title || ''));
+  check('the blend ranks the exact-term supplier note first', rankOf(/cement supplier/i) === 0, JSON.stringify(blended.map(h => h.title)));
+  check('a paraphrased note still ranks above an unrelated one', (() => {
+    const para = rankOf(/building trade/i), unrel = rankOf(/sprint review/i);
+    return para >= 0 && (unrel === -1 || para < unrel);
+  })(), JSON.stringify(blended.map(h => [h.title, h.blended])));
+  check('every blended hit carries lexical + semantic evidence', blended.length > 0 && blended.every(h => typeof h.score === 'number' && typeof h.bm25 === 'number' && typeof h.semantic === 'number' && typeof h.blended === 'number'));
+  check('blended ranking is 0.5·lexical + 0.5·semantic', brainMod.blendScore(1, 1) === 1 && brainMod.blendScore(1, 0) === 0.5 && brainMod.blendScore(0, 1) === 0.5 && brainMod.blendScore(0, 0) === 0);
+  check('cosineSimilarity: identical text → 1.0', Math.abs(embMod.cosineSimilarity(embMod.fallbackVector('cement supplier'), embMod.fallbackVector('cement supplier')) - 1) < 1e-9);
+  check('cosineSimilarity: unrelated text is far below 1.0', embMod.cosineSimilarity(embMod.fallbackVector('cement supplier'), embMod.fallbackVector('sprint planning blockers')) < 0.6);
+  check('cosineSimilarity guards mismatched/empty vectors', embMod.cosineSimilarity([1, 2], [1]) === 0 && embMod.cosineSimilarity(null, [1]) === 0);
+  check('offline search stays lexical (semantic 0, score = BM25)', (() => {
+    const plain = brainMod.search('cement supplier', 5);
+    return plain.length > 0 && plain.every(h => h.semantic === 0 && h.score === h.bm25);
+  })());
+  check('primeEmbeddings is a silent no-op without a backend', (await brainMod.primeEmbeddings({ force: false })).primed === 0);
+  check('searchAsync still answers with no LLM/embedding backend', Array.isArray(await brainMod.searchAsync('cement', 5)));
+  check('notes are never polluted with fallback vectors offline', ((await get('/api/notes')).json || []).every(n => !Array.isArray(n.embedding)));
+  const hybridRoute = (await get('/api/search?q=' + encodeURIComponent('cement supplier'))).json || [];
+  check('GET /api/search returns hybrid evidence (score + semantic + blended)', Array.isArray(hybridRoute) && hybridRoute.length > 0 && hybridRoute.every(h => typeof h.score === 'number' && typeof h.semantic === 'number' && typeof h.blended === 'number'), JSON.stringify(hybridRoute[0] || {}).slice(0, 140));
+  check('GET /api/search still finds the supplier note offline', hybridRoute.some(h => /cement supplier/i.test(h.title || '')));
+
+  console.log('\n[3j] LLM providers — cloud optional, offline always safe');
+  const norm = cfgMod.normalize({});
+  check('DEFAULTS: voiceGender is male', norm.voiceGender === 'male', String(norm.voiceGender));
+  check('DEFAULTS: the cloud provider block is present and keyless', norm.llm.openai.baseUrl === 'https://api.openai.com/v1' && norm.llm.openai.model === 'gpt-4o-mini' && norm.llm.openai.apiKey === '');
+  check('DEFAULTS: a stronger local model is recommended', /qwen2\.5|llama3\.1/i.test(norm.llm.recommendedModel), String(norm.llm.recommendedModel));
+  check('DEFAULTS: provider still defaults to auto', norm.llm.provider === 'auto');
+  check('/api/state exposes the voice-gender default', ((await get('/api/state')).json || {}).voiceGender === 'male', String(((await get('/api/state')).json || {}).voiceGender));
+  check('/api/settings exposes the voice-gender default', ((await get('/api/settings')).json || {}).voiceGender === 'male');
+  check('normalize() clamps an unknown provider to auto', cfgMod.normalize({ llm: { provider: 'wat' } }).llm.provider === 'auto');
+  check('normalize() clamps an unknown voiceGender to male', cfgMod.normalize({ voiceGender: 'robot' }).voiceGender === 'male');
+  check('normalize() keeps an explicit female voice', cfgMod.normalize({ voiceGender: 'female' }).voiceGender === 'female');
+  check('normalize() fills a partial openai block', (() => {
+    const c = cfgMod.normalize({ llm: { openai: { apiKey: 'sk-x' } } });
+    return c.llm.openai.apiKey === 'sk-x' && c.llm.openai.baseUrl === 'https://api.openai.com/v1' && c.llm.openai.model === 'gpt-4o-mini';
+  })());
+  check('no cloud key + no Ollama → nothing to try (stays offline)', llmMod.resolveProviders(cfgMod.normalize({ llm: { provider: 'auto' } }), { openai: true, ollama: false }).length === 0);
+  check('a cloud key puts the cloud provider first', JSON.stringify(llmMod.resolveProviders(cfgMod.normalize({ llm: { provider: 'auto', openai: { apiKey: 'sk-test' } } }), { openai: true, ollama: true })) === '["openai","ollama"]');
+  check('provider "openai" without a key falls through to offline', llmMod.resolveProviders(cfgMod.normalize({ llm: { provider: 'openai' } }), { ollama: false }).length === 0);
+  check('provider "offline" never calls a model', llmMod.resolveProviders(cfgMod.normalize({ llm: { provider: 'offline' } }), { openai: true, ollama: true }).length === 0);
+  check('provider "ollama" is honoured even when unreachable', JSON.stringify(llmMod.resolveProviders(cfgMod.normalize({ llm: { provider: 'ollama' } }), { ollama: false })) === '["ollama"]');
+  process.env.OPENAI_API_KEY = 'sk-test-NEVER-LOG-ME-1234567890';
+  check('OPENAI_API_KEY is read from the environment', llmMod.openaiConfigured(cfgMod.normalize({})) === true);
+  const aiStatus = llmMod.llmStatus();
+  check('llmStatus reports the cloud provider WITHOUT leaking the key', aiStatus.openai && aiStatus.openai.configured === true && !JSON.stringify(aiStatus).includes('NEVER-LOG-ME'), JSON.stringify(aiStatus).slice(0, 160));
+  check('GET /api/ai/status never exposes an api key', !JSON.stringify((await get('/api/ai/status')).json || {}).includes('NEVER-LOG-ME'));
+  delete process.env.OPENAI_API_KEY;
+  const fallThrough = await llmMod.llmChat('You are ARIA.', 'hello there', [], asstMod.TOOL_DEFS);
+  check('llmChat falls through to offline without throwing', !!fallThrough && fallThrough.text === null && fallThrough.engine === 'offline', JSON.stringify(fallThrough));
+  check('llmChat reports that the tool pass was requested', fallThrough.tools === true);
+  check('llmChat without tools also degrades to offline', (await llmMod.llmChat('sys', 'user')).engine === 'offline');
+  check('the assistant still answers with no model at all', /aria|priorit|task|hello|schedule|brain|web/i.test((await post('/api/assistant', { message: 'what are my priorities?' })).json.reply || ''));
+
+  console.log('\n[3k] Context pack & rolling conversation summary');
+  const cp = brainMod.contextPack('what is my schedule tomorrow');
+  check('contextPack keeps TODAY & UPCOMING', /TODAY & UPCOMING/i.test(cp) && /upcoming/i.test(cp));
+  check('contextPack now includes tomorrow explicitly', /== TOMORROW/i.test(cp) && cp.includes(tomorrowKey));
+  check('contextPack includes the last 3 conversation turns', /== LAST 3 TURNS ==/i.test(cp));
+  check('contextPack keeps the priority sections', /PRIORITY EMAILS/i.test(cp) && /PRIORITY MESSAGES/i.test(cp) && /OPEN ACTION ITEMS/i.test(cp));
+  check('contextPack survives a null LLM (built synchronously)', typeof cp === 'string' && cp.length > 80);
+  check('contextPack times are the owner\'s local times', /10:00–10:30 \[Work\] Team Standup/.test(cp), cp.split('\n').filter(l => /Standup/.test(l)).join(' | '));
+  const dbNow = dbMod.load();
+  const convNow = asstMod.convState(dbNow);
+  check('respond() rolled a summary on its own after 12+ turns', typeof convNow.summary === 'string' && convNow.summary.length > 20, String(convNow.summary).slice(0, 120));
+  check('the summary is prepended to the context pack', /CONVERSATION SO FAR/i.test(cp));
+  check('secrets are redacted out of the persisted summary', !/4821|sk-live/i.test(convNow.summary || ''), String(convNow.summary).slice(0, 160));
+  /* Force the next window so the rolling behaviour itself is exercised. */
+  convNow.lastSummaryTurn = Math.max(0, (dbNow.chats || []).length - asstMod.SUMMARY_EVERY);
+  const summary = await asstMod.rollConversationSummary(dbNow);
+  check('a rolling summary is written once 12 turns accumulate', typeof summary === 'string' && summary.length > 20, String(summary).slice(0, 120));
+  check('the summary is persisted on db.meta.conversation', ((dbNow.meta || {}).conversation || {}).summary === summary);
+  check('the summary records people, topics and decisions without an LLM', /People:/i.test(summary) && /Topics:/i.test(summary) && /(Done\/scheduled|Last asked)/i.test(summary), summary.slice(0, 160));
+  check('the freshly rolled summary replaces the previous one', /CONVERSATION SO FAR/i.test(brainMod.contextPack('anything')) && convNow.summary === summary);
+  check('it does not re-summarise before another 12 turns', (await asstMod.rollConversationSummary(dbNow)) === null);
+  check('heuristicSummary never throws on an empty conversation', typeof asstMod.heuristicSummary([]) === 'string' && asstMod.heuristicSummary([]).length > 10);
+
   console.log('\n[4] Frontend render (jsdom)');
   const errors = [];
   const vc = new VirtualConsole();
@@ -411,6 +650,162 @@ function check(name, cond, detail) {
   check('hub card routes the mission to the swarm', w.location.hash === '#/agency');
   await sleep(1200);
 
+  console.log('\n[5c] Voice gender — ARIA sounds male by default (Issue 2)');
+  /* jsdom has no real speechSynthesis voices, so the picker is unit-tested with a fake list. */
+  const fakeVoices = [
+    { name: 'Microsoft Zira', lang: 'en-US' },
+    { name: 'Microsoft David', lang: 'en-US' },
+    { name: 'Google UK English Female', lang: 'en-GB' },
+    { name: 'Daniel', lang: 'en-GB' },
+    { name: 'Amélie', lang: 'fr-FR' }
+  ];
+  const voice = w.AriaSpeech;
+  check('pickVoice is exported for tests', typeof voice.pickVoice === 'function' && typeof w.AriaPickVoice === 'function');
+  check('localStorage aria.voiceGender defaults to "male"', w.localStorage.getItem('aria.voiceGender') === 'male', String(w.localStorage.getItem('aria.voiceGender')));
+  check('Speech.gender() defaults to male', voice.gender() === 'male');
+  check('pickVoice(male) chooses the MALE voice', voice.pickVoice(fakeVoices, 'male').name === 'Microsoft David', voice.pickVoice(fakeVoices, 'male') && voice.pickVoice(fakeVoices, 'male').name);
+  check('pickVoice(female) chooses the FEMALE voice', voice.pickVoice(fakeVoices, 'female').name === 'Microsoft Zira', voice.pickVoice(fakeVoices, 'female') && voice.pickVoice(fakeVoices, 'female').name);
+  check('the male picker ignores French voices and stays English', /^en/i.test(voice.pickVoice(fakeVoices, 'male').lang));
+  check('voiceGenderOf names a known male/female voice', voice.voiceGenderOf('Microsoft David') === 'male' && voice.voiceGenderOf('Microsoft Zira') === 'female');
+  check('voiceGenderOf returns null for a neutral name', voice.voiceGenderOf('Some Neutral Voice') === null);
+  check('a neutral voice is still chosen (pitch carries the gender)', voice.pickVoice([{ name: 'Some Neutral Voice', lang: 'en-US' }], 'male').name === 'Some Neutral Voice');
+  check('pickVoice returns null when the device has no voices', voice.pickVoice([], 'male') === null && voice.pickVoice(null, 'female') === null);
+  check('setGender switches the stored preference at once', voice.setGender('female') === 'female' && w.localStorage.getItem('aria.voiceGender') === 'female');
+  check('the picker follows the switch with no argument', voice.pickVoice(fakeVoices).name === 'Microsoft Zira');
+  check('setGender drops the cached voice so prime() re-picks', voice._voice === null);
+  voice.setGender('male');
+  check('setGender back to male is honoured', voice.gender() === 'male' && voice.pickVoice(fakeVoices).name === 'Microsoft David');
+
+  /* Settings UI: the select lives in the Install · Sound · Notifications card. */
+  w.location.hash = '#/settings';
+  w.dispatchEvent(new w.HashChangeEvent('hashchange'));
+  await sleep(800);
+  const sel = w.document.getElementById('s-voice-gender');
+  check('Settings renders the "ARIA\'s voice" select', !!sel && sel.tagName === 'SELECT');
+  check('the select offers Male and Female', !!sel && [...sel.options].map(o => o.value).join(',') === 'male,female', sel && [...sel.options].map(o => o.value).join(','));
+  check('the select defaults to Male', !!sel && sel.value === 'male');
+  check('a voice preview button sits next to the select', !!w.document.getElementById('btn-test-voice') && /Test ARIA's voice/i.test(w.document.getElementById('btn-test-voice').textContent));
+  check('the voice card explains the choice', /voice/i.test((w.document.getElementById('voice-gender-hint') || {}).textContent || ''));
+  check('the AI engine card offers the cloud provider', (() => {
+    const p = w.document.getElementById('s-provider');
+    return !!p && [...p.options].some(o => o.value === 'openai');
+  })());
+  check('the AI engine card exposes cloud base URL / key / model', !!w.document.getElementById('s-oai-url') && !!w.document.getElementById('s-oai-key') && !!w.document.getElementById('s-oai-model'));
+  check('the cloud key field is a password input', (w.document.getElementById('s-oai-key') || {}).type === 'password');
+  check('Settings recommends a stronger local model', /qwen2\.5:7b|llama3\.1:8b/i.test(w.document.getElementById('main').innerHTML));
+
+  /* Changing the select is instant on this device; Save all persists it server-side. */
+  sel.value = 'female';
+  sel.dispatchEvent(new w.Event('change'));
+  await sleep(200);
+  check('changing the select updates localStorage immediately', w.localStorage.getItem('aria.voiceGender') === 'female');
+  check('Speech.gender() follows the select', voice.gender() === 'female');
+  w.document.getElementById('set-save').click();
+  await sleep(1000);
+  const savedFemale = (await get('/api/settings')).json || {};
+  check('Save all persists voiceGender server-side', savedFemale.voiceGender === 'female', String(savedFemale.voiceGender));
+  check('settings expose the cloud LLM block', !!savedFemale.llm && !!savedFemale.llm.openai && savedFemale.llm.openai.baseUrl === 'https://api.openai.com/v1' && savedFemale.llm.openai.model === 'gpt-4o-mini');
+  w.location.hash = '#/settings';
+  w.dispatchEvent(new w.HashChangeEvent('hashchange'));
+  await sleep(800);
+  check('the saved choice is rendered back on reload', (w.document.getElementById('s-voice-gender') || {}).value === 'female');
+  const sel2 = w.document.getElementById('s-voice-gender');
+  sel2.value = 'male';
+  sel2.dispatchEvent(new w.Event('change'));
+  w.document.getElementById('set-save').click();
+  await sleep(1000);
+  check('the voice choice is reversible', (await get('/api/settings')).json.voiceGender === 'male' && w.localStorage.getItem('aria.voiceGender') === 'male');
+  console.log('\n[6] Tool-calling loop end-to-end (mock model server)');
+  /* A fake Ollama that answers with a tool call for one phrasing and with plain prose for
+     another. ARIA must (a) EXECUTE the tool for real and reply with the record it wrote, and
+     (b) write nothing when the model only talks — no invented confirmations. */
+  const utilMod = require('../server/util');
+  const keyForDow = (dow) => {
+    const [y, mo, d] = todayKeyNow.split('-').map(Number);
+    for (let i = 1; i <= 7; i++) {
+      const dt = new Date(Date.UTC(y, mo - 1, d + i));
+      if (dt.getUTCDay() === dow) return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`;
+    }
+    return null;
+  };
+  const satKey = keyForDow(6);
+  const satIso = new Date(utilMod.zonedTime(satKey, 9, 0, ARIA_TZ)).toISOString();
+  let mockSawToolSchema = false, mockSawContext = false, mockSawHistory = false;
+  const mock = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      res.setHeader('content-type', 'application/json');
+      if (req.url === '/api/tags') return res.end(JSON.stringify({ models: [{ name: 'mock-tool-model' }] }));
+      let payload = {};
+      try { payload = JSON.parse(body || '{}'); } catch (_) {}
+      const msgs = payload.messages || [];
+      const last = String((msgs[msgs.length - 1] || {}).content || '');
+      /* Did ARIA hand the model the tool schema? (system prompt is msgs[0]) */
+      const system = String((msgs[0] || {}).content || '');
+      if (/TOOLS — you can ACT/.test(system) && /create_event/.test(system) && /plan_day/.test(system)) mockSawToolSchema = true;
+      if (/CONTEXT:/.test(last) && /CURRENT TIME:/.test(last)) mockSawContext = true;
+      if (msgs.length > 2) mockSawHistory = true;
+      let content;
+      if (/water heater/i.test(last)) {
+        content = '```json\n{"tool":"create_event","args":{"title":"Plumber — water heater repair","startISO":"' + satIso + '","context":"day-job"}}\n```';
+      } else if (/add a task to chase the cement quote/i.test(last)) {
+        content = '{"tool":"add_task","args":{"title":"Chase the cement quote","priority":"high"}}';
+      } else {
+        content = 'Here is a plain prose answer — no action was requested, so no tool call.';
+      }
+      res.end(JSON.stringify({ message: { role: 'assistant', content } }));
+    });
+  });
+  await new Promise((r) => mock.listen(0, '127.0.0.1', r));
+  const mockUrl = `http://127.0.0.1:${mock.address().port}`;
+  const settingsBeforeMock = (await get('/api/settings')).json || {};
+  await post('/api/settings', { llm: { provider: 'ollama', ollamaUrl: mockUrl, model: 'mock-tool-model' } });
+  llmMod._reset();
+  check('the mock model is detected as a live provider', (await llmMod.checkOllama()) === true && llmMod.llmStatus().activeEngine === 'ollama');
+  check('the tool schema is described to the model', /create_event/.test(llmMod.toolPrompt(asstMod.TOOL_DEFS)) && /ONLY a compact JSON object/i.test(llmMod.toolPrompt(asstMod.TOOL_DEFS)));
+
+  const evBeforeMock = await evList();
+  const chatty = await post('/api/assistant', { message: 'tell me a joke about plumbers' });
+  check('a plain model answer is passed through as chat', chatty.status === 200 && /^ollama:/.test((chatty.json || {}).engine || ''), (chatty.json || {}).engine);
+  check('chat answers write nothing to the calendar', (await evList()).length === evBeforeMock.length);
+
+  const acted = await post('/api/assistant', { message: 'could you get the water heater fixed on saturday at 9am' });
+  const actedJson = acted.json || {};
+  check('an unfamiliar phrasing is routed through the tool pass', /^tool:ollama/.test(actedJson.engine || ''), actedJson.engine);
+  check('the response names the tool that ran', actedJson.tool === 'create_event', JSON.stringify(actedJson.tool));
+  check('the reply is the REAL confirmation', /Scheduled/i.test(actedJson.reply || '') && /Plumber — water heater repair/.test(actedJson.reply || ''), actedJson.reply);
+  const heater = (await evList()).filter(e => /water heater/i.test(e.title || ''));
+  check('the tool call actually wrote the event', heater.length === 1, JSON.stringify(heater.map(e => e.title)));
+  const heaterOnSat = heater.length === 1 && dk(heater[0].start, ARIA_TZ) === satKey;
+  check('the written event honours the model\'s ISO day (Saturday)', heaterOnSat, heater.length ? `${dk(heater[0].start, ARIA_TZ)} ${wallTime(heater[0].start)}` : 'none');
+  /* Hour-independent: 09:00 is kept unless a REAL entry already owned it, in which case ARIA
+     books the next free slot and says so in the reply. */
+  check('the written event honours 09:00 — or moved off a real clash and said so',
+    heaterOnSat && (wallTime(heater[0].start) === '09:00' || /already taken|instead/i.test(actedJson.reply || '')),
+    heaterOnSat ? `${wallTime(heater[0].start)} | ${(actedJson.reply || '').slice(-110)}` : 'none');
+  check('the tool-written event does not overlap anything else that day', heaterOnSat
+    && !(await evList()).some(o => o.id !== heater[0].id && heater[0].start < (o.end || o.start + 36e5) && o.start < heater[0].end),
+    JSON.stringify((await evList()).filter(e => dk(e.start, ARIA_TZ) === satKey).map(e => [wallTime(e.start), e.title])));
+  check('the event was tagged as coming from a tool call', heater.length === 1 && heater[0].source === 'assistant-tool', heater.length ? heater[0].source : 'none');
+  check('the mutation was persisted (db.events on disk/in store)', (await get('/api/events')).json.some(e => /water heater/i.test(e.title || '')));
+
+  const tasksBeforeMock = ((await get('/api/tasks')).json || []).length;
+  const taskTool = await post('/api/assistant', { message: 'add a task to chase the cement quote' });
+  const tasksAfterMock = (await get('/api/tasks')).json || [];
+  check('add_task via the model writes a real task', /Task Added/i.test((taskTool.json || {}).reply || '') && tasksAfterMock.length === tasksBeforeMock + 1 && tasksAfterMock.some(t => /cement quote/i.test(t.title)), (taskTool.json || {}).reply);
+
+  const recallTool = await post('/api/assistant', { message: 'what is my schedule on saturday' });
+  check('conversation memory: the tool-created event is recallable', /water heater/i.test((recallTool.json || {}).reply || ''), ((recallTool.json || {}).reply || '').slice(0, 140));
+
+  /* Restore the offline default so the rest of the suite runs exactly as before. */
+  await new Promise((r) => mock.close(r));
+  await post('/api/settings', { llm: { provider: settingsBeforeMock.llm.provider, ollamaUrl: settingsBeforeMock.llm.ollamaUrl, model: settingsBeforeMock.llm.model, openai: settingsBeforeMock.llm.openai } });
+  llmMod._reset();
+  check('the engine falls back to offline once the model is gone', (await llmMod.llmChat('sys', 'user')).engine === 'offline');
+  check('the model really received the tool schema in its system prompt', mockSawToolSchema === true);
+  check('the model really received the context pack + current time', mockSawContext === true);
+  check('the model really received the conversation history', mockSawHistory === true);
   const chip = w.document.getElementById('engine-chip');
   check('sidebar engine chip updated', /engine|LLM/i.test((chip && chip.textContent) || ''), (chip && chip.textContent) || '');
   check('no console errors during render', errors.length === 0, errors.slice(0, 5).join(' | '));

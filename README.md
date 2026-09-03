@@ -22,7 +22,9 @@ Installed, it runs full-screen, works **offline** (your latest brief stays reada
 
 ## 🔊 Sound & voice
 
-ARIA talks — a real voice greeting plays with your fresh morning brief, priority items announce themselves with a chime + voice, task completions chirp, sends pop. Mute with the **🔊 button** in the sidebar (per-device, remembered). Test the voice anytime: **Settings → Install · Sound · Notifications → Test ARIA's voice**.
+ARIA talks — a real voice greeting plays with your fresh morning brief, priority items announce themselves with a chime + voice, task completions chirp, sends pop. Mute with the **🔊 button** in the sidebar (per-device, remembered).
+
+**Whose voice?** Settings → *Install · Sound · Notifications* → **ARIA's voice** picks a **Male** (default) or **Female** voice, and **▶ Test ARIA's voice** previews it straight away. The choice is stored twice: in `localStorage 'aria.voiceGender'` (instant, per device) and in `settings.voiceGender` (the default a new device adopts). Voice names differ per OS, so ARIA looks for explicitly male voices first (Daniel, Alex, David, Mark, Guy, Fred, Thomas, George, Oliver, Liam, Rishi, Google UK English Male…), keeps the female list for the other setting, and — when a device only offers neutral names — drops the pitch to 0.85 (male) or raises it to 1.05 (female) so ARIA still sounds right.
 
 ## 🔔 Morning notifications on your lock screen
 
@@ -36,10 +38,10 @@ Install the app, then **Settings → Enable morning notifications**. At wake tim
 | **📅 Calendar** | Google Calendar + Outlook + personal — one unified timeline. |
 | **📥 Inbox** | Gmail + Outlook unified, priority-scored, auto-tagged *work* vs *business*. |
 | **💬 Messages** | Slack + WhatsApp in one feed. |
-| **🧠 Second Brain** | An ever-evolving library. It **automatically captures** priority emails, important messages, every brief and a rolling day-log — then indexes everything (BM25) so you can ask *"what do I know about ___?"*. Capture anything manually too. |
+| **🧠 Second Brain** | An ever-evolving library. It **automatically captures** priority emails, important messages, every brief and a rolling day-log — then indexes everything with **hybrid retrieval** (BM25 + embeddings, 50/50) so you can ask *"what do I know about ___?"* in your own words. Capture anything manually too. |
 | **🎯 Action items** | Asks inside emails/messages ("by Friday", "please send", invoices…) become trackable tasks automatically. |
-| **🤖 Executive Assistant** | Chat that reasons over your **real** schedule, inbox, messages and brain — and **remembers the conversation**: follow-ups like *"what about tomorrow?"* and *"add another one for Friday"* just work, with people and topics carried across turns. |
-| **🗓️ Autonomous Scheduler** | Say *"plan my day tomorrow"*, *"build a weekly plan"* or *"organize this week"* and ARIA drafts a full calendar around your rhythm — wake-up brief, 2-hour deep-work blocks for high-priority tasks, a meeting window that never double-books, morning & end-of-day inbox triage, business vs day-job blocks, 15-minute buffers — then refines on command (*"move the standup to 10am"*, *"remove the inbox triage"*, *"confirm the plan"*). |
+| **🤖 Executive Assistant** | Chat that reasons over your **real** schedule, inbox, messages and brain — and **remembers the conversation**: follow-ups like *"what about tomorrow?"* and *"add another one for Friday"* just work, with people and topics carried across turns, plus a **rolling summary** every 12 turns so memory outlives the 10-turn window. Ask in plain words (*"can you set up a call with the client tomorrow at 11"*) and it **acts**: with a model reachable it tool-calls `create_event`, `add_task`, `complete_task`, `search_calendar`, `search_brain`, `web_search` and `plan_day`, then confirms with the record it really wrote. |
+| **🗓️ Autonomous Scheduler** | Say *"plan my day tomorrow"*, *"build a weekly plan"* or *"organize this week"* and ARIA drafts a full calendar around your rhythm — wake-up brief, 2-hour deep-work blocks for high-priority tasks, a meeting window that never double-books, morning & end-of-day inbox triage, business vs day-job blocks, 15-minute buffers — each block fitted into the gaps your real calendar actually leaves (a busy morning shrinks a focus block instead of collapsing the plan) — then refines on command (*"move the standup to 10am"*, *"remove the inbox triage"*, *"confirm the plan"*). |
 | **🤖 Agency Swarm** | ARIA becomes your **Executive Chief of Staff**: hand her a complex, multi-step mission and she decomposes it and delegates to background specialists — **ResearcherAgent** (second brain + web), **AnalystAgent** (priorities, inbox, financial records), **CopywriterAgent** (emails, proposals, daily summaries) — then signs off one executive report. Every step is replayed live in the UI. |
 | **🔌 Connectors** | Opt-in **demo mode** + real adapters: **Gmail/Google Calendar**, **Outlook**, **Slack** (works with a token today), **WhatsApp Business Cloud API** + a universal `/api/ingest` endpoint (iOS Shortcuts, Zapier, n8n…). |
 
@@ -104,10 +106,40 @@ ARIA's brain runs on **Ollama** — free and fully on-device:
 
 ```bash
 # install from https://ollama.com then:
-ollama pull llama3.1
+ollama pull qwen2.5:7b        # recommended: best reasoning on ~8 GB of RAM
+# ollama pull llama3.1:8b     # solid alternative
+ollama pull nomic-embed-text  # optional: turns on SEMANTIC memory (see below)
 ```
 
-That's it. ARIA detects it automatically (Settings → AI Engine). Until then, the built-in **offline engine** answers using intent routing + retrieval over your real data.
+That's it. ARIA detects it automatically (Settings → AI engine). Until then, the built-in **offline engine** answers using intent routing + retrieval over your real data — nothing stops working.
+
+### ☁️ Optional cloud provider (off by default)
+
+Settings → AI engine → *Provider* also accepts **Cloud (OpenAI-compatible)**. Paste a base URL, key and model (`gpt-4o-mini` by default) — or export `OPENAI_API_KEY` — and ARIA prefers the cloud model, falling back to Ollama and then to the offline engine. Any OpenAI-compatible endpoint works (OpenAI, Groq, OpenRouter, a local vLLM). The key is never logged and is never returned by `/api/ai/status`; with no key the provider is never contacted. On small hardware this single switch is the biggest intelligence jump available.
+
+### 🛠️ Tool calling — ARIA can *act*, not only chat
+
+With a model reachable, **every** message the deterministic layer does not recognise is offered to the model with a tool schema. When the model answers `{"tool":"create_event","args":{…}}` ARIA **executes it** through the same internal functions the intent layer uses and replies with the record it actually wrote — so a confirmation is never invented. Tools: `create_event`, `add_task`, `complete_task`, `search_calendar`, `search_brain`, `web_search`, `plan_day`. Unknown tools are never executed and invalid arguments (empty title, unparseable date) write nothing.
+
+### 🧠 Semantic memory
+
+The second brain is a **hybrid retriever**: BM25 lexical scoring blended 50/50 with cosine similarity over embeddings (`server/embeddings.js`). Notes are embedded lazily, once, and cached on the note — but only when an embedding backend is reachable, so without Ollama the brain stays purely lexical and just as fast. That is what makes a paraphrase land: *"who do I know that sells cement?"* now finds the supplier note even when it shares no keywords.
+
+### 🗣️ Say it however you like
+
+The intent layer strips politeness and filler (*"can you"*, *"could you"*, *"please"*, *"hey ARIA"*, *"I want to"*, *"I'd like to"*, *"let's"*) and the scheduling verbs cover *book / set up / arrange / organize / create / make / new / add*, so all of these create a real calendar entry:
+
+```text
+can you schedule a meeting with Kamau tomorrow at 2pm
+please schedule lunch with Amina on Friday
+add a meeting with the supplier at 3pm
+set up a call with the client tomorrow at 11
+book a meeting with Kamau tomorrow
+```
+
+Dates are parsed in **your** timezone (`tomorrow at 2pm`, `on Friday`, `next monday at 10am`, `tonight 8`), and when you name a day but no hour ARIA takes the **first free slot** in your working hours instead of double-booking you (lunch lands at 12:30, not 08:00).
+
+She never double-books a real commitment either: if the hour you asked for is already taken, she books the next free slot and **tells you** which entry owned it (*“Heads up — 14:00 was already taken by …, so I booked 15:00 instead”*). Her own unconfirmed plan blocks are only suggestions, so they step aside for something you actually asked for. `"move it to 14:00"` still forces the exact slot when you insist.
 
 ## ☀️ Morning brief delivery
 
@@ -130,16 +162,18 @@ server/
   index.js        API + static hosting (port 3000)
   scheduler.js    cron: brief at wake time, sync every 30 min
   brief.js        morning brief composer (weather via open-meteo, fail-safe)
-  brain.js        second brain: auto-capture, topics, tasks, BM25 search
-  assistant.js    executive assistant (Ollama or offline engine)
+  brain.js        second brain: auto-capture, topics, tasks, hybrid search (BM25 + embeddings)
+  assistant.js    executive assistant: intent routing · tool calling · planner · discretion
+  embeddings.js   embedding adapter (Ollama) + cosine similarity + TF-IDF fallback vector
   agency.js       Agency Swarm orchestrator (sequential / parallel waves, run history)
   agents/         director · researcher · analyst · copywriter (zero-dependency agents)
-  llm.js          local-LLM adapter
+  llm.js          model adapter: cloud (OpenAI-compatible) → Ollama → offline, tool prompts
   email.js        SMTP brief delivery
   db.js           tiny JSON persistence (data/state.json)
+  config.js       settings document: DEFAULTS + normalize() (serverless-safe writes)
   connectors/     demo · google · microsoft · slack · whatsapp
 public/           dashboard SPA (no build step)
-scripts/          oauth-google helper
+scripts/          oauth-google helper · test-app.js verification suite (`npm test`)
 data/             your everything (gitignored — it IS your brain)
 ```
 

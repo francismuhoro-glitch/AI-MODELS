@@ -93,6 +93,7 @@ function buildState() {
     rhythm: cfg.rhythm,
     timezone: tz,
     wakeTime: cfg.wakeTime,
+    voiceGender: cfg.voiceGender || 'male',
     engine,
     llm: engine,
     activeEngine: engine.activeEngine || 'offline',
@@ -353,9 +354,14 @@ api.delete('/notes/:id', async (req, res) => {
   } catch (e) { fail(res, e); }
 });
 
-api.get('/search', (req, res) => {
-  try { ok(res, arr(brain.search(req.query.q || '', 10))); }
-  catch (e) { fail(res, e, []); }
+api.get('/search', async (req, res) => {
+  /* Hybrid search: lexical BM25 blended with embeddings when an embedding backend is live.
+     Offline it degrades to exactly the old lexical behaviour. */
+  try { ok(res, arr(await brain.searchAsync(req.query.q || '', 10))); }
+  catch (_) {
+    try { ok(res, arr(brain.search(req.query.q || '', 10))); }
+    catch (e) { fail(res, e, []); }
+  }
 });
 
 /* ---------------- briefs ---------------- */
