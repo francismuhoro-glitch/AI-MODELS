@@ -40,10 +40,10 @@ Install the app, then **Settings → Enable morning notifications**. At wake tim
 | **💬 Messages** | Slack + WhatsApp in one feed. |
 | **🧠 Second Brain** | An ever-evolving library. It **automatically captures** priority emails, important messages, every brief and a rolling day-log — then indexes everything with **hybrid retrieval** (BM25 + embeddings, 50/50) so you can ask *"what do I know about ___?"* in your own words. Capture anything manually too. |
 | **🎯 Action items** | Asks inside emails/messages ("by Friday", "please send", invoices…) become trackable tasks automatically. |
-| **🤖 Executive Assistant** | Chat that reasons over your **real** schedule, inbox, messages and brain — and **remembers the conversation**: follow-ups like *"what about tomorrow?"* and *"add another one for Friday"* just work, with people and topics carried across turns, plus a **rolling summary** every 12 turns so memory outlives the 10-turn window. Ask in plain words (*"can you set up a call with the client tomorrow at 11"*) and it **acts**: with a model reachable it tool-calls `create_event`, `add_task`, `complete_task`, `search_calendar`, `search_brain`, `web_search` and `plan_day`, then confirms with the record it really wrote. |
+| **⏰ Alarms & reminders** | Browser-notification alarms (one-shot, recurring, snooze, cancel) and reminders — never confused with calendar events, and **never claimed as a phone/OS device alarm** (the web platform cannot create one). Times are parsed in **Africa/Nairobi**. Ambiguous times ask before creating. |
 | **🗓️ Autonomous Scheduler** | Say *"plan my day tomorrow"*, *"build a weekly plan"* or *"organize this week"* and ARIA drafts a full calendar around your rhythm — wake-up brief, 2-hour deep-work blocks for high-priority tasks, a meeting window that never double-books, morning & end-of-day inbox triage, business vs day-job blocks, 15-minute buffers — each block fitted into the gaps your real calendar actually leaves (a busy morning shrinks a focus block instead of collapsing the plan) — then refines on command (*"move the standup to 10am"*, *"remove the inbox triage"*, *"confirm the plan"*). |
 | **🤖 Agency Swarm** | ARIA becomes your **Executive Chief of Staff**: hand her a complex, multi-step mission and she decomposes it and delegates to background specialists — **ResearcherAgent** (second brain + web), **AnalystAgent** (priorities, inbox, financial records), **CopywriterAgent** (emails, proposals, daily summaries) — then signs off one executive report. Every step is replayed live in the UI. |
-| **🔌 Connectors** | Opt-in **demo mode** + real adapters: **Gmail/Google Calendar**, **Outlook**, **Slack** (works with a token today), **WhatsApp Business Cloud API** + a universal `/api/ingest` endpoint (iOS Shortcuts, Zapier, n8n…). |
+| **🔌 Connectors** | Opt-in **demo mode** + real adapters: **Gmail/Google Calendar** (OAuth, `gmail.readonly` + `calendar.readonly`), **Outlook** (pasted Graph token), **Slack**, **WhatsApp Business Cloud API** (official only — never WhatsApp Web scraping), **Telegram bot**, **SMTP**, optional **SMS local-device bridge**. Default is **disabled**. Statuses: connected / configured-not-authorized / expired / disabled / unavailable. |
 
 ## 🚀 Run it
 
@@ -119,7 +119,28 @@ Settings → AI engine → *Provider* also accepts **Cloud (OpenAI-compatible)**
 
 ### 🛠️ Tool calling — ARIA can *act*, not only chat
 
-With a model reachable, **every** message the deterministic layer does not recognise is offered to the model with a tool schema. When the model answers `{"tool":"create_event","args":{…}}` ARIA **executes it** through the same internal functions the intent layer uses and replies with the record it actually wrote — so a confirmation is never invented. Tools: `create_event`, `add_task`, `complete_task`, `search_calendar`, `search_brain`, `web_search`, `plan_day`. Unknown tools are never executed and invalid arguments (empty title, unparseable date) write nothing.
+With a model reachable, **every** message the deterministic layer does not recognise is offered to the model with a tool schema. When the model answers `{"tool":"create_event","args":{…}}` ARIA **executes it** through the same internal functions the intent layer uses and replies with the record it actually wrote — so a confirmation is never invented. Native OpenAI-compatible tool calling (`role: tool`, bounded iterations, one retry, `parseToolCall` fallback) is preserved; extra hub tools are appended to the same schema. Tools: `create_event`, `add_task`, `complete_task`, `search_calendar`, `search_brain`, `web_search`, `plan_day`, plus `create_alarm` / `list_alarms` / `snooze_alarm` / `cancel_alarm`, `create_reminder` / `list_reminders`, `draft_message` / `send_message` / `list_messages` / `read_message` / `mark_message_read`, `play_music` / `pause_music` / `resume_music` / `skip_track` / `set_volume` / `now_playing`, `search_free_slots`, `start_routine`, `confirm_action`. Unknown tools are never executed. **Sending, deleting, publishing or purchasing never happens from the tool loop** — the owner must confirm in chat or tap Confirm. Drafting is not sending. Group broadcasts stay off unless you opt in.
+
+### 🔐 Permissioned automation hub
+
+Settings → Connectors / Permissions / Alarms / Messaging. Default **deny**. Secrets are never returned by `GET /api/state`, `GET /api/settings` or `GET /api/integrations` (blank password fields keep the previous value). Music is **this browser / a local audio URL only** — ARIA will not pretend to control Spotify or Apple Music. WhatsApp is the official Cloud API only.
+
+| Endpoint | What it does |
+|---|---|
+| `GET /api/integrations` | Status of every connector (no secrets). |
+| `GET /api/oauth/google/start` | Start Google OAuth (readonly Gmail + Calendar). |
+| `POST /api/integrations/:id/revoke` | Wipe stored tokens. |
+| `GET/POST /api/alarms`, `POST /api/alarms/:id/snooze\|cancel` | Browser-notification alarms. |
+| `GET/POST /api/reminders` | Reminders (not calendar events). |
+| `POST /api/messages/draft`, `POST /api/messages/send` | Draft ≠ send; send is idempotent and confirm-gated. |
+| `GET/POST /api/media/*` | Browser/local playback; `POST /api/media/report` is what confirms it. |
+| `GET/POST /api/permissions`, `GET /api/audit`, `POST /api/confirm` | Grants, audit log (no secrets), owner confirmation. |
+
+```bash
+npm install
+npm test          # verification suite (jsdom + real HTTP, mocked providers only)
+npm start         # http://localhost:3000
+```
 
 ### 🧠 Semantic memory
 
@@ -163,14 +184,22 @@ server/
   scheduler.js    cron: brief at wake time, sync every 30 min
   brief.js        morning brief composer (weather via open-meteo, fail-safe)
   brain.js        second brain: auto-capture, topics, tasks, hybrid search (BM25 + embeddings)
-  assistant.js    executive assistant: intent routing · tool calling · planner · discretion
+  assistant.js    executive assistant: intent routing · tool calling · planner · discretion · hub route
+  automation.js   extra tools + deterministic alarms/messages/media/routines
+  alarms.js       browser-notification alarms & reminders (never a device alarm)
+  permissions.js  default-deny grants, confirmations, audit
+  messaging.js    draft ≠ send, idempotent sends, group deny
+  media.js        browser / local audio only
+  integrations.js OAuth + Telegram/WhatsApp Cloud/SMS-bridge/SMTP
+  secrets.js      preserve blank secret saves; redact GET bodies
   embeddings.js   embedding adapter (Ollama) + cosine similarity + TF-IDF fallback vector
   agency.js       Agency Swarm orchestrator (sequential / parallel waves, run history)
   agents/         director · researcher · analyst · copywriter (zero-dependency agents)
   llm.js          model adapter: cloud (OpenAI-compatible) → Ollama → offline, tool prompts
-  email.js        SMTP brief delivery
+  email.js        SMTP brief delivery + sendMail
   db.js           tiny JSON persistence (data/state.json)
   config.js       settings document: DEFAULTS + normalize() (serverless-safe writes)
+  scheduler.js    cron: brief at wake, sync every 30 min, alarm tick every minute
   connectors/     demo · google · microsoft · slack · whatsapp
 public/           dashboard SPA (no build step)
 scripts/          oauth-google helper · test-app.js verification suite (`npm test`)

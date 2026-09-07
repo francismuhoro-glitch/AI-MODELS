@@ -84,10 +84,25 @@ self.addEventListener('fetch', (e) => {
 self.addEventListener('push', (e) => {
   let data = { title: '☀️ ARIA OS', body: 'Your morning brief is ready.', url: '/#/briefs' };
   try { data = { ...data, ...(e.data ? e.data.json() : {}) }; } catch (_) {}
+  const isAlarm = data.type === 'alarm' || data.type === 'reminder';
   e.waitUntil(self.registration.showNotification(data.title, {
     body: data.body, icon: '/icons/icon-192.png', badge: '/icons/icon-192.png',
-    tag: 'aria-brief', renotify: false, data: { url: data.url },
-    vibrate: [80, 40, 80], silent: false
+    tag: data.tag || (isAlarm ? ('aria-alarm-' + Date.now()) : 'aria-brief'),
+    renotify: !!isAlarm, requireInteraction: !!isAlarm,
+    data: { url: data.url || (isAlarm ? '/#/settings' : '/#/briefs') },
+    vibrate: isAlarm ? [200, 80, 200, 80, 200] : [80, 40, 80], silent: false
+  }));
+});
+
+self.addEventListener('message', (e) => {
+  const data = (e && e.data) || {};
+  if (data.type !== 'aria-alarm' && data.type !== 'aria-reminder') return;
+  e.waitUntil(self.registration.showNotification(data.title || 'ARIA alarm', {
+    body: data.body || '', icon: '/icons/icon-192.png', badge: '/icons/icon-192.png',
+    tag: data.tag || ('aria-alarm-' + Date.now()),
+    renotify: true, requireInteraction: true,
+    data: { url: data.url || '/#/settings' },
+    vibrate: [200, 80, 200]
   }));
 });
 

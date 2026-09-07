@@ -21,6 +21,13 @@ const briefGen = require('./brief');
 const connectors = require('./connectors');
 const push = require('./push');
 const { llmStatus, checkOllama } = require('./llm');
+const alarms = require('./alarms');
+const permissions = require('./permissions');
+const integrations = require('./integrations');
+const messaging = require('./messaging');
+const media = require('./media');
+const secrets = require('./secrets');
+const automation = require('./automation');
 
 const app = express();
 
@@ -86,9 +93,12 @@ function buildState() {
   const tz = (cfg.owner && cfg.owner.timezone) || 'Africa/Nairobi';
   const todayEvents = events.filter(e => sameDay(e.start, tz));
 
+  const alarmItems = arr(db.alarms).filter(a => a && (a.status === 'scheduled' || a.status === 'snoozed')).map(alarms.publicItem);
+  const reminderItems = arr(db.reminders).filter(r => r && (r.status === 'scheduled' || r.status === 'open' || r.status === 'snoozed')).map(alarms.publicItem);
+
   return {
     ok: true,
-    cfg,
+    cfg: cfgm.publicConfig(cfg),
     owner: cfg.owner,
     rhythm: cfg.rhythm,
     timezone: tz,
@@ -111,6 +121,10 @@ function buildState() {
     brief: briefs[0] || null,
     agencyRuns,
     agents: agency.listAgents(),
+    alarms: alarmItems,
+    reminders: reminderItems,
+    integrations: integrations.status(),
+    pendingConfirmation: permissions.publicConfirmation(permissions.latestPending()),
     stats: {
       engine: engine.activeEngine || 'offline',
       lastSync: (db.meta && db.meta.lastSync) || null,
@@ -120,7 +134,9 @@ function buildState() {
       messages: messages.length,
       events: events.length,
       tasks: tasks.length,
-      agencyRuns: agencyRuns.length
+      agencyRuns: agencyRuns.length,
+      alarms: alarmItems.length,
+      reminders: reminderItems.length
     },
     counts: {
       events: events.length,
@@ -130,7 +146,9 @@ function buildState() {
       messages: messages.length,
       chats: chats.length,
       briefs: briefs.length,
-      agencyRuns: agencyRuns.length
+      agencyRuns: agencyRuns.length,
+      alarms: alarmItems.length,
+      reminders: reminderItems.length
     }
   };
 }
@@ -172,7 +190,7 @@ async function saveSettings(req, res) {
     const updated = await cfgm.save(req.body || {});
     const rearm = req.app.get('rearm');
     if (typeof rearm === 'function') { try { rearm(); } catch (_) {} }
-    ok(res, updated);
+    ok(res, cfgm.publicConfig(updated));
   } catch (e) { fail(res, e); }
 }
 api.post('/settings', saveSettings);
@@ -390,7 +408,7 @@ api.post('/connectors/:id', async (req, res) => {
   try {
     const { enabled, config } = req.body || {};
     const patch = { connectors: { [req.params.id]: { enabled: !!enabled, ...(config || {}) } } };
-    ok(res, await cfgm.save(patch));
+    ok(res, cfgm.publicConfig(await cfgm.save(patch)));
   } catch (e) { fail(res, e); }
 });
 
@@ -511,6 +529,193 @@ api.post('/push/subscribe', async (req, res) => {
 api.post('/push/test', async (req, res) => {
   try { ok(res, await push.pushAll({ title: 'ARIA OS', body: 'Test notification — your morning brief will arrive like this.', url: '/#/hub' })); }
   catch (e) { fail(res, e, { skipped: 'push unavailable' }); }
+});
+
+/* ---------------- automation hub: integrations, oauth, alarms, messages, media, permissions ---------------- */
+api.get('/integrations', (req, res) => { try { ok(res, arr(integrations.status())); } catch (e) { fail(res, e, []); } });
+api.get('/integrations/:id', (req, res) => {
+  try {
+    const row = integrations.one(req.params.id);
+    if (!row) return res.status(404).json({ error: 'unknown integration' });
+    ok(res, row);
+  } catch (e) { fail(res, e); }
+});
+api.post('/integrations/:id/revoke', async (req, res) => {
+  try { ok(res, await integrations.revoke(req.params.id)); }
+  catch (e) { fail(res, e); }
+});
+
+api.get('/oauth/:provider/start', (req, res) => {
+  try { ok(res, integrations.oauthStart(req.params.provider, req)); }
+  catch (e) { fail(res, e); }
+});
+api.get('/oauth/:provider/status', (req, res) => {
+  try { ok(res, integrations.oauthStatus(req.params.provider)); }
+  catch (e) { fail(res, e); }
+});
+api.post('/oauth/:provider/revoke', async (req, res) => {
+  try { ok(res, await integrations.revoke(req.params.provider)); }
+  catch (e) { fail(res, e); }
+});
+api.get('/oauth/:provider/callback', async (req, res) => {
+  try {
+    const result = await integrations.oauthCallback(req.params.provider, req.query || {});
+    const html = result.ok
+      ? '<!DOCTYPE html><meta charset="utf-8"><title>ARIA OS</title><p>Authorized. You can close this tab.</p><script>location.replace("/#/settings")</script>'
+      : `<!DOCTYPE html><meta charset="utf-8"><title>ARIA OS</title><p>Authorization failed: ${String((result && result.error) || 'unknown').replace(/[<>]/g, '')}</p>`;
+    res.status(result.ok ? 200 : 400).type('html').send(html);
+  } catch (e) {
+    res.status(500).type('html').send('<p>OAuth error</p>');
+  }
+});
+
+api.get('/alarms', (req, res) => {
+  try { ok(res, alarms.list({ kind: 'alarm', status: req.query.status }).map(alarms.publicItem)); }
+  catch (e) { fail(res, e, []); }
+});
+api.get('/alarms/due', (req, res) => {
+  try { ok(res, alarms.due().map(alarms.publicItem)); }
+  catch (e) { fail(res, e, []); }
+});
+api.post('/alarms', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const result = await alarms.create({
+      kind: 'alarm', title: b.title, body: b.body, when: b.when, fireAt: b.fireAt,
+      timezone: b.timezone, recurrence: b.recurrence, source: b.source || 'api',
+      confirmIfAmbiguous: b.confirmIfAmbiguous !== false, origin: 'user'
+    });
+    ok(res, { ...result, alarm: result.alarm ? alarms.publicItem(result.alarm) : undefined });
+  } catch (e) { fail(res, e); }
+});
+api.post('/alarms/:id/snooze', async (req, res) => {
+  try { ok(res, await alarms.snooze(req.params.id, (req.body || {}).minutes, 'alarm')); }
+  catch (e) { fail(res, e); }
+});
+api.post('/alarms/:id/cancel', async (req, res) => {
+  try { ok(res, await alarms.cancel(req.params.id, 'alarm')); }
+  catch (e) { fail(res, e); }
+});
+api.post('/alarms/:id/fired', async (req, res) => {
+  try {
+    const item = await alarms.markFired(req.params.id, { browserNotification: 'client', client: (req.body || {}).client || 'browser', deviceAlarm: alarms.DEVICE_ALARM });
+    ok(res, { ok: !!item, alarm: item ? alarms.publicItem(item) : null, deviceAlarm: alarms.DEVICE_ALARM });
+  } catch (e) { fail(res, e); }
+});
+api.delete('/alarms/:id', async (req, res) => {
+  try { ok(res, await alarms.cancel(req.params.id, 'alarm')); }
+  catch (e) { fail(res, e); }
+});
+
+api.get('/reminders', (req, res) => {
+  try { ok(res, alarms.list({ kind: 'reminder', status: req.query.status }).map(alarms.publicItem)); }
+  catch (e) { fail(res, e, []); }
+});
+api.post('/reminders', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const result = await alarms.create({
+      kind: 'reminder', title: b.title, body: b.body || b.title, when: b.when, fireAt: b.fireAt,
+      timezone: b.timezone, source: b.source || 'api', confirmIfAmbiguous: b.confirmIfAmbiguous !== false, origin: 'user'
+    });
+    ok(res, result);
+  } catch (e) { fail(res, e); }
+});
+api.post('/reminders/:id/cancel', async (req, res) => {
+  try { ok(res, await alarms.cancel(req.params.id, 'reminder')); }
+  catch (e) { fail(res, e); }
+});
+api.delete('/reminders/:id', async (req, res) => {
+  try { ok(res, await alarms.cancel(req.params.id, 'reminder')); }
+  catch (e) { fail(res, e); }
+});
+
+api.get('/drafts', (req, res) => {
+  try { ok(res, (dbm.load().drafts || []).map(messaging.publicDraft)); }
+  catch (e) { fail(res, e, []); }
+});
+api.post('/messages/draft', async (req, res) => {
+  try { ok(res, await messaging.draftMessage(req.body || {})); }
+  catch (e) { fail(res, e); }
+});
+api.post('/messages/send', async (req, res) => {
+  try { ok(res, await messaging.sendMessage({ ...(req.body || {}), origin: 'user' })); }
+  catch (e) { fail(res, e); }
+});
+api.get('/messages/:id', (req, res) => {
+  try { ok(res, messaging.readMessage(req.params.id)); }
+  catch (e) { fail(res, e); }
+});
+api.post('/messages/:id/read', async (req, res) => {
+  try { ok(res, await messaging.markRead(req.params.id)); }
+  catch (e) { fail(res, e); }
+});
+
+api.get('/media', (req, res) => { try { ok(res, media.snapshot()); } catch (e) { fail(res, e); } });
+api.get('/media/now', (req, res) => { try { ok(res, media.nowPlaying()); } catch (e) { fail(res, e); } });
+api.post('/media/play', async (req, res) => { try { ok(res, await media.play(req.body || {})); } catch (e) { fail(res, e); } });
+api.post('/media/pause', (req, res) => { try { ok(res, media.pause()); } catch (e) { fail(res, e); } });
+api.post('/media/resume', (req, res) => { try { ok(res, media.resume()); } catch (e) { fail(res, e); } });
+api.post('/media/skip', (req, res) => { try { ok(res, media.skip()); } catch (e) { fail(res, e); } });
+api.post('/media/volume', (req, res) => { try { ok(res, media.setVolume((req.body || {}).level)); } catch (e) { fail(res, e); } });
+api.post('/media/report', (req, res) => { try { ok(res, media.report(req.body || {})); } catch (e) { fail(res, e); } });
+
+api.get('/permissions', (req, res) => { try { ok(res, permissions.publicState()); } catch (e) { fail(res, e); } });
+api.post('/permissions', async (req, res) => {
+  try {
+    const b = req.body || {};
+    if (b.grant) await permissions.setGrant(b.grant, b.value !== false);
+    if (b.grants && typeof b.grants === 'object') {
+      for (const [k, v] of Object.entries(b.grants)) await permissions.setGrant(k, !!v);
+    }
+    if (Object.prototype.hasOwnProperty.call(b, 'allowGroupSend')) await permissions.setAllowGroup(!!b.allowGroupSend);
+    ok(res, permissions.publicState());
+  } catch (e) { fail(res, e); }
+});
+api.get('/audit', (req, res) => {
+  try { ok(res, arr(permissions.listAudit(req.query.limit))); }
+  catch (e) { fail(res, e, []); }
+});
+api.post('/confirm', async (req, res) => {
+  try {
+    const id = (req.body || {}).id;
+    if (!id) return res.status(400).json({ error: 'id required' });
+    ok(res, await automation.confirmPending(id, { origin: 'user' }));
+  } catch (e) { fail(res, e); }
+});
+api.post('/confirm/cancel', (req, res) => {
+  try { ok(res, permissions.cancel((req.body || {}).id)); }
+  catch (e) { fail(res, e); }
+});
+
+api.get('/contacts', (req, res) => {
+  try { ok(res, arr((cfgm.load().contacts) || [])); }
+  catch (e) { fail(res, e, []); }
+});
+api.post('/contacts', async (req, res) => {
+  try {
+    const cfg = cfgm.load();
+    const list = Array.isArray(cfg.contacts) ? cfg.contacts.slice() : [];
+    const b = req.body || {};
+    const item = {
+      id: b.id || ('ct-' + Date.now()),
+      name: String(b.name || '').trim(),
+      channels: { whatsapp: '', telegram: '', sms: '', email: '', ...((b.channels) || {}) }
+    };
+    if (!item.name) return res.status(400).json({ error: 'name required' });
+    const idx = list.findIndex(c => c.id === item.id);
+    if (idx >= 0) list[idx] = { ...list[idx], ...item };
+    else list.push(item);
+    await cfgm.save({ contacts: list });
+    ok(res, item);
+  } catch (e) { fail(res, e); }
+});
+api.delete('/contacts/:id', async (req, res) => {
+  try {
+    const list = arr((cfgm.load().contacts) || []).filter(c => c.id !== req.params.id);
+    await cfgm.save({ contacts: list });
+    ok(res, { ok: true });
+  } catch (e) { fail(res, e); }
 });
 
 /* --- Dual mount: /api/<route> AND /<route> both resolve (Vercel rewrite safety net). --- */

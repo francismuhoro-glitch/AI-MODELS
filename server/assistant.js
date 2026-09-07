@@ -35,6 +35,7 @@ const weblearn = require('./weblearn');
 const websearch = require('./websearch');
 const { llmChat, llmStatus } = require('./llm');
 const { dayKey, timeStr, dayLabel, dayKeyAdd, dayKeyDow, zonedTime, snippet, extractTopics, cleanProfanity } = require('./util');
+const automation = require('./automation');
 
 const SYSTEM_PROMPT = `You are ARIA, the user's private executive assistant inside ARIA OS.
 You manage their day job and their business. You are concise, proactive, well-organized.
@@ -90,7 +91,7 @@ const SCHEDULE_WIDE_RE = /^(?:schedule|book|set\s+up|arrange|organise|organize|c
 const CALENDAR_NOUN_RE = /\b(meetings?|calls?|appts?|appointments?|events?|lunch|dinner|breakfast|brunch|coffee|catch[\s-]?ups?|syncs?|stand[\s-]?ups?|interviews?|demos?|reviews?|sessions?|workshops?|trainings?|webinars?|check[\s-]?ins?|visits?|conferences?|kick[\s-]?offs?|one[\s-]on[\s-]ones?|deadlines?|reminders?|slots?|blocks?)\b/i;
 const TIME_PHRASE_RE = /\b(at\s+\d{1,2}|\d{1,2}(?::\d{2})?\s*(?:am|pm)|tomorrow|today|tonight|next\s+week|this\s+week|(?:on|for|by)\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|weekdays?|weekend|eod|noon|midnight|morning|afternoon|evening)\b/i;
 /* Things people ask ARIA to "create/add" that are NOT calendar entries. */
-const NOT_AN_EVENT_RE = /^(?:tasks?|to[\s-]?dos?|reminders?\s+to\s+(?:remember|note)|notes?|checklists?|lists?|summaries|summary|reports?|briefs?|emails?|messages?|drafts?|plans?\s+for\s+my\s+(?:day|week)|websites?|apps?|scripts?|files?|docs?|documents?|slides?|decks?|invoices?|quotes?|quotations?)\b/i;
+const NOT_AN_EVENT_RE = /^(?:tasks?|to[\s-]?dos?|(?:an?\s+)?(?:alarms?|reminders?)|notes?|checklists?|lists?|summaries|summary|reports?|briefs?|emails?|messages?|drafts?|plans?\s+for\s+my\s+(?:day|week)|websites?|apps?|scripts?|files?|docs?|documents?|slides?|decks?|invoices?|quotes?|quotations?)\b/i;
 /* Bare pronouns are follow-ups ("add another one for Friday") — resolveFollowUp() owns those. */
 const PRONOUN_BODY_RE = /^(?:another|one|it|that|this|these|those|the\s+same|same|them)\b/i;
 
@@ -151,6 +152,12 @@ const PERSONAL_OPERATIONAL_PATTERNS = [
   /^how\s+(?:is|are|does|do)\s+(?:my|our|the)\s+(?:inbox|calendar|schedule|day|business|email|emails)\b/i,
   /^(?:plan|organize|organise|build|create)\b.*\b(?:day|schedule|plan|week)\b/i,
   /^(?:move|remove|delete|drop|cancel)\s+(?:the\s+|my\s+)?\S+/i,
+  /^(?:set|create|add|cancel|snooze|list)\s+(?:an?\s+)?(?:alarm|reminder)/i,
+  /^remind\s+me\b/i,
+  /^(?:play|pause|resume|skip).*(?:music|playlist|track|song)/i,
+  /^(?:send|draft|text)\b/i,
+  /^(?:start|run)\s+(?:my\s+)?morning\s+routine/i,
+  /^(?:open\s+)?(?:the\s+)?calendar\b/i,
 ];
 
 function isWebSearchQuery(msg) {
@@ -308,12 +315,17 @@ async function respond(message) {
   const resolved = resolveFollowUp(raw, memory);
   const effective = resolved.message || raw;
 
-  let reply, source, intent = null, toolCall = null;
+  let reply, source, intent = null, toolCall = null, extra = {};
   const pre = await routeIntent(effective, memory);
   if (pre) {
     reply = pre.reply;
     intent = pre.intent || null;
     source = 'intent';
+    extra = {
+      ...(pre.confirmation ? { confirmation: pre.confirmation } : {}),
+      ...(pre.clientAction ? { clientAction: pre.clientAction } : {}),
+      ...(pre.needsConfirmation ? { needsConfirmation: true } : {})
+    };
   } else {
     /* TOOL PASS FIRST — whatever the deterministic layer did not recognise is offered to the
        model with the tool schema, so ANY phrasing can still create events, add tasks, search
@@ -324,6 +336,11 @@ async function respond(message) {
       intent = acted.intent || null;
       source = acted.source;
       toolCall = { tool: acted.tool, args: acted.args };
+      extra = {
+        ...(acted.confirmation ? { confirmation: acted.confirmation } : {}),
+        ...(acted.clientAction ? { clientAction: acted.clientAction } : {}),
+        ...(acted.needsConfirmation ? { needsConfirmation: true } : {})
+      };
     } else if (isWebSearchQuery(effective)) {
       // Explicit web search query -> directly trigger live web search
       reply = await handleWebSearch(effective);
@@ -369,6 +386,7 @@ async function respond(message) {
     intent: intent || undefined,
     /* When the model acted through a tool, the UI (and the tests) can see exactly what ran. */
     ...(toolCall ? { tool: toolCall.tool, toolArgs: toolCall.args } : {}),
+    ...extra,
     ...(resolved.isFollowUp ? { followUp: true, resolvedFrom: raw, resolvedTo: effective } : {})
   };
 }
@@ -458,6 +476,14 @@ async function routeIntent(msg, memory) {
   const cfg = cfgm.load();
   const tz = (cfg.owner && cfg.owner.timezone) || 'Africa/Nairobi';
   const conv = convState(db);
+
+  /* ---- Automation hub (alarms, reminders, messaging, media, confirmations) ----
+     Runs before calendar/task regexes so "set an alarm" is never a meeting, and
+     so a pending SEND confirmation is never hijacked by "confirm the plan". */
+  try {
+    const hub = await automation.route(sm);
+    if (hub && hub.reply) return hub;
+  } catch (_) {}
 
   /* ---- Plan confirmation / cancellation (before generic event removal) ---- */
   if (conv.pendingPlan && (/^(?:confirm|lock(?:\s+it)?(?:\s+in)?|approve|keep|sounds\s+good|yes(?:\s+please)?)\b/i.test(m) || /^(?:yes|confirm|lock it in|approve)[.!\s]*$/i.test(m))) {
@@ -820,9 +846,18 @@ function calendarSummary(dayText) {
   const raw = String(dayText || 'today').trim();
   const day = /^\d{4}-\d{2}-\d{2}$/.test(raw) ? { key: raw, label: raw } : parseQueryDay(raw.toLowerCase(), tz);
   const events = (db.events || []).filter(e => dayKey(e.start, tz) === day.key).sort((a, b) => a.start - b.start);
-  if (!events.length) return `You have no events scheduled for ${day.label}. Your calendar is clear!`;
-  return `**Schedule for ${day.label} (${day.key})**:\n` + events
+  if (!events.length) {
+    if (/\bfree\b|\bslots?\b|\bavailab/i.test(raw)) {
+      try { return require('./automation').freeSlotsText(raw); } catch (_) {}
+    }
+    return `You have no events scheduled for ${day.label}. Your calendar is clear!`;
+  }
+  let out = `**Schedule for ${day.label} (${day.key})**:\n` + events
     .map(e => `- ${timeStr(e.start, tz)}: ${e.title} (${e.source || 'calendar'})`).join('\n');
+  if (/\bfree\b|\bslots?\b|\bavailab/i.test(raw)) {
+    try { out += '\n\n' + require('./automation').freeSlotsText(raw); } catch (_) {}
+  }
+  return out;
 }
 
 /** Hybrid brain lookup (BM25 + embeddings when a backend is live) formatted as a reply. */
@@ -890,7 +925,7 @@ const TOOL_DEFS = [
     description: 'Generate the full autonomous plan (focus blocks, triage, meetings) for a day or the week.',
     args: { which: { type: '"today" | "tomorrow" | "week"', optional: true } }
   }
-];
+].concat(automation.TOOL_DEFS);
 const TOOL_NAMES = new Set(TOOL_DEFS.map(t => t.name));
 
 /* Accept a bare JSON object, a ```json fenced block, or JSON embedded in chatty prose.
@@ -956,7 +991,7 @@ function parseToolDate(value) {
  * Execute a validated tool call. Returns { reply, intent } built from what was REALLY written,
  * or null when the tool is unknown / its arguments do not validate (nothing is executed then).
  */
-async function executeTool(name, args) {
+async function executeTool(name, args, origin = 'assistant') {
   const tool = String(name || '').trim();
   if (!TOOL_NAMES.has(tool)) return null;             // never execute an unknown tool
   const a = (args && typeof args === 'object' && !Array.isArray(args)) ? args : {};
@@ -1004,7 +1039,7 @@ async function executeTool(name, args) {
         return { reply: await generateSchedule(/week/.test(which) ? 'build a weekly plan' : (/today/.test(which) ? 'plan my day today' : 'plan my day tomorrow')), intent: 'plan' };
       }
       default:
-        return null;
+        return await automation.executeTool(tool, a, origin);
     }
   } catch (e) {
     /* A tool that throws must never bubble up as a 500 — fall back to a plain answer. */
@@ -1048,9 +1083,9 @@ async function tryToolPass(message, memory, cfg) {
       /* Ollama/offline compatibility: only the legacy text parser reaches this branch. */
       const call = parseToolCall(out.text);
       if (!call || !TOOL_NAMES.has(call.tool)) return null;
-      const result = await executeTool(call.tool, call.args);
+      const result = await executeTool(call.tool, call.args, 'tool-loop');
       if (!result || !result.reply) return null;
-      return { reply: result.reply, intent: result.intent || `tool:${call.tool}`, source: `tool:${lastEngine}`, tool: call.tool, args: call.args, ...(result.event ? { event: result.event } : {}), ...(result.task ? { task: result.task } : {}) };
+      return { reply: result.reply, intent: result.intent || `tool:${call.tool}`, source: `tool:${lastEngine}`, tool: call.tool, args: call.args, ...(result.event ? { event: result.event } : {}), ...(result.task ? { task: result.task } : {}), ...(result.confirmation ? { confirmation: result.confirmation } : {}), ...(result.clientAction ? { clientAction: result.clientAction } : {}), ...(result.needsConfirmation ? { needsConfirmation: true } : {}) };
     }
 
     const call = native;
@@ -1066,18 +1101,21 @@ async function tryToolPass(message, memory, cfg) {
       retryUsed = true;
       continue;
     }
-    const result = await executeTool(call.tool, call.args);
+    const result = await executeTool(call.tool, call.args, 'tool-loop');
     if (!result) {
       messages.push({ role: 'tool', tool_call_id: callId, content: 'Tool execution failed or arguments were invalid. Correct the arguments and retry once.' });
       if (retryUsed) return null;
       retryUsed = true;
       continue;
     }
-    const toolContent = JSON.stringify({ reply: result.reply, event: result.event || null, task: result.task || null });
+    /* Never hand confirmation tokens or send payloads back to the model. */
+    const toolContent = JSON.stringify(automation.toolResultForModel(result) || { reply: result.reply, event: result.event || null, task: result.task || null });
     messages.push({ role: 'tool', tool_call_id: callId, content: toolContent });
+    const extras = { ...(result.event ? { event: result.event } : {}), ...(result.task ? { task: result.task } : {}), ...(result.confirmation ? { confirmation: result.confirmation } : {}), ...(result.clientAction ? { clientAction: result.clientAction } : {}), ...(result.needsConfirmation ? { needsConfirmation: true } : {}) };
     /* If the model has another tool call, continue. Otherwise ask it to synthesize the result. */
-    if (iteration === 4) return { reply: result.reply, intent: result.intent || `tool:${call.tool}`, source: `tool:${lastEngine}`, tool: call.tool, args: call.args };
-    if (result.reply && !native.id) return { reply: result.reply, intent: result.intent || `tool:${call.tool}`, source: `tool:${lastEngine}`, tool: call.tool, args: call.args };
+    if (iteration === 4) return { reply: result.reply, intent: result.intent || `tool:${call.tool}`, source: `tool:${lastEngine}`, tool: call.tool, args: call.args, ...extras };
+    if (result.reply && !native.id) return { reply: result.reply, intent: result.intent || `tool:${call.tool}`, source: `tool:${lastEngine}`, tool: call.tool, args: call.args, ...extras };
+    if (result.needsConfirmation) return { reply: result.reply, intent: result.intent || `tool:${call.tool}`, source: `tool:${lastEngine}`, tool: call.tool, args: call.args, ...extras };
   }
   return null;
 }

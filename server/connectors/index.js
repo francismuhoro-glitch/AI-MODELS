@@ -21,7 +21,18 @@ function status() {
       c.name === 'google' ? !!(conf.refreshToken && conf.clientId) :
       c.name === 'microsoft' ? !!conf.accessToken :
       c.name === 'whatsapp' ? !!(conf.accessToken && conf.phoneNumberId) : false;
-    return { id: c.name, label: c.label, enabled, configured, setupRequired: c.name !== 'demo' && !configured };
+    const db = dbm.load();
+    const expired = !!(db.meta && db.meta.connectorErrors && db.meta.connectorErrors[c.name] && db.meta.connectorErrors[c.name].expired);
+    let status = 'disabled';
+    if (!enabled) status = 'disabled';
+    else if (expired) status = 'authorization_expired';
+    else if (!configured) status = 'configured_not_authorized';
+    else status = 'connected';
+    return {
+      id: c.name, label: c.label, enabled, configured,
+      setupRequired: c.name !== 'demo' && !configured,
+      status, authorized: !!(enabled && configured && !expired)
+    };
   });
 }
 
