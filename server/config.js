@@ -23,7 +23,7 @@ const DEFAULTS = {
     /* 'auto' = cloud (only when a key exists) → local Ollama → built-in offline engine. */
     provider: 'auto',
     ollamaUrl: 'http://127.0.0.1:11434',
-    model: 'llama3.1',
+    model: 'openai/gpt-oss-120b',
     /* What ARIA recommends for a local model on modest hardware — shown in Settings. */
     recommendedModel: 'qwen2.5:7b',
     /* Any OpenAI-compatible endpoint (OpenAI, Groq, OpenRouter, a local vLLM…). OFF by
@@ -112,8 +112,26 @@ function load() {
   return cache;
 }
 
+function publicConfig(cfg) {
+  const out = clone(cfg || load());
+  out.llm = out.llm || {}; out.llm.openai = out.llm.openai || {};
+  out.llm.openai.apiKey = '';
+  out.llm.openai.apiKeyConfigured = !!openaiSecret(cfg);
+  out.smtp = out.smtp || {}; out.smtp.pass = ''; out.smtp.passConfigured = !!(cfg && cfg.smtp && cfg.smtp.pass);
+  out.telegram = out.telegram || {}; out.telegram.token = ''; out.telegram.tokenConfigured = !!(cfg && cfg.telegram && cfg.telegram.token);
+  return out;
+}
+function openaiSecret(cfg) { return String((cfg && cfg.llm && cfg.llm.openai && cfg.llm.openai.apiKey) || process.env.OPENAI_API_KEY || '').trim(); }
+
 async function save(patch) {
-  cache = normalize(merge(load(), patch || {}));
+  const incoming = clone(patch || {});
+  const current = load();
+  if (incoming.llm && incoming.llm.openai && !String(incoming.llm.openai.apiKey || '').trim()) {
+    incoming.llm.openai.apiKey = current.llm.openai.apiKey;
+  }
+  if (incoming.smtp && Object.prototype.hasOwnProperty.call(incoming.smtp, 'pass') && !String(incoming.smtp.pass || '').trim()) incoming.smtp.pass = current.smtp.pass;
+  if (incoming.telegram && Object.prototype.hasOwnProperty.call(incoming.telegram, 'token') && !String(incoming.telegram.token || '').trim()) incoming.telegram.token = current.telegram.token;
+  cache = normalize(merge(current, incoming));
   try { await store.docSet('settings', cache); } catch (_) { /* read-only fs / offline store: keep in memory */ }
   return cache;
 }
@@ -121,4 +139,4 @@ async function save(patch) {
 /* Test helper — drops the in-memory cache so the next load() re-reads the store. */
 function _reset() { cache = null; }
 
-module.exports = { init, load, save, normalize, DEFAULTS, _reset };
+module.exports = { init, load, save, normalize, publicConfig, DEFAULTS, _reset };

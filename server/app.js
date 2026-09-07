@@ -151,7 +151,7 @@ api.get('/state', (req, res) => {
     /* Never let the hub go blank: answer with an empty-but-complete payload. */
     const cfg = (() => { try { return cfgm.load(); } catch (_) { return cfgm.DEFAULTS; } })();
     fail(res, e, {
-      ok: true, cfg, owner: cfg.owner, rhythm: cfg.rhythm,
+      ok: true, cfg: cfgm.publicConfig(cfg), owner: cfg.owner, rhythm: cfg.rhythm,
       timezone: cfg.owner.timezone, wakeTime: cfg.wakeTime,
       engine: { activeEngine: 'offline', model: '' }, llm: { activeEngine: 'offline', model: '' },
       activeEngine: 'offline', unread: 0,
@@ -164,8 +164,8 @@ api.get('/state', (req, res) => {
 });
 
 /* ---------------- settings & config ---------------- */
-api.get('/settings', (req, res) => { try { ok(res, cfgm.load()); } catch (e) { fail(res, e, cfgm.DEFAULTS); } });
-api.get('/config', (req, res) => { try { ok(res, cfgm.load()); } catch (e) { fail(res, e, cfgm.DEFAULTS); } });
+api.get('/settings', (req, res) => { try { ok(res, cfgm.publicConfig(cfgm.load())); } catch (e) { fail(res, e, cfgm.publicConfig(cfgm.DEFAULTS)); } });
+api.get('/config', (req, res) => { try { ok(res, cfgm.publicConfig(cfgm.load())); } catch (e) { fail(res, e, cfgm.publicConfig(cfgm.DEFAULTS)); } });
 
 async function saveSettings(req, res) {
   try {
