@@ -1,5 +1,23 @@
 'use strict';
 /* Email delivery of the morning brief via SMTP (Gmail app password works great). */
+async function sendMail(cfg, { to, subject, text, html }) {
+  if (!cfg || !cfg.smtp || !cfg.smtp.host || !cfg.smtp.user) return { skipped: 'SMTP not configured — set it in Settings → Brief delivery' };
+  const dest = to || cfg.smtp.to;
+  if (!dest) return { skipped: 'no destination address' };
+  try {
+    const nodemailer = require('nodemailer');
+    const transport = nodemailer.createTransport({
+      host: cfg.smtp.host, port: +cfg.smtp.port || 587, secure: !!cfg.smtp.secure,
+      auth: { user: cfg.smtp.user, pass: cfg.smtp.pass }
+    });
+    const info = await transport.sendMail({
+      from: `"ARIA OS" <${cfg.smtp.user}>`, to: dest,
+      subject: subject || 'ARIA OS', text: text || '', html: html || undefined
+    });
+    return { sent: true, to: dest, id: (info && (info.messageId || info.response)) || '' };
+  } catch (e) { return { error: require('./secrets').safeError(e) }; }
+}
+
 async function sendBrief(cfg, brief) {
   if (!cfg.smtp.host || !cfg.smtp.user || !cfg.smtp.to) return { skipped: 'SMTP not configured — set it in Settings → Brief delivery' };
   try {
@@ -39,4 +57,4 @@ function mdToHtml(md) {
   return out.join('\n');
 }
 
-module.exports = { sendBrief, mdToHtml };
+module.exports = { sendBrief, sendMail, mdToHtml };

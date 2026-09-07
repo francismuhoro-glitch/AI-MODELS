@@ -177,7 +177,7 @@ async function llmChat(system, user, history, tools) {
   for (const provider of plan) {
     try {
       const out = provider === 'openai' ? await chatOpenAI(cfg, messages, hasTools ? tools : null) : await chatOllama(cfg, messages);
-      if (out && out.text) return { ...out, tools: hasTools };
+      if (out && (out.text || (Array.isArray(out.toolCalls) && out.toolCalls.length))) return { ...out, tools: hasTools };
     } catch (e) {
       lastError = (e && e.message) || 'llm error';
       if (/openai 404\b/.test(lastError)) return { text: null, engine: 'openai-error', error: `Configured model was not found or is unavailable. Set llm.openai.model to a supported model (for example openai/gpt-oss-120b) and try again. Provider said: ${lastError}` };

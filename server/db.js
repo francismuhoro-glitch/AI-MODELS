@@ -7,7 +7,7 @@
         db.events.filter(...) / res.json(db.emails) without ever seeing `undefined`. */
 const store = require('./store');
 
-const COLLECTIONS = ['events', 'emails', 'messages', 'tasks', 'notes', 'briefs', 'chats', 'inbox', 'subscriptions', 'agencyRuns'];
+const COLLECTIONS = ['events', 'emails', 'messages', 'tasks', 'notes', 'briefs', 'chats', 'inbox', 'subscriptions', 'agencyRuns', 'alarms', 'reminders', 'drafts', 'audit'];
 
 const seedTs = Date.now();
 
@@ -35,6 +35,10 @@ function seed() {
     chats: [],
     subscriptions: [],
     agencyRuns: [],
+    alarms: [],
+    reminders: [],
+    drafts: [],
+    audit: [],
     meta: { lastSync: null, lastBriefDate: null, createdAt: seedTs }
   };
 }

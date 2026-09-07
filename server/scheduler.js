@@ -29,6 +29,15 @@ function start() {
     catch (e) { console.error('[scheduler] sync failed:', e.message); }
   }, { timezone: tz }));
 
+  // Alarm / reminder tick: fire due browser-notification jobs (never a device alarm).
+  jobs.push(cron.schedule('* * * * *', async () => {
+    try {
+      const alarms = require('./alarms');
+      const r = await alarms.tick();
+      if (r.fired) console.log(`[scheduler] fired ${r.fired} alarm(s) via browser notification / web push`);
+    } catch (e) { console.error('[scheduler] alarm tick failed:', e.message); }
+  }, { timezone: tz }));
+
   console.log(`[scheduler] started — brief at ${cfg.wakeTime} ${tz}, sync every 30 min`);
 
   // Catch-up: if it's already past wake time today and no brief exists yet → generate now

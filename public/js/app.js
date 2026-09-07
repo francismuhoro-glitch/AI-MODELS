@@ -714,6 +714,65 @@ function urlBase64ToUint8Array(base64String) {
   for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
   return out;
 }
+function statusChip(st) {
+  const map = {
+    connected: ['green', 'connected'],
+    configured_not_authorized: ['yellow', 'configured · not authorized'],
+    authorization_expired: ['red', 'authorization expired'],
+    disabled: ['', 'disabled'],
+    unavailable: ['red', 'unavailable here']
+  };
+  const pair = map[st] || ['', String(st || 'unknown')];
+  return `<span class="chip ${pair[0]}">${esc(pair[1])}</span>`;
+}
+
+const MediaClient = {
+  audio: null,
+  apply(action) {
+    if (!action || !action.type) return;
+    try {
+      if (action.type === 'play' && action.url) {
+        if (!this.audio) this.audio = new Audio();
+        this.audio.src = action.url;
+        this.audio.play().then(() => POST('/api/media/report', { playing: true, title: action.title || '', provider: 'local' }).catch(() => {})).catch(() => toast('Could not start local audio in this browser'));
+      } else if (action.type === 'pause' && this.audio) {
+        this.audio.pause();
+        POST('/api/media/report', { playing: false }).catch(() => {});
+      } else if (action.type === 'resume' && this.audio) {
+        this.audio.play().then(() => POST('/api/media/report', { playing: true }).catch(() => {})).catch(() => {});
+      } else if (action.type === 'volume' && this.audio && action.value != null) {
+        this.audio.volume = Math.max(0, Math.min(1, Number(action.value) / 100));
+      }
+    } catch (_) { toast('Media control is not available in this browser'); }
+  }
+};
+
+const AlarmClient = {
+  async poll() {
+    try {
+      const due = await api('/api/alarms/due');
+      for (const a of A(due)) this.fire(a);
+    } catch (_) {}
+  },
+  fire(a) {
+    Sound.ding();
+    const title = a.title || 'ARIA alarm';
+    const body = a.body || 'Browser notification — not an OS device alarm.';
+    toast('⏰ ' + title);
+    try {
+      if (window.Notification && Notification.permission === 'granted' && typeof Notification === 'function') {
+        new Notification(title, { body, tag: 'aria-alarm-' + a.id });
+      }
+    } catch (_) {}
+    try {
+      if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+        navigator.serviceWorker.controller.postMessage({ type: 'aria-alarm', title, body, tag: 'aria-alarm-' + a.id, url: '/#/settings' });
+      }
+    } catch (_) {}
+    POST('/api/alarms/' + encodeURIComponent(a.id) + '/fired', { client: 'browser' }).catch(() => {});
+  }
+};
+
 const PushClient = {
   async subscribe() {
     if (!('serviceWorker' in navigator) || !('PushManager' in window)) return toast('Push not supported in this browser');
@@ -745,7 +804,8 @@ const EMPTY_STATE = {
   unread: 0, events: [], allEvents: [], emails: [], inbox: [], tasks: [], messages: [],
   notes: [], chats: [], briefs: [], brief: null,
   agencyRuns: [], agents: [],
-  stats: { engine: 'offline', lastSync: null, notes: 0, briefs: 0, emails: 0, messages: 0, events: 0, tasks: 0, agencyRuns: 0 },
+  alarms: [], reminders: [], integrations: [],
+  stats: { engine: 'offline', lastSync: null, notes: 0, briefs: 0, emails: 0, messages: 0, events: 0, tasks: 0, agencyRuns: 0, alarms: 0, reminders: 0 },
   counts: { events: 0, emails: 0, inbox: 0, notes: 0, messages: 0, agencyRuns: 0 }
 };
 
@@ -770,6 +830,7 @@ function normalizeState(raw) {
     tasks,
     messages: A(s.messages), notes: A(s.notes), chats: A(s.chats), briefs: A(s.briefs),
     agencyRuns: A(s.agencyRuns), agents: A(s.agents),
+    alarms: A(s.alarms), reminders: A(s.reminders), integrations: A(s.integrations),
     brief: s.brief || A(s.briefs)[0] || null,
     unread: typeof s.unread === 'number' ? s.unread : emails.filter(e => !e.read).length,
     stats: { ...EMPTY_STATE.stats, ...(s.stats || {}), engine: (s.stats && s.stats.engine) || engine.activeEngine || 'offline' },
@@ -795,6 +856,11 @@ function normalizeSettings(raw) {
     /* ARIA's speaking voice — MALE unless the owner chose otherwise. */
     voiceGender: String(s.voiceGender || '').toLowerCase() === 'female' ? 'female' : 'male',
     smtp: { host: '', port: 587, user: '', pass: '', to: '', ...(s.smtp || {}) },
+    telegram: { enabled: false, token: '', allowedChatId: '', tokenConfigured: false, ...(s.telegram || {}) },
+    sms: { enabled: false, bridgeUrl: '', token: '', tokenConfigured: false, ...(s.sms || {}) },
+    media: { provider: 'browser', localUrl: '', ...(s.media || {}) },
+    contacts: Array.isArray(s.contacts) ? s.contacts : [],
+    permissions: { grants: {}, allowGroupSend: false, autoSendRules: [], ...(s.permissions || {}) },
     brief: { email: false, ...(s.brief || {}) },
     discretion: s.discretion !== false,
     connectors: s.connectors || {}
@@ -878,7 +944,7 @@ async function viewHub(main) {
   main.innerHTML = `
     <div class="greet">
       <div><h1>${greetWord}, ${esc(s.owner.name)}.</h1>
-      <div class="date">${new Intl.DateTimeFormat('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: s.timezone }).format(Date.now())} · ${s.events.length} event${s.events.length === 1 ? '' : 's'} · ${s.unread} unread · ${s.tasks.length} open actions</div></div>
+      <div class="date">${new Intl.DateTimeFormat('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: s.timezone }).format(Date.now())} · ${s.events.length} event${s.events.length === 1 ? '' : 's'} · ${s.unread} unread · ${s.tasks.length} open actions${A(s.alarms).length ? ' · ' + s.alarms.length + ' alarm' + (s.alarms.length === 1 ? '' : 's') : ''}</div></div>
       <div class="head-actions">
         <button class="btn js-sound" title="Toggle sound">🔊</button>
         <button class="btn js-install" title="Install on this device">📲</button>
@@ -1185,7 +1251,7 @@ async function viewAssistant(main) {
       <div class="chat-scroll" id="chat-scroll">
         ${history.length ? history.map(chatMsg).join('') : welcomeMsg(ai)}
       </div>
-      <div class="suggests">${['What does my day look like?', 'What are my priorities?', 'How is my inbox?', 'Business snapshot', 'What do you know about suppliers?'].map(s => `<button class="btn" data-s="${esc(s)}">${esc(s)}</button>`).join('')}</div>
+      <div class="suggests">${['What does my day look like?', 'What are my priorities?', 'Set an alarm for tomorrow at 7:00 AM', 'Open the calendar and show me tomorrow’s free slots', 'How is my inbox?'].map(s => `<button class="btn" data-s="${esc(s)}">${esc(s)}</button>`).join('')}</div>
       <div class="chat-input"><input id="chat-in" data-voice-input placeholder="Ask ARIA anything about your day, work or business…" autocomplete="off"><button class="btn mic-btn" id="asst-mic" ${hasMic ? '' : 'hidden'} title="Talk to ARIA with your voice" aria-label="Talk to ARIA with your voice">🎤</button><button class="btn primary" id="chat-send">Send ⏎</button></div>
       <div class="voice-bar">
         <button class="btn small" id="btn-voice"></button>
@@ -1203,7 +1269,11 @@ async function viewAssistant(main) {
     scroll.scrollTop = scroll.scrollHeight;
     try {
       const r = await POST('/api/assistant', { message: text });
-      const _typ = $('#aria-typing'); if (_typ) _typ.outerHTML = `<div class="msg aria"><div class="md">${md(r.reply)}</div><div class="engine-tag">${esc(r.engine)}</div></div>`;
+      if (r.clientAction) MediaClient.apply(r.clientAction);
+      const confirmHtml = (r.needsConfirmation && r.confirmation && r.confirmation.id)
+        ? `<div class="confirm-card" data-cnf="${esc(r.confirmation.id)}"><p>${esc((r.confirmation.preview || r.reply || '').slice(0, 400))}</p><div class="confirm-actions"><button class="btn primary small js-cnf-yes">Confirm</button><button class="btn small js-cnf-no">Cancel</button></div></div>`
+        : '';
+      const _typ = $('#aria-typing'); if (_typ) _typ.outerHTML = `<div class="msg aria"><div class="md">${md(r.reply)}</div>${confirmHtml}<div class="engine-tag">${esc(r.engine)}</div></div>`;
       // Speak the reply aloud (respects the Sound mute + voice preference); conversation
       // mode resumes listening once ARIA is done talking (or right away if replies are silent).
       /* Speak the discretion-filtered twin (secrets redacted server-side); the client
@@ -1245,6 +1315,25 @@ async function viewAssistant(main) {
     toast(Speech.convo ? 'Conversation mode on — ARIA listens again after each reply. Toggle it off (or tap the mic) to stop.' : 'Conversation mode off');
   };
   $$('.suggests .btn', main).forEach(b => b.onclick = () => { $('#chat-in').value = b.dataset.s; Speech.prime(); send(); });
+  scroll.addEventListener('click', async (ev) => {
+    const yes = ev.target.closest('.js-cnf-yes');
+    const no = ev.target.closest('.js-cnf-no');
+    const card = ev.target.closest('.confirm-card');
+    if (!card) return;
+    const id = card.dataset.cnf;
+    if (yes) {
+      yes.disabled = true;
+      try {
+        const r = await POST('/api/confirm', { id });
+        if (r.clientAction) MediaClient.apply(r.clientAction);
+        card.outerHTML = `<div class="md">${md(r.reply || 'Done.')}</div>`;
+        toast(r.sent ? 'Sent' : (r.created ? 'Scheduled' : 'Updated'));
+      } catch (e) { toast(e.message); yes.disabled = false; }
+    } else if (no) {
+      await POST('/api/confirm/cancel', { id }).catch(() => {});
+      card.outerHTML = '<div class="md"><p>Cancelled — nothing was sent.</p></div>';
+    }
+  });
 }
 
 /* ===== AGENCY SWARM (multi-agent) =====
@@ -1500,9 +1589,22 @@ const voiceGenderHint = () => {
 };
 
 async function viewSettings(main) {
-  const [rawSettings, rawConns] = await Promise.all([api('/api/settings'), api('/api/connectors')]);
+  const [rawSettings, rawConns, rawInts, rawPerms, rawAlarms, rawReminders, rawAudit] = await Promise.all([
+    api('/api/settings'), api('/api/connectors'),
+    api('/api/integrations').catch(() => []),
+    api('/api/permissions').catch(() => ({ grants: {}, allowGroupSend: false })),
+    api('/api/alarms').catch(() => []),
+    api('/api/reminders').catch(() => []),
+    api('/api/audit').catch(() => [])
+  ]);
   const s = normalizeSettings(rawSettings);
   const conns = A(rawConns);
+  const ints = A(rawInts);
+  const perms = rawPerms && typeof rawPerms === 'object' ? rawPerms : { grants: {}, allowGroupSend: false };
+  const alarmList = A(rawAlarms);
+  const reminderList = A(rawReminders);
+  const auditList = A(rawAudit).slice(0, 8);
+  const intById = Object.fromEntries(ints.map(i => [i.id, i]));
   SETTINGS = s; CONNECTORS = conns;
   syncVoiceGender(s.voiceGender);
   const voiceGender = storedVoiceGender();
@@ -1583,7 +1685,58 @@ async function viewSettings(main) {
         ${c.id !== 'demo' ? `<div class="conn-config" id="cfg-${c.id}"><div class="form-grid">${configFields(c.id, conf)}</div></div>` : ''}`; }).join('')}
       </div>
     </div>
-    <p style="margin-top:14px;color:var(--faint);font-size:12px">Secrets never leave your machine — stored in <code>data/settings.json</code> on your own disk.</p>`;
+      <div class="card"><h3>🔐 Integration status</h3>
+        ${ints.map(i => `<div class="connector">
+          <div class="conn-icon">🔌</div>
+          <div class="conn-main"><div class="conn-name">${esc(i.label || i.id)} ${statusChip(i.status)}</div>
+            <div class="conn-desc">${esc(i.note || i.scopes || '')}</div></div>
+          ${i.id === 'google' ? `<button class="btn small" data-oauth="google">connect Google</button>` : ''}
+          ${i.canRevoke ? `<button class="btn small" data-revoke="${esc(i.id)}">revoke</button>` : ''}
+        </div>`).join('')}
+      </div>
+
+      <div class="card"><h3>⏰ Alarms & reminders</h3>
+        <p style="color:var(--dim);font-size:12.5px;margin:0 0 10px">These fire as <strong>browser notifications</strong> (and web-push when enabled). They are <em>not</em> native OS device alarms — ARIA never claims a phone alarm was set.</p>
+        ${(alarmList.length || reminderList.length) ? [...alarmList, ...reminderList].map(a => `<div class="alarm-row">
+          <div class="ar-main"><strong>${esc(a.title || a.kind)}</strong><div class="r-sub">${esc(a.kind)} · ${esc(a.whenLabel || '')} · ${esc(a.status)}</div></div>
+          <button class="btn small" data-alarm-cancel="${esc(a.id)}" data-kind="${esc(a.kind)}">cancel</button>
+        </div>`).join('') : '<div class="empty">None scheduled. Ask ARIA: “set an alarm for 7am” or “remind me to call Kamau at 3pm”.</div>'}
+      </div>
+
+      <div class="card"><h3>💬 Messaging & contacts</h3>
+        <div class="form-grid">
+          <label class="switch" style="display:flex;gap:9px;align-items:center"><input type="checkbox" id="s-tg-on" ${s.telegram.enabled ? 'checked' : ''}><span>Telegram bot</span></label>
+          <label class="field">Bot token<input id="s-tg-token" type="password" value="" placeholder="${s.telegram.tokenConfigured ? 'Configured — leave blank to keep' : '123456:ABC…'}" autocomplete="off"></label>
+          <label class="field">Allowed chat ID<input id="s-tg-chat" value="${esc(s.telegram.allowedChatId)}" placeholder="optional allow-list"></label>
+          <label class="switch" style="display:flex;gap:9px;align-items:center"><input type="checkbox" id="s-sms-on" ${s.sms.enabled ? 'checked' : ''}><span>SMS local bridge</span></label>
+          <label class="field">Bridge URL<input id="s-sms-url" value="${esc(s.sms.bridgeUrl)}" placeholder="http://127.0.0.1:8765/sms"></label>
+          <label class="field">Bridge token<input id="s-sms-token" type="password" value="" placeholder="${s.sms.tokenConfigured ? 'Configured — leave blank to keep' : 'optional'}" autocomplete="off"></label>
+        </div>
+        <p style="color:var(--faint);font-size:12px;margin-top:10px">WhatsApp is the official Cloud API only — never WhatsApp Web scraping. SMS only leaves this machine if a local bridge is configured. Group broadcasts stay off unless you opt in below.</p>
+        <h3 style="margin-top:14px">People ARIA can message</h3>
+        ${A(s.contacts).map(c => `<div class="alarm-row"><div class="ar-main"><strong>${esc(c.name)}</strong><div class="r-sub">${esc(Object.entries(c.channels || {}).filter(([,v]) => v).map(([k,v]) => k + ': ' + v).join(' · ') || 'no channels')}</div></div><button class="btn small" data-contact-del="${esc(c.id)}">remove</button></div>`).join('') || '<div class="empty">No contacts yet.</div>'}
+        <div class="form-grid" style="margin-top:10px;grid-template-columns:1fr 1fr 1fr auto;align-items:end">
+          <label class="field">Name<input id="ct-name" placeholder="Kamau"></label>
+          <label class="field">Channel<select id="ct-ch"><option value="telegram">telegram</option><option value="whatsapp">whatsapp</option><option value="sms">sms</option><option value="email">email</option></select></label>
+          <label class="field">Handle / number<input id="ct-handle" placeholder="@user or +254…"></label>
+          <button class="btn" id="ct-add">＋ Add</button>
+        </div>
+      </div>
+
+      <div class="card"><h3>🎵 Music</h3>
+        <p style="color:var(--dim);font-size:12.5px">Playback is this browser’s audio element or a local file/URL you configure. Spotify, Apple Music and YouTube are not connected — ARIA will not pretend they are.</p>
+        <label class="field">Local audio URL<input id="s-media-url" value="${esc(s.media.localUrl)}" placeholder="https://…/track.mp3 or /audio/morning.mp3"></label>
+      </div>
+
+      <div class="card"><h3>🔐 Permissions</h3>
+        <p style="color:var(--dim);font-size:12.5px;margin:0 0 8px">Default deny. Sending, deleting, publishing or purchasing never happens without an explicit grant <em>and</em> a confirmation (or a matching auto-send rule you wrote).</p>
+        ${['whatsapp.send','telegram.send','sms.send','email.send','calendar.write'].map(g => `<label class="perm-row"><span>${esc(g)}</span><input type="checkbox" data-grant="${g}" ${(perms.grants && perms.grants[g]) ? 'checked' : ''}></label>`).join('')}
+        <label class="perm-row"><span>Allow group / broadcast sends</span><input type="checkbox" id="s-allow-group" ${perms.allowGroupSend ? 'checked' : ''}></label>
+        <h3 style="margin-top:14px">Recent audit</h3>
+        ${auditList.length ? auditList.map(a => `<div class="audit-row">${esc(a.ts ? new Date(a.ts).toISOString().slice(11, 19) : '')} · ${esc(a.action)} · ${esc(a.integration || a.target || '')} · ${esc(a.result || '')}</div>`).join('') : '<div class="empty">No audited actions yet.</div>'}
+      </div>
+    </div>
+    <p style="margin-top:14px;color:var(--faint);font-size:12px">Secrets never leave your machine — stored in <code>data/settings.json</code> on your own disk. Blank secret fields keep the previous value.</p>`;
 
   $('#set-save').onclick = async () => {
     const gender = $('#s-voice-gender') ? $('#s-voice-gender').value : storedVoiceGender();
@@ -1601,8 +1754,14 @@ async function viewSettings(main) {
       },
       voiceGender: gender === 'female' ? 'female' : 'male',
       smtp: { host: $('#s-smtphost').value, port: +$('#s-smtpport').value || 587, user: $('#s-smtpuser').value, pass: $('#s-smtppass').value, to: $('#s-smtpto').value },
+      telegram: { enabled: !!( $('#s-tg-on') && $('#s-tg-on').checked ), token: ($('#s-tg-token') && $('#s-tg-token').value) || '', allowedChatId: ($('#s-tg-chat') && $('#s-tg-chat').value) || '' },
+      sms: { enabled: !!( $('#s-sms-on') && $('#s-sms-on').checked ), bridgeUrl: ($('#s-sms-url') && $('#s-sms-url').value) || '', token: ($('#s-sms-token') && $('#s-sms-token').value) || '' },
+      media: { provider: 'browser', localUrl: ($('#s-media-url') && $('#s-media-url').value) || '' },
       discretion: $('#s-discretion').checked
     });
+    const grants = {};
+    $$('input[data-grant]', main).forEach(el => { grants[el.dataset.grant] = !!el.checked; });
+    await POST('/api/permissions', { grants, allowGroupSend: !!( $('#s-allow-group') && $('#s-allow-group').checked ) }).catch(() => {});
     Speech.setGender(gender);          // this device switches over immediately
     for (const c of conns) {
       const enabled = $(`input[data-conn="${c.id}"]`).checked;
@@ -1659,6 +1818,37 @@ async function viewSettings(main) {
   };
   $('#btn-push').onclick = () => PushClient.subscribe();
   $('#btn-push-test').onclick = () => PushClient.test();
+  $$('button[data-oauth]', main).forEach(b => b.onclick = async () => {
+    try {
+      const r = await api('/api/oauth/' + b.dataset.oauth + '/start');
+      if (r.url) location.href = r.url; else toast(r.error || 'OAuth is not configured');
+    } catch (e) { toast(e.message); }
+  });
+  $$('button[data-revoke]', main).forEach(b => b.onclick = async () => {
+    if (!confirm('Revoke saved tokens for ' + b.dataset.revoke + '?')) return;
+    try { await POST('/api/integrations/' + b.dataset.revoke + '/revoke'); toast('Revoked'); route(); }
+    catch (e) { toast(e.message); }
+  });
+  $$('button[data-alarm-cancel]', main).forEach(b => b.onclick = async () => {
+    const kind = b.dataset.kind === 'reminder' ? 'reminders' : 'alarms';
+    try { await POST('/api/' + kind + '/' + encodeURIComponent(b.dataset.alarmCancel) + '/cancel'); toast('Cancelled'); route(); }
+    catch (e) { toast(e.message); }
+  });
+  $$('button[data-contact-del]', main).forEach(b => b.onclick = async () => {
+    try { await api('/api/contacts/' + encodeURIComponent(b.dataset.contactDel), { method: 'DELETE' }); toast('Contact removed'); route(); }
+    catch (e) { toast(e.message); }
+  });
+  const addCt = $('#ct-add');
+  if (addCt) addCt.onclick = async () => {
+    const name = ($('#ct-name') && $('#ct-name').value.trim()) || '';
+    const ch = ($('#ct-ch') && $('#ct-ch').value) || 'telegram';
+    const handle = ($('#ct-handle') && $('#ct-handle').value.trim()) || '';
+    if (!name || !handle) return toast('Name and handle required');
+    try {
+      await POST('/api/contacts', { name, channels: { [ch]: handle } });
+      toast('Contact saved'); route();
+    } catch (e) { toast(e.message); }
+  };
 }
 
 function configFields(id, conf) {
@@ -1668,7 +1858,11 @@ function configFields(id, conf) {
     slack: [['userToken', 'User token (xoxp-…)', 'password']],
     whatsapp: [['accessToken', 'Cloud API access token', 'password'], ['phoneNumberId', 'Phone number ID']]
   };
-  return (F[id] || []).map(([k, label, type]) => `<label class="field">${label}<input data-k="${id}.${k}" type="${type || 'text'}" value="${esc(conf[k] || '')}"></label>`).join('');
+  return (F[id] || []).map(([k, label, type]) => {
+    const isSecret = type === 'password';
+    const placeholder = isSecret && conf[k] ? 'Configured — leave blank to keep' : '';
+    return `<label class="field">${label}<input data-k="${id}.${k}" type="${type || 'text'}" value="${isSecret ? '' : esc(conf[k] || '')}" placeholder="${esc(placeholder)}" autocomplete="off"></label>`;
+  }).join('');
 }
 function configValues(id) {
   const out = {};
@@ -1707,6 +1901,8 @@ function bindTaskToggles(sel) {
   await refreshState().catch(() => {}); // a 401 here surfaces the unlock overlay via api()
   route();
   setInterval(() => { refreshState().then(updateSidebar).catch(() => {}); }, 60_000);
+  setTimeout(() => AlarmClient.poll(), 1500);
+  setInterval(() => AlarmClient.poll(), 30_000);
 })();
 
 

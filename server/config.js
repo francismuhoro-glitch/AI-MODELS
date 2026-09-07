@@ -3,6 +3,7 @@
    Serverless-safe: store.js writes to /tmp (or Supabase) when running on Vercel, and every
    write is wrapped so a read-only filesystem (EROFS) can never crash a request. */
 const store = require('./store');
+const secrets = require('./secrets');
 
 const LLM_PROVIDERS = ['auto', 'ollama', 'openai', 'offline'];
 const VOICE_GENDERS = ['male', 'female'];
@@ -36,6 +37,11 @@ const DEFAULTS = {
   smtp: { host: '', port: 587, secure: false, user: '', pass: '', to: '' },
   brief: { email: false },
   telegram: { enabled: false, token: '', allowedChatId: '' },
+  sms: { enabled: false, bridgeUrl: '', token: '' },
+  media: { provider: 'browser', localUrl: '' },
+  contacts: [],
+  permissions: { grants: {}, allowGroupSend: false, autoSendRules: [] },
+  routines: { morning: { enabled: true, steps: ['calendar_today', 'unread_summary'] } },
   connectors: {
     demo: { enabled: false, config: {} },
     google: { enabled: false },
@@ -83,6 +89,14 @@ function normalize(cfg) {
   out.rhythm = merge(clone(DEFAULTS.rhythm), out.rhythm || {});
   out.discretion = out.discretion !== false;   // default ON — never leak secrets to TTS
   out.telegram = merge(clone(DEFAULTS.telegram), out.telegram || {});
+  out.sms = merge(clone(DEFAULTS.sms), out.sms || {});
+  out.media = merge(clone(DEFAULTS.media), out.media || {});
+  out.permissions = merge(clone(DEFAULTS.permissions), out.permissions || {});
+  out.permissions.grants = out.permissions.grants && typeof out.permissions.grants === 'object' ? out.permissions.grants : {};
+  out.permissions.autoSendRules = Array.isArray(out.permissions.autoSendRules) ? out.permissions.autoSendRules : [];
+  out.permissions.allowGroupSend = !!out.permissions.allowGroupSend;
+  out.routines = merge(clone(DEFAULTS.routines), out.routines || {});
+  out.contacts = Array.isArray(out.contacts) ? out.contacts : [];
   out.connectors = merge(clone(DEFAULTS.connectors), out.connectors || {});
   for (const key of Object.keys(DEFAULTS.connectors)) {
     out.connectors[key] = out.connectors[key] || { enabled: false };
@@ -113,24 +127,20 @@ function load() {
 }
 
 function publicConfig(cfg) {
-  const out = clone(cfg || load());
+  const src = cfg || load();
+  const out = secrets.redactTree(clone(src), src);
   out.llm = out.llm || {}; out.llm.openai = out.llm.openai || {};
   out.llm.openai.apiKey = '';
-  out.llm.openai.apiKeyConfigured = !!openaiSecret(cfg);
-  out.smtp = out.smtp || {}; out.smtp.pass = ''; out.smtp.passConfigured = !!(cfg && cfg.smtp && cfg.smtp.pass);
-  out.telegram = out.telegram || {}; out.telegram.token = ''; out.telegram.tokenConfigured = !!(cfg && cfg.telegram && cfg.telegram.token);
+  out.llm.openai.apiKeyConfigured = !!openaiSecret(src);
+  out.smtp = out.smtp || {}; out.smtp.pass = ''; out.smtp.passConfigured = !!(src && src.smtp && src.smtp.pass);
+  out.telegram = out.telegram || {}; out.telegram.token = ''; out.telegram.tokenConfigured = !!(src && src.telegram && src.telegram.token);
   return out;
 }
 function openaiSecret(cfg) { return String((cfg && cfg.llm && cfg.llm.openai && cfg.llm.openai.apiKey) || process.env.OPENAI_API_KEY || '').trim(); }
 
 async function save(patch) {
-  const incoming = clone(patch || {});
   const current = load();
-  if (incoming.llm && incoming.llm.openai && !String(incoming.llm.openai.apiKey || '').trim()) {
-    incoming.llm.openai.apiKey = current.llm.openai.apiKey;
-  }
-  if (incoming.smtp && Object.prototype.hasOwnProperty.call(incoming.smtp, 'pass') && !String(incoming.smtp.pass || '').trim()) incoming.smtp.pass = current.smtp.pass;
-  if (incoming.telegram && Object.prototype.hasOwnProperty.call(incoming.telegram, 'token') && !String(incoming.telegram.token || '').trim()) incoming.telegram.token = current.telegram.token;
+  const incoming = secrets.preserveBlanks(current, clone(patch || {}));
   cache = normalize(merge(current, incoming));
   try { await store.docSet('settings', cache); } catch (_) { /* read-only fs / offline store: keep in memory */ }
   return cache;

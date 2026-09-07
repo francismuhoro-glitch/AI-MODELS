@@ -250,3 +250,14 @@ label.field { display: flex; flex-direction: column; gap: 5px; font-size: 12px; 
 .ac-skills { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
 .ac-hint { color: var(--faint); font-size: 11.5px; margin-top: 6px; }
 .agency-hub .suggests { margin-top: 8px; }
+
+/* Automation hub */
+.confirm-card { margin-top: 10px; padding: 10px 12px; border: 1px solid rgba(255,200,87,.45); background: rgba(255,200,87,.08); border-radius: 12px; }
+.confirm-card .confirm-preview { font-size: 12.5px; color: var(--dim); margin-bottom: 8px; white-space: pre-wrap; }
+.confirm-card .confirm-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.chip.faint { color: var(--faint); }
+.perm-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 2px; border-bottom: 1px solid rgba(255,255,255,.05); font-size: 13px; }
+.perm-row:last-child { border-bottom: none; }
+.alarm-row { display: flex; align-items: center; gap: 10px; padding: 8px 2px; border-bottom: 1px solid rgba(255,255,255,.05); }
+.alarm-row .ar-main { flex: 1; min-width: 0; }
+.audit-row { font-family: var(--mono); font-size: 11px; color: var(--dim); padding: 6px 0; border-bottom: 1px dashed rgba(255,255,255,.06); }
