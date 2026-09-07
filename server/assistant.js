@@ -1020,35 +1020,66 @@ async function executeTool(name, args) {
 async function tryToolPass(message, memory, cfg) {
   const conf = cfg || cfgm.load();
   const tz = (conf.owner && conf.owner.timezone) || 'Africa/Nairobi';
-  let context = '';
-  try { context = brain.contextPack(message); } catch (_) { context = ''; }
+  let context = ''; try { context = brain.contextPack(message); } catch (_) {}
   const history = ((memory && memory.history) || []).filter((h, i, all) => !(i === all.length - 1 && h.role === 'user'));
-  let text = null, usedEngine = 'offline';
-  try {
-    const out = await llmChat(
-      SYSTEM_PROMPT,
-      `CONTEXT:\n${context}\n\nCURRENT TIME: ${dayLabel(Date.now(), tz)} ${timeStr(Date.now(), tz)} (${tz})\n\nUSER: ${message}`,
-      history,
-      TOOL_DEFS
-    );
-    text = out && out.text;
-    usedEngine = (out && out.engine) || 'offline';
-  } catch (_) { return null; }
-  if (!text) return null;
-  const call = parseToolCall(text);
-  if (!call || !TOOL_NAMES.has(call.tool)) return null;
-  const result = await executeTool(call.tool, call.args);
-  if (!result || !result.reply) return null;
-  return {
-    reply: result.reply,
-    intent: result.intent || `tool:${call.tool}`,
-    /* Keep the familiar engine labels so the UI/tests recognise the source. */
-    source: call.tool === 'web_search' ? 'web-search' : `tool:${usedEngine}`,
-    tool: call.tool,
-    args: call.args,
-    ...(result.event ? { event: result.event } : {}),
-    ...(result.task ? { task: result.task } : {})
-  };
+  const started = Date.now();
+  let retryUsed = false;
+  let lastEngine = 'offline';
+  let messages = history.slice();
+
+  for (let iteration = 0; iteration < 5 && Date.now() - started < 45_000; iteration++) {
+    let out;
+    try {
+      out = await llmChat(SYSTEM_PROMPT,
+        `CONTEXT:\n${context}\n\nCURRENT TIME: ${dayLabel(Date.now(), tz)} ${timeStr(Date.now(), tz)} (${tz})\n\nUSER: ${message}`,
+        messages, TOOL_DEFS);
+    } catch (_) { return null; }
+    lastEngine = (out && out.engine) || lastEngine;
+    if (!out) return null;
+
+    const native = Array.isArray(out.toolCalls) && out.toolCalls.length ? out.toolCalls[0] : null;
+    if (!native) {
+      /* A second model response is the reasoning/synthesis after seeing tool output. */
+      if (out.text && messages.some(h => h.role === 'tool')) {
+        const prior = messages.slice().reverse().find(h => h.role === 'assistant' && h.tool_calls);
+        const fn = prior && prior.tool_calls && prior.tool_calls[0] && prior.tool_calls[0].function;
+        return { reply: out.text, intent: `tool:${fn ? fn.name : 'result'}`, source: `tool:${lastEngine}`, ...(fn ? { tool: fn.name, args: (() => { try { return JSON.parse(fn.arguments); } catch (_) { return {}; } })() } : {}) };
+      }
+      /* Ollama/offline compatibility: only the legacy text parser reaches this branch. */
+      const call = parseToolCall(out.text);
+      if (!call || !TOOL_NAMES.has(call.tool)) return null;
+      const result = await executeTool(call.tool, call.args);
+      if (!result || !result.reply) return null;
+      return { reply: result.reply, intent: result.intent || `tool:${call.tool}`, source: `tool:${lastEngine}`, tool: call.tool, args: call.args, ...(result.event ? { event: result.event } : {}), ...(result.task ? { task: result.task } : {}) };
+    }
+
+    const call = native;
+    const toolDef = TOOL_DEFS.find(t => t.name === call.tool);
+    const valid = !!(toolDef && call.args && typeof call.args === 'object' && !Array.isArray(call.args) && Object.entries(toolDef.args || {}).every(([k, v]) => v.optional || (Object.prototype.hasOwnProperty.call(call.args, k) && String(call.args[k]).trim())));
+    const assistantCall = { role: 'assistant', content: null, tool_calls: [{ id: call.id || `call-${iteration}`, type: 'function', function: { name: call.tool, arguments: JSON.stringify(call.args || {}) } }] };
+    messages.push(assistantCall);
+    const callId = call.id || `call-${iteration}`;
+    if (!valid) {
+      const error = `Invalid arguments for ${call.tool}. Required fields are missing or malformed. Correct the arguments and retry once.`;
+      messages.push({ role: 'tool', tool_call_id: callId, content: error });
+      if (retryUsed) return null;
+      retryUsed = true;
+      continue;
+    }
+    const result = await executeTool(call.tool, call.args);
+    if (!result) {
+      messages.push({ role: 'tool', tool_call_id: callId, content: 'Tool execution failed or arguments were invalid. Correct the arguments and retry once.' });
+      if (retryUsed) return null;
+      retryUsed = true;
+      continue;
+    }
+    const toolContent = JSON.stringify({ reply: result.reply, event: result.event || null, task: result.task || null });
+    messages.push({ role: 'tool', tool_call_id: callId, content: toolContent });
+    /* If the model has another tool call, continue. Otherwise ask it to synthesize the result. */
+    if (iteration === 4) return { reply: result.reply, intent: result.intent || `tool:${call.tool}`, source: `tool:${lastEngine}`, tool: call.tool, args: call.args };
+    if (result.reply && !native.id) return { reply: result.reply, intent: result.intent || `tool:${call.tool}`, source: `tool:${lastEngine}`, tool: call.tool, args: call.args };
+  }
+  return null;
 }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -1494,7 +1525,7 @@ async function offlineEngine(msg, context, engineStatus) {
     return calendarSummary(m);
   }
 
-  if (/\b(priorit|urgent|important|to do|tasks|focus)\b/.test(m)) {
+  if (/\b(priorit\w*|urgent|important|to.?do|tasks?|focus)\b/.test(m)) {
     const open = (db.inbox || []).filter(i => !i.done);
     const items = open.slice(0, 5);
     if (!items.length) return "No urgent priorities right now. All tasks are clear!";

@@ -39,8 +39,8 @@ function openaiConfig(cfg) {
   const o = (c.llm && c.llm.openai) || {};
   return {
     apiKey: String(o.apiKey || process.env.OPENAI_API_KEY || '').trim(),
-    baseUrl: String(o.baseUrl || 'https://api.openai.com/v1').replace(/\/+$/, ''),
-    model: String(o.model || 'gpt-4o-mini')
+    baseUrl: String(o.baseUrl || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/+$/, ''),
+    model: String(o.model || process.env.OPENAI_MODEL || 'openai/gpt-oss-120b')
   };
 }
 
@@ -101,7 +101,13 @@ function buildMessages(system, user, history) {
      model can resolve follow-ups like "what about tomorrow?". */
   const messages = [{ role: 'system', content: String(system || '') }];
   for (const h of (Array.isArray(history) ? history : []).slice(-10)) {
-    if (h && h.content) messages.push({ role: h.role === 'assistant' ? 'assistant' : 'user', content: String(h.content).slice(0, 4000) });
+    if (h && (h.content !== undefined || h.tool_calls)) {
+      const role = ['assistant', 'tool', 'system'].includes(h.role) ? h.role : 'user';
+      const message = { role, content: h.content === undefined ? null : String(h.content).slice(0, 4000) };
+      if (h.tool_call_id) message.tool_call_id = h.tool_call_id;
+      if (h.tool_calls) message.tool_calls = h.tool_calls;
+      messages.push(message);
+    }
   }
   messages.push({ role: 'user', content: String(user || '') });
   return messages;
@@ -124,13 +130,17 @@ async function chatOllama(cfg, messages) {
   return { text, engine: `ollama:${want}` };
 }
 
-async function chatOpenAI(cfg, messages) {
+function nativeToolSchemas(tools) {
+  return (Array.isArray(tools) ? tools : []).map(t => ({ type: 'function', function: { name: t.name, description: t.description || '', parameters: { type: 'object', properties: Object.fromEntries(Object.entries(t.args || {}).map(([k, v]) => [k, { type: 'string', description: String(v.type || '') }])), required: Object.entries(t.args || {}).filter(([, v]) => !v.optional).map(([k]) => k), additionalProperties: false } } }));
+}
+
+async function chatOpenAI(cfg, messages, tools) {
   const o = openaiConfig(cfg);
   if (!o.apiKey) throw new Error('openai: no api key configured');
   const res = await fetch(`${o.baseUrl}/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${o.apiKey}` },
-    body: JSON.stringify({ model: o.model, stream: false, temperature: 0.4, messages }),
+    body: JSON.stringify({ model: o.model, stream: false, temperature: 0.4, messages, ...(tools && tools.length ? { tools: nativeToolSchemas(tools), tool_choice: 'auto' } : {}) }),
     signal: AbortSignal.timeout(60_000)
   });
   if (!res.ok) {
@@ -139,9 +149,11 @@ async function chatOpenAI(cfg, messages) {
     throw new Error(`openai ${res.status} ${String(detail).slice(0, 160)}`);
   }
   const json = await res.json();
-  const text = (json.choices && json.choices[0] && json.choices[0].message && json.choices[0].message.content) || null;
-  if (!text) throw new Error('openai empty reply');
-  return { text, engine: `openai:${o.model}` };
+  const message = json.choices && json.choices[0] && json.choices[0].message;
+  const calls = message && Array.isArray(message.tool_calls) ? message.tool_calls.map(c => ({ id: c.id, tool: c.function && c.function.name, args: (() => { try { return JSON.parse(c.function.arguments || '{}'); } catch (_) { return null; } })() })) : [];
+  const text = (message && message.content) || null;
+  if (!text && !calls.length) throw new Error('openai empty reply');
+  return { text, toolCalls: calls, engine: `openai:${o.model}` };
 }
 
 /**
@@ -164,9 +176,13 @@ async function llmChat(system, user, history, tools) {
   let lastError = null;
   for (const provider of plan) {
     try {
-      const out = provider === 'openai' ? await chatOpenAI(cfg, messages) : await chatOllama(cfg, messages);
+      const out = provider === 'openai' ? await chatOpenAI(cfg, messages, hasTools ? tools : null) : await chatOllama(cfg, messages);
       if (out && out.text) return { ...out, tools: hasTools };
-    } catch (e) { lastError = (e && e.message) || 'llm error'; /* fall through to the next provider */ }
+    } catch (e) {
+      lastError = (e && e.message) || 'llm error';
+      if (/openai 404\b/.test(lastError)) return { text: null, engine: 'openai-error', error: `Configured model was not found or is unavailable. Set llm.openai.model to a supported model (for example openai/gpt-oss-120b) and try again. Provider said: ${lastError}` };
+      /* fall through to the next provider */
+    }
   }
   return { text: null, engine: 'offline', ...(lastError ? { error: lastError } : {}), tools: hasTools };
 }

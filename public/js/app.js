@@ -1529,7 +1529,7 @@ async function viewSettings(main) {
         <label class="field">Ollama URL<input id="s-ourl" value="${esc(s.llm.ollamaUrl)}"></label>
         <label class="field">Local model<input id="s-model" value="${esc(s.llm.model)}" placeholder="${esc(s.llm.recommendedModel || 'qwen2.5:7b')}"></label>
         <label class="field">Cloud base URL<input id="s-oai-url" value="${esc(s.llm.openai.baseUrl)}" placeholder="https://api.openai.com/v1"></label>
-        <label class="field">Cloud API key<input id="s-oai-key" type="password" value="${esc(s.llm.openai.apiKey)}" placeholder="sk-… (optional)" autocomplete="off"></label>
+        <label class="field">Cloud API key<input id="s-oai-key" type="password" value="" placeholder="${s.llm.openai.apiKeyConfigured ? 'Configured — leave blank to keep' : 'sk-… (optional)'}" autocomplete="off"></label>
         <label class="field">Cloud model<input id="s-oai-model" value="${esc(s.llm.openai.model)}" placeholder="gpt-4o-mini"></label>
       </div>
       <p style="color:var(--faint);font-size:12px;margin-top:10px"><strong>Local (free & private):</strong> install <a href="https://ollama.com" target="_blank" style="color:var(--accent)">Ollama</a> → <code>ollama pull ${esc(s.llm.recommendedModel || 'qwen2.5:7b')}</code> → set the model above. <strong>${esc(s.llm.recommendedModel || 'qwen2.5:7b')}</strong> is the recommended default (best reasoning on 8&nbsp;GB); <code>llama3.1:8b</code> is a solid alternative. ARIA also understands tool calls with either.</p>
