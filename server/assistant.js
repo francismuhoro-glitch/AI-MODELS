@@ -30,6 +30,9 @@
  */
 const dbm = require('./db');
 const brain = require('./brain');
+const memoryMod = require('./memory');
+const learning = require('./learning');
+const dictionary = require('./dictionary');
 const cfgm = require('./config');
 const weblearn = require('./weblearn');
 const websearch = require('./websearch');
@@ -42,7 +45,25 @@ You manage their day job and their business. You are concise, proactive, well-or
 You remember the earlier turns of this conversation (provided as history) — resolve follow-up
 questions like "what about tomorrow?" or "add another one" using that context instead of asking again.
 Use the provided CONTEXT (calendar, emails, chats, second-brain notes) to answer the user's query.
-If something is unknown, say so and suggest what to check. Never invent meetings or emails.`;
+If something is unknown, say so and suggest what to check. Never invent meetings or emails.
+A MEMORY block may be provided: it holds durable facts and preferences about the user retrieved
+by meaning. Trust it, never contradict it, and never invent memories beyond it. When the user
+states a lasting fact, preference or correction, store it with the remember tool (one short
+sentence — never secrets, PINs, tokens, card numbers or full message bodies).`;
+
+/* LANGUAGE — Swahili / Kikuyu / Sheng grounding (Phase 4). The block is only added when it can
+   change behaviour (a non-English mode, or a dictionary phrase in this message), so an
+   English-only install sends the exact same prompt as before. */
+function systemPromptFor(text) {
+  try {
+    const mode = dictionary.mode();
+    const matched = text ? dictionary.match(text) : null;
+    if (mode === 'en' && !matched) return SYSTEM_PROMPT;
+    return `${SYSTEM_PROMPT}\n\n${dictionary.promptBlock(text)}`;
+  } catch (_) {
+    return SYSTEM_PROMPT;
+  }
+}
 
 /* ════════════════════════════════════════════════════════════════════════
    0. NATURAL PHRASING — strip politeness/filler, then match the intent
@@ -267,6 +288,27 @@ function resolveFollowUp(message, memory) {
   return out;
 }
 
+/**
+ * SEMANTIC MEMORY — pull the durable memories that matter for this message BEFORE anything
+ * reasons. Never throws: without Supabase/Ollama this degrades to the local store (and with
+ * nothing configured at all, to an empty block), so a turn can never fail because of memory.
+ * @returns {Promise<{memories: Array, text: string, backend: string}>}
+ */
+async function recallMemory(message, limit = memoryMod.DEFAULT_LIMIT) {
+  try {
+    return await memoryMod.retrieveForPrompt(message, { limit });
+  } catch (_) {
+    return { memories: [], text: '', backend: 'unavailable' };
+  }
+}
+
+/** Compact memory evidence for the UI — never the embedding, never internal fields. */
+function publicRecalled(memories) {
+  return (Array.isArray(memories) ? memories : [])
+    .slice(0, 10)
+    .map((m) => ({ id: m.id, content: m.content, kind: m.kind, importance: m.importance, source: m.source, blended: m.blended }));
+}
+
 /* Remember the entities + query topic of this turn for the NEXT turn's carry-over. */
 function updateMemory(db, rawMessage, effectiveMessage, intent) {
   const conv = convState(db);
@@ -315,8 +357,20 @@ async function respond(message) {
   const resolved = resolveFollowUp(raw, memory);
   const effective = resolved.message || raw;
 
+  /* LANGUAGE NORMALIZATION (Phase 4) — a Swahili/Sheng/Kikuyu command phrase is rewritten into
+     the English phrasing the deterministic layer already understands BEFORE anything routes.
+     The original message is what the model sees; the rewrite is routing sugar. */
+  const lang = dictionary.apply(effective);
+  const routed = lang.text || effective;
+  memory.language = lang;
+
+  /* SEMANTIC MEMORY — embed the incoming message, fetch the top memories and inject them into
+     the prompt BEFORE the director/assistant reasons. Retrieval also bumps last_accessed. */
+  const recalled = await recallMemory(effective);
+  const memoryBlock = recalled.text;
+
   let reply, source, intent = null, toolCall = null, extra = {};
-  const pre = await routeIntent(effective, memory);
+  const pre = await routeIntent(routed, memory);
   if (pre) {
     reply = pre.reply;
     intent = pre.intent || null;
@@ -324,13 +378,15 @@ async function respond(message) {
     extra = {
       ...(pre.confirmation ? { confirmation: pre.confirmation } : {}),
       ...(pre.clientAction ? { clientAction: pre.clientAction } : {}),
-      ...(pre.needsConfirmation ? { needsConfirmation: true } : {})
+      ...(pre.needsConfirmation ? { needsConfirmation: true } : {}),
+      /* Which language the reply came back in (Phase 4) — the UI badges it. */
+      ...(pre.language ? { language: pre.language } : {})
     };
   } else {
     /* TOOL PASS FIRST — whatever the deterministic layer did not recognise is offered to the
        model with the tool schema, so ANY phrasing can still create events, add tasks, search
        the calendar/brain or trigger a web search. Offline this returns null instantly. */
-    const acted = await tryToolPass(effective, memory, cfg);
+    const acted = await tryToolPass(effective, memory, cfg, memoryBlock);
     if (acted) {
       reply = acted.reply;
       intent = acted.intent || null;
@@ -347,19 +403,21 @@ async function respond(message) {
       source = 'web-search';
     } else {
       const context = brain.contextPack(effective);
+      /* The retrieved memories lead the prompt — durable facts the model must respect. */
+      const contextWithMemory = memoryBlock ? `${memoryBlock}\n\n${context}` : context;
       /* Multi-turn memory: pass everything except the current turn (it is the user turn below). */
       const history = memory.history.filter((h, i) => !(i === memory.history.length - 1 && h.role === 'user'));
       const followUpNote = resolved.isFollowUp ? `\n\n(This message is a FOLLOW-UP. ${resolved.note || ''})` : '';
       const { text, engine: usedEngine } = await llmChat(
-        SYSTEM_PROMPT,
-        `CONTEXT:\n${context}\n\nCURRENT TIME: ${dayLabel(Date.now(), cfg.owner.timezone)} ${timeStr(Date.now(), cfg.owner.timezone)} (${cfg.owner.timezone})\n\nUSER: ${effective}${followUpNote}`,
+        systemPromptFor(effective),
+        `CONTEXT:\n${contextWithMemory}\n\nCURRENT TIME: ${dayLabel(Date.now(), cfg.owner.timezone)} ${timeStr(Date.now(), cfg.owner.timezone)} (${cfg.owner.timezone})\n\nUSER: ${effective}${followUpNote}${lang.note || ''}`,
         history
       );
       if (text) {
         reply = text;
         source = usedEngine;
       } else {
-        reply = await offlineEngine(effective, context, engine);
+        reply = await offlineEngine(effective, contextWithMemory, engine, recalled.memories);
         source = 'offline-engine';
       }
     }
@@ -378,12 +436,22 @@ async function respond(message) {
      The full detail stays in `reply` for the screen. */
   const speech = toSpeechText(reply, { discretion: cfg.discretion !== false });
 
+  /* DURABLE LEARNING (Phase 3) — high-signal turns are QUEUED for out-of-band extraction.
+     Deliberately fire-and-forget: the reply never waits for an embedding or a write, and the
+     queue is persisted first, so a serverless freeze is finished by the next turn/sweep. */
+  try {
+    learning.scheduleExtraction({ message: raw, reply, source: source || 'chat', chatId: null });
+  } catch (_) {}
+
   return {
     reply,
     speech,
     engine: source,
     llm: engine,
     intent: intent || undefined,
+    /* Retrieved semantic memory (evidence for the UI + tests; never the embedding). */
+    memories: publicRecalled(recalled.memories),
+    memoryBackend: recalled.backend,
     /* When the model acted through a tool, the UI (and the tests) can see exactly what ran. */
     ...(toolCall ? { tool: toolCall.tool, toolArgs: toolCall.args } : {}),
     ...extra,
@@ -477,6 +545,17 @@ async function routeIntent(msg, memory) {
   const tz = (cfg.owner && cfg.owner.timezone) || 'Africa/Nairobi';
   const conv = convState(db);
 
+  /* ---- Language layer (Phase 4) ----
+     A Swahili/Sheng/Kikuyu phrase that is purely social (greeting, thanks, goodbye, help, or the
+     honest "I cannot dial" reply) is answered deterministically in the user's language. A phrase
+     that carries a COMMAND was already rewritten to English before this function was called, so
+     the normal intent layer below handles it. */
+  try {
+    const applied = memory && memory.language ? memory.language : dictionary.apply(m);
+    const scripted = dictionary.scriptedReply(applied.matches, applied);
+    if (scripted) return scripted;
+  } catch (_) {}
+
   /* ---- Automation hub (alarms, reminders, messaging, media, confirmations) ----
      Runs before calendar/task regexes so "set an alarm" is never a meeting, and
      so a pending SEND confirmation is never hijacked by "confirm the plan". */
@@ -484,6 +563,22 @@ async function routeIntent(msg, memory) {
     const hub = await automation.route(sm);
     if (hub && hub.reply) return hub;
   } catch (_) {}
+
+  /* ---- Long-term memory commands (Phase 3) ----
+     Routed HERE, before the calendar/task regexes, so "forget that memory" can never be read as
+     "remove that event". Forgetting is a real deletion: the reply reports exactly what went. */
+  const forgetCmd = learning.matchForget(sm);
+  if (forgetCmd) {
+    const result = await learning.forget(forgetCmd);
+    return { reply: result.reply, intent: 'memory-forget', memoryForgotten: result.items.map((x) => x.id), removed: result.removed };
+  }
+  let memQ = m.match(/^what do you remember(?:\s+about\s+(.+?))?\s*\??$/i)
+    || m.match(/^what have you (?:learned|noted|remembered)(?:\s+about\s+me)?\s*\??$/i)
+    || m.match(/^(?:show|list)\s+(?:me\s+)?(?:my\s+)?(?:memories|long[-\s]?term memory)\s*\??$/i);
+  if (memQ) {
+    const topic = memQ[1] ? memQ[1].trim() : '';
+    return { reply: await learning.recallReply(topic), intent: 'memory-recall' };
+  }
 
   /* ---- Plan confirmation / cancellation (before generic event removal) ---- */
   if (conv.pendingPlan && (/^(?:confirm|lock(?:\s+it)?(?:\s+in)?|approve|keep|sounds\s+good|yes(?:\s+please)?)\b/i.test(m) || /^(?:yes|confirm|lock it in|approve)[.!\s]*$/i.test(m))) {
@@ -921,6 +1016,15 @@ const TOOL_DEFS = [
     args: { query: { type: 'string' } }
   },
   {
+    name: 'remember',
+    description: 'Store ONE short durable fact, preference or correction about the user in long-term semantic memory (max ~300 chars). Never store secrets, PINs, tokens, card numbers or full message bodies.',
+    args: {
+      content: { type: 'string — the fact in one short sentence, e.g. "Prefers meetings before 11am"' },
+      kind: { type: '"fact" | "preference" | "correction"', optional: true },
+      importance: { type: 'number 0..1 (0.5 default)', optional: true }
+    }
+  },
+  {
     name: 'plan_day',
     description: 'Generate the full autonomous plan (focus blocks, triage, meetings) for a day or the week.',
     args: { which: { type: '"today" | "tomorrow" | "week"', optional: true } }
@@ -1034,6 +1138,19 @@ async function executeTool(name, args, origin = 'assistant') {
         if (!q) return null;
         return { reply: await handleWebSearch(q), intent: 'web-search' };
       }
+      case 'remember': {
+        const content = str(a.content || a.fact || a.text || a.memory);
+        if (!content || content.length < 3) return null;
+        const kind = ['fact', 'preference', 'correction'].includes(str(a.kind).toLowerCase()) ? str(a.kind).toLowerCase() : 'fact';
+        const saved = await memoryMod.upsertMemory({
+          content,
+          kind,
+          importance: a.importance,
+          source: origin === 'tool-loop' ? 'assistant-tool' : 'assistant'
+        });
+        if (!saved) return null;
+        return { reply: `🧠 Noted and remembered: "${snippet(saved.content, 160)}" (${saved.kind}). Say "forget that" to remove it.`, intent: 'memory-add', memory: saved };
+      }
       case 'plan_day': {
         const which = str(a.which || a.day || a.scope).toLowerCase();
         return { reply: await generateSchedule(/week/.test(which) ? 'build a weekly plan' : (/today/.test(which) ? 'plan my day today' : 'plan my day tomorrow')), intent: 'plan' };
@@ -1052,10 +1169,11 @@ async function executeTool(name, args, origin = 'assistant') {
  * Returns null when no model is reachable, when the answer is not a tool call, or when the
  * tool/args do not validate — the caller then continues to web search / plain chat.
  */
-async function tryToolPass(message, memory, cfg) {
+async function tryToolPass(message, memory, cfg, memoryBlock = '') {
   const conf = cfg || cfgm.load();
   const tz = (conf.owner && conf.owner.timezone) || 'Africa/Nairobi';
   let context = ''; try { context = brain.contextPack(message); } catch (_) {}
+  if (memoryBlock) context = `${memoryBlock}\n\n${context}`;
   const history = ((memory && memory.history) || []).filter((h, i, all) => !(i === all.length - 1 && h.role === 'user'));
   const started = Date.now();
   let retryUsed = false;
@@ -1065,7 +1183,7 @@ async function tryToolPass(message, memory, cfg) {
   for (let iteration = 0; iteration < 5 && Date.now() - started < 45_000; iteration++) {
     let out;
     try {
-      out = await llmChat(SYSTEM_PROMPT,
+      out = await llmChat(systemPromptFor(message),
         `CONTEXT:\n${context}\n\nCURRENT TIME: ${dayLabel(Date.now(), tz)} ${timeStr(Date.now(), tz)} (${tz})\n\nUSER: ${message}`,
         messages, TOOL_DEFS);
     } catch (_) { return null; }
@@ -1085,7 +1203,7 @@ async function tryToolPass(message, memory, cfg) {
       if (!call || !TOOL_NAMES.has(call.tool)) return null;
       const result = await executeTool(call.tool, call.args, 'tool-loop');
       if (!result || !result.reply) return null;
-      return { reply: result.reply, intent: result.intent || `tool:${call.tool}`, source: `tool:${lastEngine}`, tool: call.tool, args: call.args, ...(result.event ? { event: result.event } : {}), ...(result.task ? { task: result.task } : {}), ...(result.confirmation ? { confirmation: result.confirmation } : {}), ...(result.clientAction ? { clientAction: result.clientAction } : {}), ...(result.needsConfirmation ? { needsConfirmation: true } : {}) };
+      return { reply: result.reply, intent: result.intent || `tool:${call.tool}`, source: `tool:${lastEngine}`, tool: call.tool, args: call.args, ...(result.event ? { event: result.event } : {}), ...(result.task ? { task: result.task } : {}), ...(result.memory ? { memory: result.memory } : {}), ...(result.confirmation ? { confirmation: result.confirmation } : {}), ...(result.clientAction ? { clientAction: result.clientAction } : {}), ...(result.needsConfirmation ? { needsConfirmation: true } : {}) };
     }
 
     const call = native;
@@ -1111,7 +1229,7 @@ async function tryToolPass(message, memory, cfg) {
     /* Never hand confirmation tokens or send payloads back to the model. */
     const toolContent = JSON.stringify(automation.toolResultForModel(result) || { reply: result.reply, event: result.event || null, task: result.task || null });
     messages.push({ role: 'tool', tool_call_id: callId, content: toolContent });
-    const extras = { ...(result.event ? { event: result.event } : {}), ...(result.task ? { task: result.task } : {}), ...(result.confirmation ? { confirmation: result.confirmation } : {}), ...(result.clientAction ? { clientAction: result.clientAction } : {}), ...(result.needsConfirmation ? { needsConfirmation: true } : {}) };
+    const extras = { ...(result.event ? { event: result.event } : {}), ...(result.task ? { task: result.task } : {}), ...(result.memory ? { memory: result.memory } : {}), ...(result.confirmation ? { confirmation: result.confirmation } : {}), ...(result.clientAction ? { clientAction: result.clientAction } : {}), ...(result.needsConfirmation ? { needsConfirmation: true } : {}) };
     /* If the model has another tool call, continue. Otherwise ask it to synthesize the result. */
     if (iteration === 4) return { reply: result.reply, intent: result.intent || `tool:${call.tool}`, source: `tool:${lastEngine}`, tool: call.tool, args: call.args, ...extras };
     if (result.reply && !native.id) return { reply: result.reply, intent: result.intent || `tool:${call.tool}`, source: `tool:${lastEngine}`, tool: call.tool, args: call.args, ...extras };
@@ -1183,6 +1301,11 @@ async function rollConversationSummary(db) {
   conv.summaryAt = Date.now();
   conv.summaryEngine = text ? 'llm' : 'heuristic';
   try { await dbm.saveNow(); } catch (_) { /* read-only fs: the in-memory summary still serves this process */ }
+  /* DURABLE LEARNING on the rolling cadence: the window is queued for model-assisted
+     extraction out-of-band (heuristics are the offline path). Never awaited here. */
+  try {
+    learning.scheduleSummaryExtraction({ turns: windowTurns, windowText: transcript, chatId: `rolling-${conv.lastSummaryTurn}` });
+  } catch (_) {}
   return conv.summary;
 }
 
@@ -1549,7 +1672,7 @@ function parseQueryDay(text, tz) {
   return { key: todayKey, label: 'today' };
 }
 
-async function offlineEngine(msg, context, engineStatus) {
+async function offlineEngine(msg, context, engineStatus, recalledMemories = []) {
   const db = dbm.load();
   const cfg = cfgm.load();
   const tz = (cfg.owner && cfg.owner.timezone) || 'Africa/Nairobi';
@@ -1625,6 +1748,12 @@ async function offlineEngine(msg, context, engineStatus) {
       '\n\n_Try saying "search for ..." or "look up ..." for a live web search._';
   }
 
+  /* Durable memories are the last honest resort: answer from what ARIA actually remembers. */
+  if (recalledMemories.length) {
+    return 'From my memory:\n\n' + recalledMemories.slice(0, 4).map(m => '- ' + snippet(m.content, 220)).join('\n') +
+      '\n\n_Ask me to "forget that" if any of this is wrong._';
+  }
+
   return 'I could not find information about that in your brain or on the web. You can teach me by saying "remember that ...", or try "search for ..." to search the web!';
 }
 
@@ -1651,8 +1780,13 @@ async function rememberReply(content) {
   const note = brain.ingestNote({ title: snippet(content, 80), content, source: 'assistant', tags: ['memory'] });
   brain.buildIndex();
   await dbm.saveNow();
+  /* Durable semantic memory too (searchable by meaning, survives the rolling summary). */
+  let saved = null;
+  try {
+    saved = await memoryMod.upsertMemory({ content, kind: 'fact', importance: 0.8, source: 'assistant' });
+  } catch (_) { saved = null; }
   const topic = extractTopics(content, 1)[0] || 'that';
-  return `🧠 Remembered: "${snippet(content, 160)}" — saved to brain. Ask me "what do you know about ${topic}?" anytime.`;
+  return `🧠 Remembered: "${snippet(content, 160)}" — saved to my brain${saved ? ' and long-term memory' : ''}. Ask me "what do you know about ${topic}?" anytime.`;
 }
 
 async function learnReply(url) {
@@ -1668,11 +1802,15 @@ module.exports = {
   respond, offlineEngine, isWebSearchQuery, isPersonalQuery,
   /* natural phrasing */
   stripFiller, matchScheduleRequest, cleanEventTitle, parseRelativeDateTime,
+  /* language layer (Phase 4) */
+  systemPromptFor,
   /* internal actions — shared by the regex layer and LLM tool calls */
   routeIntent, createEvent, createEventFromText, addTask, addTaskFromText, completeTaskByQuery,
   calendarSummary, brainSummary, guessContext,
   /* LLM tool calling */
   TOOL_DEFS, parseToolCall, tryParseJson, parseToolDate, executeTool, tryToolPass,
+  /* semantic memory + durable learning */
+  recallMemory, publicRecalled, learning,
   /* rolling conversation memory */
   rollConversationSummary, heuristicSummary, SUMMARY_EVERY,
   /* conversation memory */
@@ -1680,5 +1818,4 @@ module.exports = {
   /* autonomous scheduler */
   isPlannerRequest, planTargetDays, generateSchedule, confirmPlan, cancelPlan, moveEvent, removeEvent, findEventByWords,
   /* speech discretion */
-  toSpeechText, redactSensitive, applyDiscretion, parseQueryDay
-};
+  toSpeechText, redactSensitive, applyDiscretion, parseQueryDay, dictionary };

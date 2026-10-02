@@ -15,6 +15,7 @@
 const dbm = require('./db');
 const cfgm = require('./config');
 const brain = require('./brain');
+const memoryMod = require('./memory');
 const registry = require('./agents');
 const { snippet, cleanProfanity } = require('./util');
 
@@ -80,6 +81,20 @@ async function run(opts = {}) {
     trace: []
   };
 
+  /* 1a. SEMANTIC MEMORY — retrieve what ARIA durably remembers about the owner/topic and
+     hand it to the Director BEFORE anyone reasons. Never blocks a mission: failures here
+     degrade to an empty memory block. */
+  try {
+    const recalled = await memoryMod.retrieveForPrompt(task, { limit: 6 });
+    ctx.memory = recalled.memories || [];
+    ctx.memoryText = recalled.text || '';
+    ctx.memoryBackend = recalled.backend;
+  } catch (_) {
+    ctx.memory = [];
+    ctx.memoryText = '';
+    ctx.memoryBackend = 'unavailable';
+  }
+
   const startedAt = Date.now();
 
   /* 1. ARIA parses the instruction and delegates. */
@@ -107,6 +122,8 @@ async function run(opts = {}) {
     subtasks: p.subtasks,
     finalOutput,
     agentTrace: ctx.trace,
+    memoryUsed: (ctx.memory || []).map(m => ({ id: m.id, content: m.content, kind: m.kind })),
+    memoryBackend: ctx.memoryBackend || 'unavailable',
     startedAt,
     finishedAt,
     durationMs: finishedAt - startedAt,
@@ -124,19 +141,32 @@ async function run(opts = {}) {
     subtasks: p.subtasks,
     finalOutput,
     agentTrace: ctx.trace,
+    memoryUsed: record.memoryUsed,
+    memoryBackend: record.memoryBackend,
     startedAt,
     finishedAt,
     durationMs: record.durationMs
   };
 }
 
-/* Missions are memory too: keep the last N runs and write the report into the second brain. */
+/* Missions are memory too: keep the last N runs and write the report into the second brain
+   AND a durable `summary` memory row (dedupe-keyed by mission id, so a re-run never doubles). */
 async function persist(record) {
   try {
     const db = dbm.load();
     if (!Array.isArray(db.agencyRuns)) db.agencyRuns = [];
     db.agencyRuns.unshift(record);
     db.agencyRuns = db.agencyRuns.slice(0, MAX_RUNS);
+    try {
+      await memoryMod.upsertMemory({
+        content: `Agency mission — ${snippet(record.task, 140)} → ${snippet(record.finalOutput, 400)}`,
+        kind: 'summary',
+        importance: 0.4,
+        source: 'agency',
+        dedupeKey: `agency:${record.id}`,
+        metadata: { agents: record.agents, mode: record.mode }
+      });
+    } catch (_) { /* memory is best-effort; the mission itself already succeeded */ }
     brain.ingestNote({
       title: `Agency mission — ${snippet(record.task, 70)}`,
       content: record.finalOutput,

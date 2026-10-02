@@ -26,6 +26,10 @@ const permissions = require('./permissions');
 const integrations = require('./integrations');
 const messaging = require('./messaging');
 const media = require('./media');
+const phone = require('./phone');
+const memory = require('./memory');
+const learning = require('./learning');
+const dictionary = require('./dictionary');
 const secrets = require('./secrets');
 const automation = require('./automation');
 
@@ -104,6 +108,8 @@ function buildState() {
     timezone: tz,
     wakeTime: cfg.wakeTime,
     voiceGender: cfg.voiceGender || 'male',
+    /* Language mode (Phase 4). Kikuyu has no browser STT — the client disables the mic for it. */
+    language: (() => { try { return dictionary.languageInfo(); } catch (_) { return { mode: 'auto', sttLocale: null, sttSupported: true }; } })(),
     engine,
     llm: engine,
     activeEngine: engine.activeEngine || 'offline',
@@ -124,6 +130,16 @@ function buildState() {
     alarms: alarmItems,
     reminders: reminderItems,
     integrations: integrations.status(),
+    /* Android phone bridge: pending/acked commands. NEVER the bridge token. */
+    phone: (() => { try { return phone.publicState(); } catch (_) { return null; } })(),
+    /* Semantic memory: counts + backend only (the rows have their own endpoint). */
+    memory: (() => {
+      try {
+        const db = dbm.load();
+        const local = Array.isArray(db.memories) ? db.memories.length : 0;
+        return { backend: (process.env.SUPABASE_URL && (process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_KEY)) ? 'supabase' : 'local', local, dim: memory.embedDim() };
+      } catch (_) { return null; }
+    })(),
     pendingConfirmation: permissions.publicConfirmation(permissions.latestPending()),
     stats: {
       engine: engine.activeEngine || 'offline',
@@ -136,7 +152,8 @@ function buildState() {
       tasks: tasks.length,
       agencyRuns: agencyRuns.length,
       alarms: alarmItems.length,
-      reminders: reminderItems.length
+      reminders: reminderItems.length,
+      memories: (() => { try { return (dbm.load().memories || []).length; } catch (_) { return 0; } })()
     },
     counts: {
       events: events.length,
@@ -148,7 +165,8 @@ function buildState() {
       briefs: briefs.length,
       agencyRuns: agencyRuns.length,
       alarms: alarmItems.length,
-      reminders: reminderItems.length
+      reminders: reminderItems.length,
+      memories: (() => { try { return (dbm.load().memories || []).length; } catch (_) { return 0; } })()
     }
   };
 }
@@ -174,8 +192,9 @@ api.get('/state', (req, res) => {
       engine: { activeEngine: 'offline', model: '' }, llm: { activeEngine: 'offline', model: '' },
       activeEngine: 'offline', unread: 0,
       events: [], allEvents: [], emails: [], inbox: [], tasks: [], messages: [], notes: [], chats: [], briefs: [], brief: null,
-      agencyRuns: [], agents: [],
-      stats: { engine: 'offline', lastSync: null, notes: 0, briefs: 0, emails: 0, messages: 0, events: 0, tasks: 0, agencyRuns: 0 },
+      agencyRuns: [], agents: [], phone: null, memory: null, alarms: [], reminders: [],
+      integrations: [],
+      stats: { engine: 'offline', lastSync: null, notes: 0, briefs: 0, emails: 0, messages: 0, events: 0, tasks: 0, agencyRuns: 0, alarms: 0, reminders: 0 },
       counts: { events: 0, emails: 0, inbox: 0, notes: 0, messages: 0, chats: 0, briefs: 0, agencyRuns: 0 }
     });
   }
@@ -454,8 +473,10 @@ api.delete('/assistant/history', async (req, res) => {
 api.get('/ai/status', async (req, res) => {
   try {
     await checkOllama().catch(() => {});
-    ok(res, llmStatus());
-  } catch (e) { fail(res, e, { provider: 'offline', activeEngine: 'offline', model: '', ollamaReachable: false, models: [] }); }
+    let embedding = null;
+    try { embedding = await require('./embeddings').embeddingStatus(); } catch (_) { embedding = null; }
+    ok(res, { ...llmStatus(), embedding });
+  } catch (e) { fail(res, e, { provider: 'offline', activeEngine: 'offline', model: '', ollamaReachable: false, models: [], embedding: null }); }
 });
 
 /* ---------------- agency swarm (multi-agent) ----------------
@@ -676,6 +697,45 @@ api.get('/audit', (req, res) => {
   try { ok(res, arr(permissions.listAudit(req.query.limit))); }
   catch (e) { fail(res, e, []); }
 });
+
+/* ---------------- Android phone bridge (Tasker / MacroDroid) ----------------
+   Owner routes:  GET /api/phone, POST /api/phone/command, POST /api/phone/commands/:id/cancel
+   Phone routes:  GET /api/phone/pending, POST /api/phone/ack
+   The phone authenticates with `Authorization: Bearer <bridgeToken>` (header only — the token
+   is never accepted in the query string, so it cannot end up in a log or a URL share). */
+api.get('/phone', (req, res) => { try { ok(res, phone.publicState()); } catch (e) { fail(res, e); } });
+api.post('/phone/command', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const result = await phone.enqueue({
+      type: b.type || b.command,
+      args: b.args || b,
+      idempotencyKey: b.idempotencyKey,
+      origin: 'user'
+    });
+    ok(res, result);
+  } catch (e) { fail(res, e); }
+});
+api.post('/phone/commands/:id/cancel', async (req, res) => {
+  try { ok(res, await phone.cancel(req.params.id)); } catch (e) { fail(res, e); }
+});
+api.get('/phone/pending', async (req, res) => {
+  try {
+    const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+    const result = await phone.pending({ token });
+    if (!result.ok) return res.status(result.status || 401).json({ error: result.error });
+    ok(res, result);
+  } catch (e) { fail(res, e); }
+});
+api.post('/phone/ack', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+    const result = await phone.ack({ token, id: b.id, status: b.status, detail: b.detail });
+    if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
+    ok(res, result);
+  } catch (e) { fail(res, e); }
+});
 api.post('/confirm', async (req, res) => {
   try {
     const id = (req.body || {}).id;
@@ -686,6 +746,145 @@ api.post('/confirm', async (req, res) => {
 api.post('/confirm/cancel', (req, res) => {
   try { ok(res, permissions.cancel((req.body || {}).id)); }
   catch (e) { fail(res, e); }
+});
+
+/* ---------------- semantic memory (Supabase pgvector / local fallback) ----------------
+   GET answers with an ARRAY (endpoint contract); stats/search are their own endpoints.
+   Everything here works with no keys and no Ollama via the local fallback. */
+api.get('/memory', async (req, res) => {
+  try { ok(res, arr(await memory.listMemories({ limit: req.query.limit, offset: req.query.offset }))); }
+  catch (e) { fail(res, e, []); }
+});
+api.get('/memory/stats', async (req, res) => {
+  try { ok(res, { ...(await memory.stats()), learning: learning.stats() }); }
+  catch (e) { fail(res, e, { backend: 'unavailable', count: 0 }); }
+});
+api.get('/memory/search', async (req, res) => {
+  try { ok(res, arr(await memory.searchMemories(req.query.q || '', Number(req.query.limit) || 10))); }
+  catch (e) { fail(res, e, []); }
+});
+api.post('/memory', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const saved = await memory.upsertMemory({
+      content: b.content,
+      kind: b.kind,
+      importance: b.importance,
+      source: b.source || 'user',
+      dedupeKey: b.dedupeKey,
+      expiresAt: b.expiresAt,
+      metadata: b.metadata
+    });
+    if (!saved) return res.status(400).json({ error: 'content required' });
+    permissions.audit({ integration: 'memory', action: 'store', status: 'ok', summary: `stored ${saved.kind} memory`, target: saved.id });
+    ok(res, saved);
+  } catch (e) { fail(res, e); }
+});
+async function updateMemoryRoute(req, res) {
+  try {
+    const saved = await memory.updateMemory(req.params.id, req.body || {});
+    if (!saved) return res.status(404).json({ error: 'memory not found or invalid' });
+    ok(res, saved);
+  } catch (e) { fail(res, e); }
+}
+api.put('/memory/:id', updateMemoryRoute);
+api.patch('/memory/:id', updateMemoryRoute);
+api.delete('/memory/:id', async (req, res) => {
+  try {
+    const result = await memory.removeMemory(req.params.id);
+    if (result.deleted) permissions.audit({ integration: 'memory', action: 'forget', status: 'ok', summary: 'deleted one memory', target: req.params.id });
+    ok(res, result);
+  } catch (e) { fail(res, e); }
+});
+/* "forget that": by id(s), by search query, or everything (only with confirm=true). */
+api.post('/memory/forget', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const ids = arr(b.ids);
+    if (ids.length) return ok(res, await memory.removeMany(ids));
+    const q = String(b.query || '').trim();
+    if (!q) return res.status(400).json({ error: 'ids[] or query required' });
+    const hits = await memory.searchMemories(q, Number(b.limit) || 5);
+    const result = await memory.removeMany(hits.map((m) => m.id));
+    permissions.audit({ integration: 'memory', action: 'forget', status: 'ok', summary: `forgot ${result.deleted} memory item(s) matching "${q}"` });
+    ok(res, { ...result, removed: hits.map((m) => ({ id: m.id, content: m.content })) });
+  } catch (e) { fail(res, e); }
+});
+api.delete('/memory', async (req, res) => {
+  try {
+    if (String(req.query.confirm) !== 'true') return res.status(400).json({ error: 'confirm=true required to delete every memory' });
+    const result = await memory.forgetAll();
+    permissions.audit({ integration: 'memory', action: 'forget-all', status: 'ok', summary: `deleted ${result.deleted} memor(ies)` });
+    ok(res, result);
+  } catch (e) { fail(res, e); }
+});
+
+/* ---------------- durable learning (Phase 3) ----------------
+   Status + a manual drain. Extraction itself is out-of-band; POST /api/learning/run exists for
+   cron jobs, tests and "learn now" — it is never on a reply's critical path. */
+api.get('/learning', (req, res) => {
+  try { ok(res, learning.stats()); } catch (e) { fail(res, e, { pending: 0 }); }
+});
+api.post('/learning/run', async (req, res) => {
+  try { ok(res, await learning.flush()); } catch (e) { fail(res, e, { processed: 0 }); }
+});
+
+/* ---------------- phrase dictionary & language (Phase 4) ----------------
+   One editable store: Swahili / Kikuyu / Sheng phrases mapped to the English phrasing the
+   deterministic intent layer already understands, injected into the LLM prompt for grounding.
+   CRUD is open to the owner (this is the same trust boundary as settings/notes); every write is
+   audited. GET /api/language answers "what can this device actually do?" honestly. */
+api.get('/language', (req, res) => {
+  try { ok(res, { ...dictionary.languageInfo(), phrases: dictionary.stats() }); }
+  catch (e) { fail(res, e, { mode: 'auto', sttLocale: null, sttSupported: true }); }
+});
+
+api.get('/dictionary', (req, res) => {
+  try {
+    const entries = dictionary.list({ lang: req.query.lang, enabledOnly: req.query.enabled === 'true' });
+    ok(res, { ...dictionary.stats(), entries });
+  } catch (e) { fail(res, e, { entries: [], count: 0 }); }
+});
+
+api.post('/dictionary', async (req, res) => {
+  try {
+    const out = await dictionary.add(req.body || {});
+    if (out && out.error) return res.status(400).json({ error: out.error });
+    ok(res, out);
+  } catch (e) { fail(res, e); }
+});
+
+async function updatePhrase(req, res) {
+  try {
+    const out = await dictionary.update(req.params.id, req.body || {});
+    if (!out) return res.status(404).json({ error: 'phrase not found' });
+    if (out.error) return res.status(400).json({ error: out.error });
+    ok(res, out);
+  } catch (e) { fail(res, e); }
+}
+api.put('/dictionary/:id', updatePhrase);
+api.patch('/dictionary/:id', updatePhrase);
+
+api.delete('/dictionary/:id', async (req, res) => {
+  try {
+    const out = await dictionary.remove(req.params.id);
+    if (!out.deleted) return res.status(404).json({ error: 'phrase not found' });
+    ok(res, out);
+  } catch (e) { fail(res, e); }
+});
+
+api.post('/dictionary/reset', async (req, res) => {
+  try { ok(res, { entries: await dictionary.reset(), ...dictionary.stats() }); }
+  catch (e) { fail(res, e, { entries: [] }); }
+});
+
+/* Debug/verification helper: what would the normalizer do with this message? */
+api.post('/dictionary/match', (req, res) => {
+  try {
+    const text = String((req.body || {}).text || '');
+    const applied = dictionary.apply(text);
+    ok(res, { original: applied.original, text: applied.text, matches: applied.matches, changed: applied.text !== applied.original });
+  } catch (e) { fail(res, e, { matches: [] }); }
 });
 
 api.get('/contacts', (req, res) => {

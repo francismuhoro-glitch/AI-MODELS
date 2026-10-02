@@ -360,6 +360,68 @@ try {
 
 const preferLocale = (list) => list.find(v => /(?:^|[-_])(?:US|GB)$/i.test(v.lang || '')) || list[0] || null;
 
+/* ---- Conversation language (Phase 4) -----------------------------------------------
+   Three sources, in order of authority:
+     • localStorage 'aria.lang'    — this device, applied instantly
+     • settings.language.mode      — the server-side default for a fresh device
+     • 'auto'                      — mirror whatever the user writes in
+   Kikuyu is a special case and it is handled honestly: NO browser ships Kikuyu speech
+   recognition, so with 'ki' active the mic is disabled and badged, and typed Kikuyu (or
+   any dictionary phrase the owner adds) goes through the phrase dictionary instead. */
+const LANG_KEY = 'aria.lang';
+const LANG_MODES = ['auto', 'en', 'sw', 'ki'];
+const LANG_LABEL = { auto: 'Auto (mirror me)', en: 'English (en-KE)', sw: 'Swahili (sw-KE)', ki: 'Kikuyu (ki)' };
+/* Locales a browser can be asked to recognise. Kikuyu: none — that is the whole point. */
+const STT_LOCALES = { auto: null, en: 'en-KE', sw: 'sw-KE', ki: null };
+/* Voice-locale preference used by pickVoice(), best first. */
+const VOICE_LANGS = {
+  auto: [/^en[-_]KE$/i, /^en[-_](US|GB|AU|IN)$/i, /^en/i],
+  en: [/^en[-_]KE$/i, /^en[-_](US|GB|AU|IN)$/i, /^en/i],
+  sw: [/^sw[-_]KE$/i, /^sw[-_]TZ$/i, /^sw/i, /^en[-_]KE$/i, /^en/i],
+  ki: [/^ki/i, /^sw[-_]KE$/i, /^sw/i, /^en[-_]KE$/i, /^en/i]
+};
+let serverLangMode = null;
+
+function storedLangMode() {
+  let m = null;
+  try { m = localStorage.getItem(LANG_KEY); } catch (_) {}
+  if (!LANG_MODES.includes(m)) m = serverLangMode || 'auto';
+  return LANG_MODES.includes(m) ? m : 'auto';
+}
+
+/** Adopt the server-side language default on a device that has not chosen one yet. */
+function syncLanguage(serverValue) {
+  const mode = String((serverValue && serverValue.mode) || serverValue || '').toLowerCase();
+  if (!LANG_MODES.includes(mode)) return storedLangMode();
+  serverLangMode = mode;
+  try {
+    if (!LANG_MODES.includes(localStorage.getItem(LANG_KEY))) localStorage.setItem(LANG_KEY, mode);
+  } catch (_) {}
+  return storedLangMode();
+}
+
+const sttLocaleFor = (mode) => STT_LOCALES[LANG_MODES.includes(mode) ? mode : 'auto'];
+const langLabel = (mode) => LANG_LABEL[LANG_MODES.includes(mode) ? mode : 'auto'];
+
+/**
+ * Pick the best voice for a language mode, then the requested gender.
+ * Pure + injectable (jsdom has no voices) so it is unit-testable with a fake list.
+ * Kikuyu falls back to Swahili, then Kenyan English; if nothing matches at all the caller
+ * stays SILENT rather than throwing (Speech.speak returns false and the loop still closes).
+ */
+function pickVoiceFor(list, gender, mode) {
+  const all = (Array.isArray(list) ? list : []).filter(v => v && typeof v.name === 'string');
+  if (!all.length) return null;
+  const prefs = VOICE_LANGS[LANG_MODES.includes(mode) ? mode : 'auto'];
+  let pool = null;
+  for (const re of prefs) {
+    const hit = all.filter(v => re.test(v.lang || ''));
+    if (hit.length) { pool = hit; break; }
+  }
+  if (!pool) pool = all;                       // no language match anywhere → gender-only pick
+  return pickVoice(pool, gender);
+}
+
 /**
  * Choose the voice ARIA speaks with.
  * @param {Array}  list   speechSynthesis.getVoices()
@@ -418,6 +480,31 @@ const Speech = {
      a fake voice list — jsdom has no real speechSynthesis voices. Speech.pickVoice delegates. */
   gender() { return storedVoiceGender(); },
 
+  /* ---- language mode (Phase 4) ---- */
+  langMode() { return storedLangMode(); },
+  langLabel() { return langLabel(this.langMode()); },
+  sttLocale() {
+    const explicit = sttLocaleFor(this.langMode());
+    if (explicit) return explicit;
+    /* 'auto' uses the device default; Kikuyu has no locale at all (null → mic disabled). */
+    if (this.langMode() === 'auto') return navigator.language || 'en-US';
+    return null;
+  },
+  /* Kikuyu cannot be recognised by any browser — startMic() refuses with an explanation. */
+  sttSupported() { return this.langMode() !== 'ki'; },
+  setLanguage(mode) {
+    const m = LANG_MODES.includes(String(mode)) ? String(mode) : 'auto';
+    try { localStorage.setItem(LANG_KEY, m); } catch (_) {}
+    serverLangMode = m;
+    this._voice = null;                 // a different language wants a different voice
+    this._voicesHooked = false;
+    if (m === 'ki' && this.listening) { this._suppressRestart = true; this.stopMic(); }
+    if (this.rec) { try { this.rec.lang = this.sttLocale() || navigator.language || 'en-US'; } catch (_) {} }
+    this.prime(true);
+    this.render();
+    return m;
+  },
+
   /* Switch ARIA's voice: persist per-device, drop the cached voice and re-pick right away. */
   setGender(gender) {
     const g = String(gender || '').toLowerCase() === 'female' ? 'female' : 'male';
@@ -439,16 +526,16 @@ const Speech = {
       this._voicesHooked = true;
       try {
         const voices = window.speechSynthesis.getVoices();
-        if (voices && voices.length) this._voice = pickVoice(voices, this.gender());
+        if (voices && voices.length) this._voice = pickVoiceFor(voices, this.gender(), this.langMode());
         window.speechSynthesis.onvoiceschanged = () => {
           const v = window.speechSynthesis.getVoices();
-          if (v && v.length) this._voice = pickVoice(v, this.gender());
+          if (v && v.length) this._voice = pickVoiceFor(v, this.gender(), this.langMode());
         };
       } catch (_) {}
     } else if (!this._voice) {
       try {
         const voices = window.speechSynthesis.getVoices();
-        if (voices && voices.length) this._voice = pickVoice(voices, this.gender());
+        if (voices && voices.length) this._voice = pickVoiceFor(voices, this.gender(), this.langMode());
       } catch (_) {}
     }
     if (this._primeDone) return;
@@ -467,7 +554,8 @@ const Speech = {
   create() {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     const r = new SR();
-    r.lang = navigator.language || 'en-US';
+    /* sw → sw-KE, en → en-KE, auto → the device language, ki → never created (see startMic). */
+    r.lang = this.sttLocale() || navigator.language || 'en-US';
     r.continuous = false;
     r.interimResults = true;
     r.maxAlternatives = 1;
@@ -536,6 +624,13 @@ const Speech = {
   startMic() {
     this._leave = false;
     if (!this.supported()) { toast('🎤 Voice input is not supported in this browser — try Chrome, Edge or Safari.'); return; }
+    /* Kikuyu: no browser has a Kikuyu recognition model. Say so plainly instead of collecting
+       a garbled English transcript from Kikuyu speech. Typed Kikuyu still works. */
+    if (!this.sttSupported()) {
+      toast('⌨️ Kikuyu voice input is not supported by any browser — type your Kikuyu instead (add phrases in Settings → 🗣️ Language & phrases).');
+      this.render();
+      return;
+    }
     if (!this.secure()) { toast('🔒 Voice input needs HTTPS (or localhost) — this page is plain HTTP, so the browser blocks the microphone.'); return; }
     if (this.listening) return;
     this.cancelSpeak();   // don't talk over the user
@@ -640,15 +735,24 @@ const Speech = {
   render() {
     const mic = this.micEl();
     if (mic) {
+      const kikuyu = !this.sttSupported();
       mic.hidden = !this.supported();
+      mic.disabled = kikuyu;
       mic.classList.toggle('listening', this.listening);
-      mic.title = this.listening ? 'Listening… tap to stop' : 'Talk to ARIA with your voice';
-      mic.textContent = this.listening ? '🔴' : '🎤';
+      mic.dataset.stt = kikuyu ? 'unsupported' : 'ready';
+      mic.title = kikuyu
+        ? 'Kikuyu voice input is not supported by any browser — type your Kikuyu instead'
+        : (this.listening ? 'Listening… tap to stop' : `Talk to ARIA with your voice (${this.sttLocale() || 'device default'})`);
+      mic.textContent = this.listening ? '🔴' : (kikuyu ? '⌨️' : '🎤');
       mic.setAttribute('aria-pressed', this.listening ? 'true' : 'false');
+      mic.setAttribute('aria-disabled', kikuyu ? 'true' : 'false');
     }
     const st = $('#mic-status');
     if (st) {
-      st.textContent = this.listening ? '🎙️ listening… speak now' : this._speaking ? '🔊 ARIA is speaking…' : '';
+      st.textContent = this.listening
+        ? `🎙️ listening… (${this.sttLocale()})`
+        : this._speaking ? '🔊 ARIA is speaking…'
+          : (!this.sttSupported() ? `⌨️ ${this.langLabel()} — type your command (no browser voice input for Kikuyu)` : '');
       st.classList.toggle('live', this.listening || this._speaking);
     }
     const v = $('#btn-voice');
@@ -855,10 +959,14 @@ function normalizeSettings(raw) {
     },
     /* ARIA's speaking voice — MALE unless the owner chose otherwise. */
     voiceGender: String(s.voiceGender || '').toLowerCase() === 'female' ? 'female' : 'male',
+    /* Conversation language (Phase 4): auto | en | sw | ki. Kikuyu = typed input only. */
+    language: { mode: LANG_MODES.includes(String(((s.language || {}).mode) || '').toLowerCase()) ? String(s.language.mode).toLowerCase() : 'auto', sttLocale: ((s.language || {}).sttLocale || '') },
     smtp: { host: '', port: 587, user: '', pass: '', to: '', ...(s.smtp || {}) },
     telegram: { enabled: false, token: '', allowedChatId: '', tokenConfigured: false, ...(s.telegram || {}) },
     sms: { enabled: false, bridgeUrl: '', token: '', tokenConfigured: false, ...(s.sms || {}) },
     media: { provider: 'browser', localUrl: '', ...(s.media || {}) },
+    /* Android phone bridge — token always blank from the server (secret redaction). */
+    phone: { enabled: false, bridgeToken: '', bridgeTokenConfigured: false, label: 'Android phone', commandTtlSeconds: 1800, pollSeconds: 300, ...(s.phone || {}) },
     contacts: Array.isArray(s.contacts) ? s.contacts : [],
     permissions: { grants: {}, allowGroupSend: false, autoSendRules: [], ...(s.permissions || {}) },
     brief: { email: false, ...(s.brief || {}) },
@@ -876,6 +984,8 @@ async function refreshState() {
   }
   /* Adopt the server-side voice default on a device that has not chosen one yet. */
   try { syncVoiceGender((STATE && (STATE.voiceGender || (STATE.cfg && STATE.cfg.voiceGender))) || 'male'); } catch (_) {}
+  /* Same for the conversation language (Phase 4). */
+  try { syncLanguage((STATE && STATE.language) || (STATE && STATE.cfg && STATE.cfg.language) || null); } catch (_) {}
   const high = A(STATE.inbox).filter(e => e && e.priority === 'high' && !e.read).length
     + A(STATE.messages).filter(m => m && m.priority === 'high' && !m.read).length;
   if (lastHighSeen !== null && high > lastHighSeen) Sound.priorityAlert();
@@ -1140,8 +1250,59 @@ function msgRow(m) {
 
 /* ===== BRAIN ===== */
 async function viewBrain(main) {
-  const notes = A(await api('/api/notes'));
-  main.innerHTML = `<div class="view-head"><div><h1>Second Brain</h1><div class="sub">${notes.length} notes · grows automatically from briefs, emails & messages</div></div></div>
+  const [rawNotes, rawMem, rawMemStats, rawDict] = await Promise.all([
+    api('/api/notes'),
+    api('/api/memory?limit=100').catch(() => []),
+    api('/api/memory/stats').catch(() => null),
+    api('/api/dictionary').catch(() => null)
+  ]);
+  const notes = A(rawNotes);
+  const memories = A(rawMem);
+  const memStats = rawMemStats && typeof rawMemStats === 'object' ? rawMemStats : { backend: 'local', dim: 768, count: memories.length };
+  const learn = (memStats && memStats.learning) || null;
+  const dict = rawDict && Array.isArray(rawDict.entries) ? rawDict : { entries: [], count: 0 };
+  const dictMode = storedLangMode();
+  main.innerHTML = `<div class="view-head"><div><h1>Second Brain</h1><div class="sub">${notes.length} notes · ${memories.length} memories · grows automatically from briefs, emails & messages</div></div></div>
+    <div class="card" id="memory-card"><h3>🧠 Long-term memory <span class="chip ${memStats.backend === 'supabase' ? 'green' : 'blue'}">${esc(memStats.backend)}</span> <span class="chip">${esc(String(memStats.dim))}-dim</span></h3>
+      <p style="color:var(--dim);font-size:12.5px;margin:0 0 10px">Durable facts, preferences and corrections ARIA recalls by meaning on every turn (top ${6} injected before it reasons). Embeddings run <strong>cloud → Ollama → lexical</strong>; none of it stores secrets, PINs, tokens, card numbers or full messages. Edit or delete anything here — or just say <em>“forget that”</em>.</p>
+      ${learn ? `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:11.5px;color:var(--dim);margin:0 0 8px">
+        <span class="chip green">🧠 auto-learned ${esc(String(learn.saved || 0))}</span>
+        <span class="chip">merged ${esc(String(learn.merged || 0))}</span>
+        <span class="chip">superseded ${esc(String(learn.superseded || 0))}</span>
+        <span class="chip">skipped noise ${esc(String(learn.skipped || 0))}</span>
+        <span class="chip red">secrets blocked ${esc(String(learn.rejected || 0))}</span>
+        <span class="chip ${learn.pending ? 'blue' : ''}">queue ${esc(String(learn.pending || 0))}</span>
+        <button class="btn small" id="learn-run">⚙ Learn now</button>
+        <span style="font-family:var(--mono);font-size:10px;color:var(--faint)">extraction is out-of-band · no retraining</span></div>` : ''}
+      <div class="form-grid" style="grid-template-columns:2fr auto auto;align-items:end">
+        <label class="field">Teach ARIA something durable<input id="mem-content" placeholder="e.g. Kamau is my cement supplier — negotiate prices quarterly"></label>
+        <label class="field">Kind<select id="mem-kind"><option value="fact">fact</option><option value="preference">preference</option><option value="correction">correction</option></select></label>
+        <button class="btn primary" id="mem-add" style="height:40px">🧠 Remember</button>
+      </div>
+      <div class="form-grid" style="grid-template-columns:1fr auto;align-items:end;margin-top:8px">
+        <label class="field">Search memory ("forget that" works from chat too)<input id="mem-q" placeholder="supplier, meetings, invoice…"></label>
+        <div style="display:flex;gap:8px"><button class="btn" id="mem-search">🔎 Search</button><button class="btn ghost" id="mem-clear">🗑 Delete all</button></div>
+      </div>
+      <div id="mem-list" style="margin-top:10px">${memories.map(memoryRow).join('') || '<div class="empty">No memories yet. They build up as you talk to ARIA — or add one above.</div>'}</div>
+    </div>
+    <div class="card" id="phrase-card"><h3>🗣️ Language &amp; phrases <span class="chip ${dictMode === 'en' ? 'blue' : 'green'}">${esc(langLabel(dictMode))}</span> <span class="chip">${esc(String(dict.count || 0))} phrases</span></h3>
+      <p style="color:var(--dim);font-size:12.5px;margin:0 0 10px">Swahili, Kikuyu and Sheng phrases that ARIA recognises <strong>without a model round-trip</strong> — each one rewrites to the English phrasing the intent layer already understands, and the whole list is injected into the prompt as grounding. <strong>Kikuyu:</strong> browsers cannot recognise Kikuyu speech, so the mic is disabled for it — typed Kikuyu and these phrases work, and you can add your own below.</p>
+      <div class="form-grid" style="grid-template-columns:1.4fr .9fr 1fr;align-items:end">
+        <label class="field">Phrase<input id="ph-phrase" placeholder="weka kengele · wĩ mwega · mambo vipi"></label>
+        <label class="field">Language<select id="ph-lang"><option value="sw">Swahili</option><option value="ki">Kikuyu</option><option value="sheng">Sheng</option><option value="en">English</option></select></label>
+        <label class="field">Intent<select id="ph-intent">${['greeting','acknowledge','thanks','goodbye','help','call','plan','alarm-set','remind','task-add','priorities-query','schedule-query','schedule-create','media-play','media-pause','media-next','media-previous','media-volume','memory-forget','memory-remember','confirm','cancel','custom'].map(i => `<option value="${i}">${i}</option>`).join('')}</select></label>
+      </div>
+      <div class="form-grid" style="grid-template-columns:2fr 1.4fr auto;align-items:end;margin-top:8px">
+        <label class="field">English command (optional — use <code>{rest}</code> for what follows)<input id="ph-command" placeholder="set an alarm {rest}"></label>
+        <label class="field">Means (note)<input id="ph-note" placeholder="set an alarm"></label>
+        <button class="btn primary" id="ph-add" style="height:40px">＋ Add phrase</button>
+      </div>
+      <div id="ph-list" style="margin-top:10px;max-height:320px;overflow:auto">${dict.entries.map(phraseRow).join('') || '<div class="empty">No phrases yet — add one above.</div>'}</div>
+      <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+        <button class="btn ghost small" id="ph-reset">↺ Restore seed phrases</button>
+        <span style="color:var(--faint);font-size:11.5px;align-self:center">Matching is deterministic phrase → English command; it is editable, not a translation engine.</span>
+      </div>
+    </div>
     <div class="card capture-box"><h3>⚡ Capture — teach your brain anything</h3>
       <div class="form-grid" style="grid-template-columns:1fr 2fr auto;align-items:end">
         <label class="field">Title (optional)<input id="cap-title" placeholder="e.g. Supplier pricing playbook"></label>
@@ -1213,6 +1374,122 @@ async function viewBrain(main) {
       <div class="sr-meta"><span class="chip blue">${h.kind}</span><span>score ${h.score}</span><span>${fmtAgo(h.ts)} ago</span></div></div>`).join('') || '<div class="empty">No matches yet.</div>';
   }, 250); };
   $$('.note-card', main).forEach(c => c.onclick = () => openNote(notes.find(n => n.id === c.dataset.id)));
+
+  /* ---- long-term memory management (add / search / edit / delete) ---- */
+  const memList = $('#mem-list');
+  const reloadMem = async (q) => {
+    const rows = q ? await api('/api/memory/search?q=' + encodeURIComponent(q)).catch(() => []) : await api('/api/memory?limit=100').catch(() => []);
+    memList.innerHTML = A(rows).map(memoryRow).join('') || `<div class="empty">${q ? 'Nothing in memory matches that.' : 'No memories yet.'}</div>`;
+    bindMemRows();
+  };
+  const bindMemRows = () => {
+    $$('button[data-mem-del]', memList).forEach(b => b.onclick = async () => {
+      if (!confirm('Delete this memory permanently?')) return;
+      await fetch('/api/memory/' + encodeURIComponent(b.dataset.memDel), { method: 'DELETE' });
+      toast('🗑 Memory deleted'); reloadMem($('#mem-q') && $('#mem-q').value.trim());
+    });
+    $$('button[data-mem-edit]', memList).forEach(b => b.onclick = async () => {
+      const id = b.dataset.memEdit;
+      const cur = A(memories).find(m => m.id === id) || (await api('/api/memory?limit=100')).find(m => m.id === id);
+      const next = prompt('Edit this memory:', (cur && cur.content) || '');
+      if (next === null || !next.trim()) return;
+      await fetch('/api/memory/' + encodeURIComponent(id), { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: next.trim() }) });
+      toast('✏️ Memory updated'); reloadMem($('#mem-q') && $('#mem-q').value.trim());
+    });
+  };
+  bindMemRows();
+  if ($('#learn-run')) $('#learn-run').onclick = async (ev) => {
+    ev.preventDefault();
+    const btn = $('#learn-run');
+    btn.disabled = true;
+    const swept = await POST('/api/learning/run', {}).catch(() => null);
+    btn.disabled = false;
+    toast(`🧠 Learning sweep done — processed ${(swept && swept.processed) || 0} queued turn(s)`);
+  };
+  /* ---- phrase dictionary (Phase 4): add / edit / delete / reset ---- */
+  const reloadDict = () => route();
+  if ($('#ph-add')) $('#ph-add').onclick = async () => {
+    const phrase = $('#ph-phrase').value.trim();
+    if (!phrase) return toast('Write the phrase first');
+    const r = await POST('/api/dictionary', {
+      phrase,
+      lang: $('#ph-lang').value,
+      intent: $('#ph-intent').value,
+      command: $('#ph-command').value.trim(),
+      note: $('#ph-note').value.trim()
+    }).catch(() => null);
+    if (!r || r.error) return toast('⚠️ ' + ((r && r.error) || 'Could not save that phrase'));
+    toast('🗣️ Phrase added');
+    reloadDict();
+  };
+  $$('button[data-ph-del]', $('#phrase-card')).forEach(b => b.onclick = async () => {
+    if (!confirm('Delete this phrase from the dictionary?')) return;
+    await fetch('/api/dictionary/' + encodeURIComponent(b.dataset.phDel), { method: 'DELETE' });
+    toast('🗑 Phrase deleted');
+    reloadDict();
+  });
+  $$('button[data-ph-edit]', $('#phrase-card')).forEach(b => b.onclick = async () => {
+    const id = b.dataset.phEdit;
+    const cur = (dict.entries || []).find(e => e.id === id);
+    const next = prompt('Edit the phrase:', (cur && cur.phrase) || '');
+    if (next === null || !next.trim()) return;
+    const note = prompt('What does it mean?', (cur && cur.note) || '');
+    if (note === null) return;
+    const out = await fetch('/api/dictionary/' + encodeURIComponent(id), {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phrase: next.trim(), note: note.trim() })
+    }).then(x => x.json()).catch(() => null);
+    if (!out || out.error) return toast('⚠️ ' + ((out && out.error) || 'Could not update that phrase'));
+    toast('✏️ Phrase updated');
+    reloadDict();
+  });
+  if ($('#ph-reset')) $('#ph-reset').onclick = async () => {
+    if (!confirm('Restore the built-in Swahili / Kikuyu / Sheng phrases? Your own phrases are kept; edited seeds go back to their original text.')) return;
+    await POST('/api/dictionary/reset', {});
+    toast('↺ Seed phrases restored');
+    reloadDict();
+  };
+  if ($('#mem-add')) $('#mem-add').onclick = async () => {
+    const content = $('#mem-content').value.trim();
+    if (!content) return toast('Write the memory first');
+    const r = await POST('/api/memory', { content, kind: $('#mem-kind').value, source: 'user' });
+    if (!r || !r.id) return toast('⚠️ Could not save that memory');
+    toast('🧠 Memory saved'); route();
+  };
+  if ($('#mem-search')) $('#mem-search').onclick = () => reloadMem($('#mem-q').value.trim());
+  if ($('#mem-q')) $('#mem-q').onkeydown = (e) => { if (e.key === 'Enter') $('#mem-search').click(); };
+  if ($('#mem-clear')) $('#mem-clear').onclick = async () => {
+    if (!confirm('Delete EVERY memory? This cannot be undone.')) return;
+    await fetch('/api/memory?confirm=true', { method: 'DELETE' });
+    toast('🗑 All memories deleted'); route();
+  };
+}
+
+/* One memory as an editable row (kind + importance + when it was learned). */
+function memoryRow(m) {
+  if (!m) return '';
+  const age = m.createdAt ? fmtAgo(new Date(m.createdAt).getTime()) : '';
+  return `<div class="alarm-row">
+    <div class="ar-main"><strong>${esc(m.content)}</strong>
+      <div class="r-sub"><span class="chip ${m.kind === 'preference' ? 'green' : (m.kind === 'correction' ? 'red' : 'blue')}">${esc(m.kind || 'fact')}</span>
+      <span>importance ${esc(String(m.importance ?? 0.5))}</span><span>${esc(m.source || 'chat')}</span>${age ? `<span>${esc(age)} ago</span>` : ''}</div></div>
+    <button class="btn small" data-mem-edit="${esc(m.id)}">edit</button>
+    <button class="btn small" data-mem-del="${esc(m.id)}">delete</button>
+  </div>`;
+}
+
+/* One phrase dictionary entry (lang + meaning + what it maps to). */
+function phraseRow(e) {
+  if (!e) return '';
+  const langChip = e.lang === 'sw' ? 'green' : (e.lang === 'ki' ? 'red' : 'blue');
+  return `<div class="alarm-row" data-phrase="${esc(e.id)}">
+    <div class="ar-main"><strong>${esc(e.phrase)}</strong>
+      <div class="r-sub"><span class="chip ${langChip}">${esc(e.lang)}</span>
+      <span class="chip">${esc(e.intent)}</span>
+      <span>${esc(e.note || '')}</span>${e.command ? `<span style="font-family:var(--mono)">→ ${esc(e.command)}</span>` : ''}</div></div>
+    <button class="btn small" data-ph-edit="${esc(e.id)}">edit</button>
+    <button class="btn small" data-ph-del="${esc(e.id)}">delete</button>
+  </div>`;
 }
 
 function noteCard(n) {
@@ -1588,14 +1865,26 @@ const voiceGenderHint = () => {
     : 'ARIA speaks with a male voice on this device. Devices without a matching voice name get a slightly deeper pitch instead.';
 };
 
+/* Honest, device-aware description of the voice pipeline for the selected language. */
+function langHintHtml() {
+  const mode = storedLangMode();
+  const stt = sttLocaleFor(mode);
+  if (mode === 'ki') return '⌨️ <strong>Kikuyu:</strong> no browser recognises Kikuyu speech, so the mic is disabled — type your Kikuyu (or add your own phrases in Second Brain → 🗣️ Language &amp; phrases). ARIA replies in Swahili/English when unsure of the Kikuyu.';
+  if (mode === 'sw') return `🎙️ Swahili speech recognition runs in the browser as <code>${esc(stt || 'sw-KE')}</code> where it exists (Chrome/Edge); Apple devices vary. A Swahili TTS voice is used if installed — otherwise ARIA speaks Kenyan English.`;
+  if (mode === 'auto') return '🌍 Auto mirrors the language you write or speak in (device default for the microphone). Swahili is recognised on browsers that support it; Kikuyu is typed only.';
+  return `🎙️ English speech recognition runs as <code>${esc(stt || 'en-KE')}</code>; ARIA prefers a Kenyan English voice when one is installed.`;
+}
+
 async function viewSettings(main) {
-  const [rawSettings, rawConns, rawInts, rawPerms, rawAlarms, rawReminders, rawAudit] = await Promise.all([
+  const [rawSettings, rawConns, rawInts, rawPerms, rawAlarms, rawReminders, rawAudit, rawPhone, rawMemStats] = await Promise.all([
     api('/api/settings'), api('/api/connectors'),
     api('/api/integrations').catch(() => []),
     api('/api/permissions').catch(() => ({ grants: {}, allowGroupSend: false })),
     api('/api/alarms').catch(() => []),
     api('/api/reminders').catch(() => []),
-    api('/api/audit').catch(() => [])
+    api('/api/audit').catch(() => []),
+    api('/api/phone').catch(() => null),
+    api('/api/memory/stats').catch(() => null)
   ]);
   const s = normalizeSettings(rawSettings);
   const conns = A(rawConns);
@@ -1604,6 +1893,9 @@ async function viewSettings(main) {
   const alarmList = A(rawAlarms);
   const reminderList = A(rawReminders);
   const auditList = A(rawAudit).slice(0, 8);
+  const ph = rawPhone && typeof rawPhone === 'object' ? rawPhone : { enabled: false, tokenConfigured: false, recent: [], pendingCount: 0 };
+  s.memoryStats = rawMemStats && typeof rawMemStats === 'object' ? rawMemStats : { backend: 'local', dim: s.llm.embedDim || 768, count: 0 };
+  const phoneEndpoint = location.origin + '/api/phone/pending';
   const intById = Object.fromEntries(ints.map(i => [i.id, i]));
   SETTINGS = s; CONNECTORS = conns;
   syncVoiceGender(s.voiceGender);
@@ -1657,9 +1949,15 @@ async function viewSettings(main) {
               <option value="female" ${voiceGender === 'female' ? 'selected' : ''}>Female</option>
             </select>
           </label>
+          <label class="field" title="The language ARIA listens for and answers in. Kikuyu has no browser speech recognition anywhere — with Kikuyu active the mic is disabled and you type instead.">Language
+            <select id="s-lang">
+              ${LANG_MODES.map(m => `<option value="${m}" ${storedLangMode() === m ? 'selected' : ''}>${esc(LANG_LABEL[m])}${m === 'ki' ? ' — typed only' : ''}</option>`).join('')}
+            </select>
+          </label>
           <div style="display:flex;align-items:flex-end"><button class="btn" id="btn-test-voice">▶ Test ARIA's voice</button></div>
         </div>
         <p style="color:var(--faint);font-size:12px;margin-top:6px" id="voice-gender-hint">${voiceGenderHint()}</p>
+        <p style="color:var(--faint);font-size:12px;margin-top:6px" id="lang-hint">${langHintHtml()}</p>
         <div style="display:flex;gap:9px;flex-wrap:wrap;margin-top:10px">
           <button class="btn" id="btn-push">🔔 Enable morning notifications</button>
           <button class="btn ghost" id="btn-push-test">Send test notification</button>
@@ -1723,14 +2021,45 @@ async function viewSettings(main) {
         </div>
       </div>
 
+      <div class="card"><h3>🧠 Semantic memory (pgvector)</h3>
+        <p style="color:var(--dim);font-size:12.5px;margin:0 0 10px">Durable facts, preferences and corrections live in <code>aria_memory</code> when Supabase is configured (with an offline local fallback). Retrieval is hybrid — BM25 + embeddings — and the top matches are injected before ARIA reasons. Manage them in <strong>Second Brain → 🧠 Long-term memory</strong>, or just say <em>“forget that”</em>.</p>
+        <div class="connector">
+          <div class="conn-icon">🧠</div>
+          <div class="conn-main"><div class="conn-name">${esc((s.memoryStats && s.memoryStats.backend) || 'local')} <span class="chip">${esc(String((s.memoryStats && s.memoryStats.dim) || s.llm.embedDim || 768))}-dim</span></div>
+            <div class="conn-desc">Embeddings: cloud (needs a key) → Ollama → lexical fallback. The dimension MUST match <code>aria_memory.embedding vector(N)</code> — change both together (see <code>docs/SEMANTIC_MEMORY.md</code>).</div></div>
+        </div>
+        <p style="color:var(--faint);font-size:12px;margin-top:8px">Run <code>supabase/migrations/&lt;timestamp&gt;_aria_memory.sql</code> in the Supabase SQL editor once. Secrets, PINs, tokens, card numbers and full message bodies are never stored.</p>
+      </div>
+
       <div class="card"><h3>🎵 Music</h3>
         <p style="color:var(--dim);font-size:12.5px">Playback is this browser’s audio element or a local file/URL you configure. Spotify, Apple Music and YouTube are not connected — ARIA will not pretend they are.</p>
         <label class="field">Local audio URL<input id="s-media-url" value="${esc(s.media.localUrl)}" placeholder="https://…/track.mp3 or /audio/morning.mp3"></label>
       </div>
 
+      <div class="card"><h3>📱 Android phone bridge (Tasker / MacroDroid)</h3>
+        <p style="color:var(--dim);font-size:12.5px;margin:0 0 10px"><strong>Off by default.</strong> When on, ARIA queues real phone commands (set alarm, media keys, open app) in an outbox; your phone polls <code>${esc(phoneEndpoint)}</code> with a bearer token and acks what it really did. Until the ack arrives ARIA says <em>“sent to phone, waiting for confirmation”</em> — it never claims the alarm rang.</p>
+        <label class="switch" style="display:flex;gap:9px;align-items:center;margin-bottom:10px"><input type="checkbox" id="s-phone-on" ${ph.enabled ? 'checked' : ''}><span>Enable the phone bridge</span></label>
+        <div class="form-grid">
+          <label class="field">Device label<input id="s-phone-label" value="${esc(s.phone ? s.phone.label : 'Android phone')}" placeholder="My Pixel"></label>
+          <label class="field">Bridge token<input id="s-phone-token" type="password" value="" placeholder="${ph.tokenConfigured ? 'Configured — leave blank to keep' : 'paste a long random string'}" autocomplete="off"></label>
+          <label class="field">Command TTL (seconds)<input id="s-phone-ttl" type="number" min="60" max="86400" value="${esc(String((s.phone && s.phone.commandTtlSeconds) || 1800))}"></label>
+          <label class="field">Tasker poll interval (s)<input id="s-phone-poll" type="number" min="15" max="86400" value="${esc(String((s.phone && s.phone.pollSeconds) || 300))}"></label>
+        </div>
+        <p style="color:var(--faint);font-size:12px;margin-top:8px">Token is stored as a secret: blanked in every GET, never logged, never sent to the model. Grants needed: <code>phone.alarm</code>, <code>phone.media</code>, <code>phone.app</code> (Permissions card below). Full walkthrough: <code>docs/ANDROID_BRIDGE.md</code>.</p>
+        <div style="display:flex;gap:9px;flex-wrap:wrap;margin:10px 0">
+          <button class="btn" id="btn-phone-test" ${ph.configured ? '' : 'disabled'}>⏰ Queue a test alarm (2 min)</button>
+          <span style="color:var(--faint);font-size:12px;align-self:center">Queued: ${ph.pendingCount || 0} · last poll: ${ph.lastPollAt ? esc(new Date(ph.lastPollAt).toISOString().slice(11, 19)) + 'Z' : 'never'}</span>
+        </div>
+        ${A(ph.recent).length ? A(ph.recent).slice(0, 6).map(c => `<div class="alarm-row">
+          <div class="ar-main"><strong>${esc(c.human || c.type)}</strong><div class="r-sub">${esc(c.type)} · <span class="chip ${c.status === 'acked' ? 'green' : (c.status === 'failed' ? 'red' : 'yellow')}">${esc(c.status)}</span> ${c.result && c.result.detail ? esc(c.result.detail) : ''}</div></div>
+          ${c.status === 'queued' ? `<button class="btn small" data-phone-cancel="${esc(c.id)}">cancel</button>` : ''}
+        </div>`).join('') : '<div class="empty">No phone commands yet.</div>'}
+      </div>
+
       <div class="card"><h3>🔐 Permissions</h3>
         <p style="color:var(--dim);font-size:12.5px;margin:0 0 8px">Default deny. Sending, deleting, publishing or purchasing never happens without an explicit grant <em>and</em> a confirmation (or a matching auto-send rule you wrote).</p>
-        ${['whatsapp.send','telegram.send','sms.send','email.send','calendar.write'].map(g => `<label class="perm-row"><span>${esc(g)}</span><input type="checkbox" data-grant="${g}" ${(perms.grants && perms.grants[g]) ? 'checked' : ''}></label>`).join('')}
+        ${['whatsapp.send','telegram.send','sms.send','email.send','calendar.write','phone.alarm','phone.media','phone.app'].map(g => `<label class="perm-row"><span>${esc(g)}</span><input type="checkbox" data-grant="${g}" ${(perms.grants && perms.grants[g]) ? 'checked' : ''}></label>`).join('')}
+        <p style="color:var(--faint);font-size:12px;margin:6px 0 0"><code>phone.alarm</code> sets a <strong>real alarm on your phone</strong> (and can cancel one) and always needs your confirmation when a model asks for it. <code>phone.media</code> covers play/pause/next/previous/volume. <code>phone.app</code> opens an app.</p>
         <label class="perm-row"><span>Allow group / broadcast sends</span><input type="checkbox" id="s-allow-group" ${perms.allowGroupSend ? 'checked' : ''}></label>
         <h3 style="margin-top:14px">Recent audit</h3>
         ${auditList.length ? auditList.map(a => `<div class="audit-row">${esc(a.ts ? new Date(a.ts).toISOString().slice(11, 19) : '')} · ${esc(a.action)} · ${esc(a.integration || a.target || '')} · ${esc(a.result || '')}</div>`).join('') : '<div class="empty">No audited actions yet.</div>'}
@@ -1738,6 +2067,8 @@ async function viewSettings(main) {
     </div>
     <p style="margin-top:14px;color:var(--faint);font-size:12px">Secrets never leave your machine — stored in <code>data/settings.json</code> on your own disk. Blank secret fields keep the previous value.</p>`;
 
+  const langSel = $('#s-lang');
+  if (langSel) langSel.onchange = () => { Speech.setLanguage(langSel.value); const h = $('#lang-hint'); if (h) h.innerHTML = langHintHtml(); };
   $('#set-save').onclick = async () => {
     const gender = $('#s-voice-gender') ? $('#s-voice-gender').value : storedVoiceGender();
     await POST('/api/settings', {
@@ -1753,16 +2084,25 @@ async function viewSettings(main) {
         }
       },
       voiceGender: gender === 'female' ? 'female' : 'male',
+      language: { mode: (($('#s-lang') && $('#s-lang').value) || storedLangMode()) },
       smtp: { host: $('#s-smtphost').value, port: +$('#s-smtpport').value || 587, user: $('#s-smtpuser').value, pass: $('#s-smtppass').value, to: $('#s-smtpto').value },
       telegram: { enabled: !!( $('#s-tg-on') && $('#s-tg-on').checked ), token: ($('#s-tg-token') && $('#s-tg-token').value) || '', allowedChatId: ($('#s-tg-chat') && $('#s-tg-chat').value) || '' },
       sms: { enabled: !!( $('#s-sms-on') && $('#s-sms-on').checked ), bridgeUrl: ($('#s-sms-url') && $('#s-sms-url').value) || '', token: ($('#s-sms-token') && $('#s-sms-token').value) || '' },
       media: { provider: 'browser', localUrl: ($('#s-media-url') && $('#s-media-url').value) || '' },
+      phone: {
+        enabled: !!( $('#s-phone-on') && $('#s-phone-on').checked ),
+        bridgeToken: ($('#s-phone-token') && $('#s-phone-token').value) || '',
+        label: ($('#s-phone-label') && $('#s-phone-label').value.trim()) || 'Android phone',
+        commandTtlSeconds: +( ($('#s-phone-ttl') && $('#s-phone-ttl').value) || 1800 ),
+        pollSeconds: +( ($('#s-phone-poll') && $('#s-phone-poll').value) || 300 )
+      },
       discretion: $('#s-discretion').checked
     });
     const grants = {};
     $$('input[data-grant]', main).forEach(el => { grants[el.dataset.grant] = !!el.checked; });
     await POST('/api/permissions', { grants, allowGroupSend: !!( $('#s-allow-group') && $('#s-allow-group').checked ) }).catch(() => {});
     Speech.setGender(gender);          // this device switches over immediately
+    Speech.setLanguage(($('#s-lang') && $('#s-lang').value) || storedLangMode());
     for (const c of conns) {
       const enabled = $(`input[data-conn="${c.id}"]`).checked;
       const cfg = configValues(c.id);
@@ -1836,6 +2176,22 @@ async function viewSettings(main) {
   });
   $$('button[data-contact-del]', main).forEach(b => b.onclick = async () => {
     try { await api('/api/contacts/' + encodeURIComponent(b.dataset.contactDel), { method: 'DELETE' }); toast('Contact removed'); route(); }
+    catch (e) { toast(e.message); }
+  });
+  /* ── Android phone bridge: test alarm + cancel a queued command ──
+     A test alarm is explicitly "queued, not confirmed" — the toast repeats that so nobody
+     can mistake a queued command for a ringing phone. */
+  const phoneTest = $('#btn-phone-test');
+  if (phoneTest) phoneTest.onclick = async () => {
+    const when = new Date(Date.now() + 2 * 60000).toISOString();
+    try {
+      const r = await POST('/api/phone/command', { type: 'set_alarm', args: { fireAt: when, title: 'ARIA test alarm' } });
+      toast((r && r.reply) ? String(r.reply).replace(/[*`]/g, '').slice(0, 220) : 'Queued — waiting for the phone to ack');
+      route();
+    } catch (e) { toast('⚠️ ' + e.message); }
+  };
+  $$('button[data-phone-cancel]', main).forEach(b => b.onclick = async () => {
+    try { await POST('/api/phone/commands/' + encodeURIComponent(b.dataset.phoneCancel) + '/cancel'); toast('Queued command cancelled'); route(); }
     catch (e) { toast(e.message); }
   });
   const addCt = $('#ct-add');
@@ -2030,6 +2386,10 @@ Speech.pickVoice = pickVoice;
 Speech.voiceGenderOf = voiceGenderOf;
 window.AriaSpeech = Speech;
 window.AriaPickVoice = pickVoice;
+window.AriaPickVoiceFor = pickVoiceFor;
+window.AriaSttLocaleFor = sttLocaleFor;
+window.AriaLangLabel = langLabel;
+window.AriaLangModes = LANG_MODES;
 window.AriaVoiceGenderOf = voiceGenderOf;
 
 /* Opt-in only (localStorage aria.wake = '1'). Enabling it unprompted would hold the

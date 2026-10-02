@@ -24,6 +24,8 @@ Installed, it runs full-screen, works **offline** (your latest brief stays reada
 
 ARIA talks — a real voice greeting plays with your fresh morning brief, priority items announce themselves with a chime + voice, task completions chirp, sends pop. Mute with the **🔊 button** in the sidebar (per-device, remembered).
 
+**Which language?** Settings → *Install · Sound · Notifications* → **Language** switches ARIA between **Auto (mirror me)**, **English (en-KE)**, **Swahili (sw-KE)** and **Kikuyu (ki)** — per device instantly, and server-side as the default for a new device. Kikuyu is honest by design: **no browser recognises Kikuyu speech**, so the mic is disabled, badged ⌨️ and says *type your Kikuyu instead*, while typed Kikuyu (and any phrase you add to the dictionary) works. ARIA answers in the language you used and, when unsure in Kikuyu, falls back to Swahili/English — stated in the reply. TTS picks a Swahili voice when the device has one, then Kenyan English, and stays silently text-only if the device has neither (never an uncaught error). Full guide: **[docs/LANGUAGE_VOICE.md](docs/LANGUAGE_VOICE.md)**.
+
 **Whose voice?** Settings → *Install · Sound · Notifications* → **ARIA's voice** picks a **Male** (default) or **Female** voice, and **▶ Test ARIA's voice** previews it straight away. The choice is stored twice: in `localStorage 'aria.voiceGender'` (instant, per device) and in `settings.voiceGender` (the default a new device adopts). Voice names differ per OS, so ARIA looks for explicitly male voices first (Daniel, Alex, David, Mark, Guy, Fred, Thomas, George, Oliver, Liam, Rishi, Google UK English Male…), keeps the female list for the other setting, and — when a device only offers neutral names — drops the pitch to 0.85 (male) or raises it to 1.05 (female) so ARIA still sounds right.
 
 ## 🔔 Morning notifications on your lock screen
@@ -135,6 +137,24 @@ Settings → Connectors / Permissions / Alarms / Messaging. Default **deny**. Se
 | `POST /api/messages/draft`, `POST /api/messages/send` | Draft ≠ send; send is idempotent and confirm-gated. |
 | `GET/POST /api/media/*` | Browser/local playback; `POST /api/media/report` is what confirms it. |
 | `GET/POST /api/permissions`, `GET /api/audit`, `POST /api/confirm` | Grants, audit log (no secrets), owner confirmation. |
+| `GET /api/phone`, `POST /api/phone/command` | Android bridge status / queue a command (owner side). |
+| `GET /api/phone/pending`, `POST /api/phone/ack` | Phone side — bearer-token authed. Poll for commands, ack what really ran. |
+
+### 📱 Android phone bridge — real alarms & music (Tasker / MacroDroid)
+
+Off by default. Turn it on in Settings → **Android phone bridge**, paste a bridge token (stored as a
+secret: blanked in every GET, never logged, never given to the model), grant `phone.alarm`,
+`phone.media` and/or `phone.app`, then follow **[docs/ANDROID_BRIDGE.md](docs/ANDROID_BRIDGE.md)**
+for the copy-paste Tasker profile.
+
+ARIA queues commands (`set_alarm`, `cancel_alarm`, `play`, `pause`, `next`, `previous`, `volume`,
+`open_app`) into an outbox. Your phone polls with `Authorization: Bearer <token>`, runs the real
+action (Tasker *Set Alarm* / *Media Control* / *Launch App*) and acks. **Until the ack arrives ARIA
+only ever says “sent to phone, waiting for confirmation”** — it never claims an alarm rang or a
+track played. Commands expire, repeat intents are idempotent, repeat acks are ignored, and a model
+can never self-confirm a real device alarm. Every queued command is audited, and an optional
+web-push with a fixed title (`ARIA ALARM 06:30`) can wake a Tasker/AutoNotification profile when
+polling is not enough.
 
 ```bash
 npm install
@@ -142,9 +162,69 @@ npm test          # verification suite (jsdom + real HTTP, mocked providers only
 npm start         # http://localhost:3000
 ```
 
+### 🗣️ Swahili, Kikuyu, Sheng — the editable phrase dictionary
+
+A real, editable store (`/api/dictionary`, seeded with 55 phrases) rewrites Swahili/Kikuyu/Sheng
+commands into the English the intent layer already understands — **deterministically, with no model
+round-trip** — and injects the whole vocabulary into the prompt as grounding for anything longer:
+
+```
+"weka kengele kesho asubuhi"  →  set an alarm tomorrow morning   (real alarm created)
+"panga siku yangu"            →  plan my day                     (real plan generated)
+"nikumbushe kupiga simu kesho"→  reminder created · "sahau" → forget that
+"habari ya asubuhi"           →  a Swahili greeting, answered in Swahili
+"wĩ mwega" / "ũhoro waku"     →  a Kikuyu greeting, answered in Swahili (stated honestly)
+"piga simu kwa Kamau"         →  "I cannot place calls — I can set a reminder or draft a message"
+```
+
+Edit or add phrases in **Second Brain → 🗣️ Language & phrases** (add / edit / delete / restore seeds):
+`{ phrase, lang, intent, command }`, where `{rest}` keeps whatever followed the phrase. An owner-added
+Kikuyu command works on the very next message. Details, capability table and the custom-STT future
+path: **[docs/LANGUAGE_VOICE.md](docs/LANGUAGE_VOICE.md)**.
+
 ### 🧠 Semantic memory
 
-The second brain is a **hybrid retriever**: BM25 lexical scoring blended 50/50 with cosine similarity over embeddings (`server/embeddings.js`). Notes are embedded lazily, once, and cached on the note — but only when an embedding backend is reachable, so without Ollama the brain stays purely lexical and just as fast. That is what makes a paraphrase land: *"who do I know that sells cement?"* now finds the supplier note even when it shares no keywords.
+Two layers, same idea — recall by meaning, not just keywords:
+
+* **Second brain** — a hybrid retriever: BM25 lexical scoring blended 50/50 with cosine similarity over embeddings (`server/embeddings.js`). Notes are embedded lazily, once, and cached on the note, so without a backend it stays purely lexical and just as fast. A paraphrase lands: *"who do I know that sells cement?"* finds the supplier note even when it shares no keywords.
+* **Long-term memory about you** (`server/memory.js`) — durable facts, preferences and corrections in a real Postgres table with pgvector (`aria_memory`), or the local JSON store when Supabase is not configured. The incoming message is embedded, the top ~6 memories are injected **before** ARIA (and the Agency Swarm's Director) reasons, and `last_accessed` is bumped for exactly what was used. Embedding chain: **cloud (only with a key) → Ollama → lexical fallback**, all fitted to the same configurable dimension (`settings.llm.embedDim`, default **768**, matching the `vector(768)` column).
+
+```
+supabase/migrations/20261002085317_aria_memory.sql   # paste once in the Supabase SQL editor
+```
+
+Manage them in **Second Brain → 🧠 Long-term memory** (add / search / edit / delete), or say *"remember that …"* / *"forget that"*. Secrets never reach memory: every write is redacted first. Full guide: **[docs/SEMANTIC_MEMORY.md](docs/SEMANTIC_MEMORY.md)**.
+
+#### 🌱 Durable learning — ARIA learns from the conversation
+
+ARIA **extracts lasting facts, preferences and corrections on its own** and stores them as memories —
+no model is ever retrained, learning is retrieval + preference memory (`server/learning.js`):
+
+* **Never blocks a reply.** Extraction is queued out-of-band (the queue is persisted first, drained
+  on the next tick and by an hourly sweep at :07 — it survives serverless freezes). Every 12 turns the
+  rolling summary window is also offered to the model for JSON extraction; offline, heuristics do it.
+* **Filtered hard.** Greetings, thanks, questions and commands are dropped; nothing below
+  `MIN_IMPORTANCE 0.55` is stored. PINs, passwords, OTPs, API keys/tokens, card numbers (Luhn-checked)
+  and recovery phrases are **rejected before persistence**, never stored in redacted form.
+* **Deduped and reconciled.** Near-duplicates merge into one row (Jaccard ≥ 0.86 or cosine ≥ 0.93),
+  and a correction **supersedes in place** — *"no, I meant Kamau not Mwangi"* leaves one supplier
+  memory, with the old text kept in `metadata.priorContent`. *"My accountant is Otieno"* vs *"my
+  lawyer is Otieno"* is explicitly never a conflict.
+* **Forgettable.** *"forget that"*, *"forget what you know about my supplier"*, *"forget
+  everything"* — the reply states exactly what was removed. The model itself can only *propose* a
+  forget; it takes an owner confirmation to delete.
+
+The Second Brain memory card shows the counters (auto-learned · merged · superseded · skipped noise ·
+secrets blocked · queue) with a **⚙ Learn now** button. Full guide: **[docs/DURABLE_LEARNING.md](docs/DURABLE_LEARNING.md)**.
+
+| Endpoint | What it does |
+|---|---|
+| `GET /api/memory`, `GET /api/memory/stats`, `GET /api/memory/search?q=` | List / backend+dimension / hybrid search. |
+| `POST /api/memory`, `PATCH\|PUT /api/memory/:id`, `DELETE /api/memory/:id` | Store / edit (re-embeds) / delete — all audited. |
+| `POST /api/memory/forget`, `DELETE /api/memory?confirm=true` | *"Forget that"* by id or meaning / clear everything. |
+| `GET /api/learning`, `POST /api/learning/run` | Durable-learning counters + policy / drain the learning queue now. |
+| `GET /api/language` | Honest voice capability table (mode, STT locales, Kikuyu unavailable, TTS fallback). |
+| `GET /api/dictionary`, `POST /api/dictionary`, `PUT\|PATCH\|DELETE /api/dictionary/:id`, `POST /api/dictionary/reset`, `POST /api/dictionary/match` | Phrase dictionary CRUD (Swahili/Kikuyu/Sheng → intents) + seed restore + normalizer debug. |
 
 ### 🗣️ Say it however you like
 
@@ -187,12 +267,16 @@ server/
   assistant.js    executive assistant: intent routing · tool calling · planner · discretion · hub route
   automation.js   extra tools + deterministic alarms/messages/media/routines
   alarms.js       browser-notification alarms & reminders (never a device alarm)
+  phone.js        Android bridge outbox: real device alarms/media via Tasker/MacroDroid + acks
+  memory.js       semantic memory: pgvector store (Supabase) / local fallback, hybrid retrieval, forget
+  learning.js     durable learning: extraction, noise filter, secret scrubbing, dedupe, conflict supersede, forget
+  dictionary.js   language layer: Swahili/Kikuyu/Sheng phrase dictionary, STT/TTS policy, prompt grounding
   permissions.js  default-deny grants, confirmations, audit
   messaging.js    draft ≠ send, idempotent sends, group deny
   media.js        browser / local audio only
   integrations.js OAuth + Telegram/WhatsApp Cloud/SMS-bridge/SMTP
   secrets.js      preserve blank secret saves; redact GET bodies
-  embeddings.js   embedding adapter (Ollama) + cosine similarity + TF-IDF fallback vector
+  embeddings.js   embedding adapter: cloud → Ollama → lexical, dimension-fitted (768 default)
   agency.js       Agency Swarm orchestrator (sequential / parallel waves, run history)
   agents/         director · researcher · analyst · copywriter (zero-dependency agents)
   llm.js          model adapter: cloud (OpenAI-compatible) → Ollama → offline, tool prompts
@@ -202,6 +286,7 @@ server/
   scheduler.js    cron: brief at wake, sync every 30 min, alarm tick every minute
   connectors/     demo · google · microsoft · slack · whatsapp
 public/           dashboard SPA (no build step)
+supabase/         migrations you paste into the Supabase SQL editor (idempotent)
 scripts/          oauth-google helper · test-app.js verification suite (`npm test`)
 data/             your everything (gitignored — it IS your brain)
 ```

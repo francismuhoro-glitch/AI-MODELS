@@ -38,7 +38,20 @@ function start() {
     } catch (e) { console.error('[scheduler] alarm tick failed:', e.message); }
   }, { timezone: tz }));
 
-  console.log(`[scheduler] started — brief at ${cfg.wakeTime} ${tz}, sync every 30 min`);
+  // Memory hygiene + durable learning: drain anything the reply path queued but did not finish
+  // (serverless freezes, a crash mid-extraction), then expire stale low-importance memories.
+  jobs.push(cron.schedule('7 * * * *', async () => {
+    try {
+      const learning = require('./learning');
+      const learned = await learning.flush();
+      if (learned.processed) console.log(`[scheduler] learning: ${learned.saved} saved, ${learned.merged} merged, ${learned.superseded} superseded`);
+      const memory = require('./memory');
+      const r = await memory.expireStale();
+      if (r.expired) console.log(`[scheduler] expired ${r.expired} stale memory item(s)`);
+    } catch (e) { console.error('[scheduler] memory sweep failed:', e.message); }
+  }, { timezone: tz }));
+
+  console.log(`[scheduler] started — brief at ${cfg.wakeTime} ${tz}, sync every 30 min, memory sweep hourly`);
 
   // Catch-up: if it's already past wake time today and no brief exists yet → generate now
   catchUp();

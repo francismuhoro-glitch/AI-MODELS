@@ -34,7 +34,26 @@ create table if not exists aria_docs (
 );
 ```
 
-That's the whole schema — ARIA stores its state/settings as documents in this one table.
+That's the base schema — ARIA stores its state/settings as documents in this table.
+
+**Semantic memory (recommended, one more paste):** run
+`supabase/migrations/20261002085317_aria_memory.sql` in the same SQL editor. It enables
+`pgvector`, creates the `aria_memory` table (with its HNSW index + `match_aria_memories()`
+function) and leaves `aria_docs` untouched. Without it, memory still works — it just falls back
+to the local document store (`GET /api/memory/stats` tells you which backend is live).
+See [docs/SEMANTIC_MEMORY.md](docs/SEMANTIC_MEMORY.md).
+
+**Durable learning needs no extra schema.** It writes to the same `aria_memory` rows and keeps its
+queue in the existing document store, so the migration above is all the SQL there is. After deploy,
+`GET /api/learning` should show counters and `training: "none …"`; extraction is queued out-of-band
+(an hourly cron at `7 * * * *` drains leftovers, which is what keeps it safe on serverless freezes).
+See [docs/DURABLE_LEARNING.md](docs/DURABLE_LEARNING.md).
+
+**Swahili / Kikuyu voice needs no schema or key either.** The phrase dictionary is a document in the
+same store (`/api/dictionary`), and speech uses the browser's own Web Speech APIs. Two deployment
+notes: the microphone needs **HTTPS** (Vercel gives you that), and **Kikuyu speech recognition does
+not exist in browsers** — with Kikuyu selected the mic is disabled and typing (plus the dictionary)
+is the supported path. See [docs/LANGUAGE_VOICE.md](docs/LANGUAGE_VOICE.md).
 
 ### 2. Push this repo to GitHub, then import to Vercel
 1. Push the repo to your GitHub.

@@ -5,6 +5,8 @@
 const alarms = require('./alarms');
 const messaging = require('./messaging');
 const media = require('./media');
+const phone = require('./phone');
+const learning = require('./learning');
 const permissions = require('./permissions');
 const integrations = require('./integrations');
 const cfgm = require('./config');
@@ -31,8 +33,9 @@ const TOOL_DEFS = [
   { name: 'now_playing', description: 'Report last requested / client-confirmed playback. Never invent a track.', args: { provider: { type: 'string', optional: true } } },
   { name: 'search_free_slots', description: 'Show free slots on the calendar for a day.', args: { dayLabel: { type: 'today | tomorrow | weekday | YYYY-MM-DD', optional: true } } },
   { name: 'start_routine', description: 'Start a named local routine (default: morning). Messaging steps still require confirmation.', args: { name: { type: '"morning"', optional: true } } },
-  { name: 'confirm_action', description: 'Confirm a pending sensitive action. Only the owner can do this — not the model.', args: { id: { type: 'confirmation id from the UI or chat' } } }
-];
+  { name: 'confirm_action', description: 'Confirm a pending sensitive action. Only the owner can do this — not the model.', args: { id: { type: 'confirmation id from the UI or chat' } } },
+  { name: 'forget_memory', description: 'Forget a durable long-term memory: by id, or by topic (the memories that match by meaning). ALWAYS requires the owner to confirm — a model can never self-confirm a deletion.', args: { id: { type: 'memory id', optional: true }, query: { type: 'topic words, e.g. "supplier prices"', optional: true } } }
+].concat(phone.TOOL_DEFS);
 
 function str(v) { return String(v === null || v === undefined ? '' : v).replace(/\s+/g, ' ').trim(); }
 
@@ -102,6 +105,22 @@ async function confirmPending(id, { origin } = {}) {
     if (!draft) return { reply: 'The draft disappeared — nothing was sent.', intent: 'confirm', confirmed: false };
     const result = await messaging.performSend(draft, { idempotencyKey: payload.idempotencyKey });
     return { ...result, intent: 'message-send', confirmed: !!result.sent };
+  }
+  /* Owner confirmed a memory deletion the model proposed. Only this path (origin 'user') runs it. */
+  if (payload.type === 'forget') {
+    const result = await learning.forget({ mode: payload.ids && payload.ids.length ? 'ids' : 'topic', query: payload.query || '', ids: payload.ids });
+    return { reply: result.reply, intent: 'memory-forget', removed: result.removed, confirmed: result.removed > 0 };
+  }
+  /* Owner confirmed a REAL phone command the model asked for (phone alarm / media / app).
+     Only this path (origin 'user') can push it into the outbox. */
+  if (payload.type === 'phone' || /^phone_/.test(String(rec.action || ''))) {
+    const result = await phone.enqueue({
+      type: payload.command || String(rec.action || '').replace(/^phone_/, ''),
+      args: payload.args || {},
+      idempotencyKey: payload.idempotencyKey,
+      origin: 'user'
+    });
+    return { ...result, intent: result.intent || 'phone-command', confirmed: !!result.queued };
   }
   if (payload.kind === 'alarm' || payload.kind === 'reminder' || rec.action === 'create_alarm' || rec.action === 'create_reminder') {
     const result = await alarms.create({
@@ -229,6 +248,32 @@ async function executeTool(name, args, origin = 'assistant') {
         return { reply: freeSlotsText(str(a.dayLabel || a.day || a.when) || 'tomorrow'), intent: 'schedule-query' };
       case 'start_routine':
         return await startRoutine(str(a.name || a.which) || 'morning');
+      case 'forget_memory': {
+        const id = str(a.id || a.memoryId);
+        const query = str(a.query || a.about || a.topic || a.content);
+        if (!id && !query) return null;
+        if (origin === 'tool-loop') {
+          const rec = permissions.createConfirmation({
+            action: 'forget_memory',
+            integration: 'memory',
+            preview: {
+              title: 'Forget a memory',
+              kind: 'memory',
+              destination: '',
+              body: id ? `memory ${id}` : `memories matching "${query}"`
+            },
+            payload: { type: 'forget', ids: id ? [id] : [], query }
+          });
+          return {
+            reply: `That would delete ${id ? 'a stored memory' : `memories matching "${query}"`}. A model cannot confirm a deletion — say **confirm** or tap Confirm and I will remove it. Nothing was deleted yet.`,
+            intent: 'memory-forget',
+            needsConfirmation: true,
+            confirmation: permissions.publicConfirmation(rec)
+          };
+        }
+        const result = await learning.forget({ mode: id ? 'ids' : 'topic', ids: id ? [id] : [], query });
+        return { reply: result.reply, intent: 'memory-forget', removed: result.removed };
+      }
       case 'confirm_action': {
         if (origin === 'tool-loop') {
           return { reply: 'A model cannot confirm a sensitive action. The owner must say confirm or tap Confirm.', intent: 'confirm', confirmed: false };
@@ -237,8 +282,12 @@ async function executeTool(name, args, origin = 'assistant') {
         if (!id) return null;
         return await confirmPending(id, { origin });
       }
-      default:
+      default: {
+        /* Android phone bridge commands (phone_command) — real device alarm / media / app. */
+        const viaPhone = await phone.executeTool(tool, a, origin);
+        if (viaPhone) return viaPhone;
         return null;
+      }
     }
   } catch (e) {
     return { reply: 'That action failed: ' + require('./secrets').safeError(e), intent: 'error' };
@@ -306,6 +355,14 @@ async function route(msg) {
     permissions.cancel(pending.id);
     return { reply: 'Cancelled — nothing was sent or changed.', intent: 'confirm-cancel' };
   }
+
+  /* Android phone bridge — "set an alarm on my phone for 6:30", "pause the music on my phone".
+     Runs BEFORE the browser alarm / browser media matchers so a phone request is never turned
+     into a browser notification or a tab-local playback action. */
+  try {
+    const ph = await phone.route(s, { origin: 'user' });
+    if (ph && ph.reply) return ph;
+  } catch (_) {}
 
   const al = matchAlarm(s);
   if (al) {
@@ -393,6 +450,7 @@ function toolResultForModel(result) {
   if (result.created === false) out.created = false;
   if (result.ok === false) out.ok = false;
   if (result.deviceAlarm) out.deviceAlarm = result.deviceAlarm;
+  if (typeof result.removed === 'number') out.removed = result.removed;
   if (result.confirmedPlayback === false) out.confirmedPlayback = false;
   return out;
 }

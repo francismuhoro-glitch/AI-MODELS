@@ -138,9 +138,18 @@ class DirectorAgent extends Agent {
       d ? `${/^[aeiou]/i.test(d.title) ? 'An' : 'A'} ${d.title.toLowerCase()} is drafted and ready for your review.` : ''
     ].filter(Boolean).join(' ');
 
+    /* Durable memories (retrieved before the swarm ran) frame the synthesis: the principal's
+       standing preferences and facts outrank generic advice. */
+    const remembered = Array.isArray(ctx.memory) ? ctx.memory : [];
+
     const { text: summary, engine } = await think(
-      'You are ARIA, Executive Chief of Staff. Write ONE tight executive paragraph (max 70 words) summarising the mission outcome for the principal. No headings, no bullet points, no preamble.',
-      [`MISSION: ${ctx.task}`, '', 'AGENT OUTPUTS:', ...ctx.trace.map(t => `${t.agent}: ${snippet(t.result, 400)}`)].join('\n'),
+      'You are ARIA, Executive Chief of Staff. Write ONE tight executive paragraph (max 70 words) summarising the mission outcome for the principal. Respect the MEMORY block: it holds durable facts and preferences about the principal. No headings, no bullet points, no preamble.',
+      [
+        `MISSION: ${ctx.task}`,
+        ctx.memoryText ? `\n${ctx.memoryText}\n` : '',
+        'AGENT OUTPUTS:',
+        ...ctx.trace.map(t => `${t.agent}: ${snippet(t.result, 400)}`)
+      ].join('\n'),
       fallbackSummary
     );
 
@@ -150,6 +159,11 @@ class DirectorAgent extends Agent {
     L.push('');
     L.push(`**Mission:** ${ctx.task}`);
     L.push('');
+    if (remembered.length) {
+      L.push(`### Standing context (from memory)`);
+      remembered.slice(0, 4).forEach(m => L.push(`- ${m.kind && m.kind !== 'fact' ? `_${m.kind}_ — ` : ''}${snippet(m.content, 160)}`));
+      L.push('');
+    }
     L.push(`### Executive summary`);
     L.push(summary || fallbackSummary);
     if (r.hits && r.hits.length) {

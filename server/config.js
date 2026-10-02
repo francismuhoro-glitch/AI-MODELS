@@ -6,6 +6,7 @@ const store = require('./store');
 const secrets = require('./secrets');
 
 const LLM_PROVIDERS = ['auto', 'ollama', 'openai', 'offline'];
+const LANGUAGES = ['auto', 'en', 'sw', 'ki'];
 const VOICE_GENDERS = ['male', 'female'];
 
 const DEFAULTS = {
@@ -20,16 +21,27 @@ const DEFAULTS = {
      fresh install; the client mirrors it in localStorage 'aria.voiceGender' for an instant,
      per-device switch (Settings → "ARIA's voice"). */
   voiceGender: 'male',
+  /* Language of the conversation (and of ARIA's replies). 'auto' = mirror whatever the user
+     writes in; 'en' | 'sw' | 'ki' pin it. sttLocale overrides the SpeechRecognition locale
+     ('', = derive it from the mode: sw → sw-KE, en → en-KE, ki → none, auto → device default).
+     Kikuyu has NO browser speech recognition — the mic degrades to typed input by design. */
+  language: { mode: 'auto', sttLocale: '' },
   llm: {
     /* 'auto' = cloud (only when a key exists) → local Ollama → built-in offline engine. */
     provider: 'auto',
     ollamaUrl: 'http://127.0.0.1:11434',
     model: 'openai/gpt-oss-120b',
+    /* Embedding dimension for SEMANTIC MEMORY (aria_memory.embedding). MUST match the
+       vector(768) column and match_aria_memories(). env ARIA_EMBED_DIM overrides. */
+    embedDim: 768,
+    /* Which Ollama model to embed with (falls back to ollama's own default, then
+       nomic-embed-text). */
+    embedModel: 'nomic-embed-text',
     /* What ARIA recommends for a local model on modest hardware — shown in Settings. */
     recommendedModel: 'qwen2.5:7b',
     /* Any OpenAI-compatible endpoint (OpenAI, Groq, OpenRouter, a local vLLM…). OFF by
        default: with no apiKey (and no OPENAI_API_KEY env) it is never contacted. */
-    openai: { baseUrl: 'https://api.openai.com/v1', apiKey: '', model: 'gpt-4o-mini' }
+    openai: { baseUrl: 'https://api.openai.com/v1', apiKey: '', model: 'gpt-4o-mini', embedModel: 'text-embedding-3-small' }
   },
   /* Discretion mode: TTS output skips full email contents, long lists and sensitive strings
      (passwords, PINs, tokens, card numbers, addresses). Display text stays complete. */
@@ -39,6 +51,16 @@ const DEFAULTS = {
   telegram: { enabled: false, token: '', allowedChatId: '' },
   sms: { enabled: false, bridgeUrl: '', token: '' },
   media: { provider: 'browser', localUrl: '' },
+  /* Android phone bridge (Tasker / MacroDroid). OFF by default: with no token saved and no
+     explicit phone.* grants, no command can ever reach a device. Commands are queued in the
+     outbox and stay unconfirmed until the phone acks them. */
+  phone: {
+    enabled: false,
+    bridgeToken: '',
+    label: 'Android phone',
+    commandTtlSeconds: 1800,     // must be longer than the Tasker poll interval
+    pollSeconds: 300
+  },
   contacts: [],
   permissions: { grants: {}, allowGroupSend: false, autoSendRules: [] },
   routines: { morning: { enabled: true, steps: ['calendar_today', 'unread_summary'] } },
@@ -76,6 +98,11 @@ function normalize(cfg) {
   out.llm.openai.baseUrl = String(out.llm.openai.baseUrl || DEFAULTS.llm.openai.baseUrl).replace(/\/+$/, '');
   out.llm.openai.apiKey = String(out.llm.openai.apiKey || '').trim();   // never logged, never echoed to /api/ai/status
   out.llm.openai.model = String(out.llm.openai.model || DEFAULTS.llm.openai.model);
+  out.llm.openai.embedModel = String(out.llm.openai.embedModel || DEFAULTS.llm.openai.embedModel);
+  /* Embedding dimension: 64..3072, default 768 — must match the aria_memory vector column. */
+  const embedDim = Number(process.env.ARIA_EMBED_DIM || out.llm.embedDim);
+  out.llm.embedDim = Number.isFinite(embedDim) && embedDim >= 64 && embedDim <= 3072 ? Math.round(embedDim) : DEFAULTS.llm.embedDim;
+  out.llm.embedModel = String(out.llm.embedModel || DEFAULTS.llm.embedModel);
   if (!out.llm.recommendedModel) out.llm.recommendedModel = DEFAULTS.llm.recommendedModel;
   // Back-compat: an older build stored { ollama: { host, model } }
   if (cfg && cfg.ollama) {
@@ -84,6 +111,11 @@ function normalize(cfg) {
   }
   out.voiceGender = VOICE_GENDERS.includes(String(out.voiceGender || '').toLowerCase())
     ? String(out.voiceGender).toLowerCase() : DEFAULTS.voiceGender;
+  out.language = merge(clone(DEFAULTS.language), out.language || {});
+  const langMode = String(out.language.mode || 'auto').toLowerCase();
+  out.language.mode = ['auto', 'en', 'sw', 'ki'].includes(langMode) ? langMode : 'auto';
+  out.language.sttLocale = String(out.language.sttLocale || '').trim().slice(0, 20);
+  if (out.language.sttLocale && !/^[a-z]{2}(-[A-Za-z]{2})?$/.test(out.language.sttLocale)) out.language.sttLocale = '';
   out.smtp = merge(clone(DEFAULTS.smtp), out.smtp || {});
   out.brief = merge(clone(DEFAULTS.brief), out.brief || {});
   out.rhythm = merge(clone(DEFAULTS.rhythm), out.rhythm || {});
@@ -91,6 +123,16 @@ function normalize(cfg) {
   out.telegram = merge(clone(DEFAULTS.telegram), out.telegram || {});
   out.sms = merge(clone(DEFAULTS.sms), out.sms || {});
   out.media = merge(clone(DEFAULTS.media), out.media || {});
+  out.phone = merge(clone(DEFAULTS.phone), out.phone || {});
+  out.phone.enabled = !!out.phone.enabled;
+  out.phone.bridgeToken = String(out.phone.bridgeToken || '').trim();
+  out.phone.label = String(out.phone.label || DEFAULTS.phone.label).slice(0, 60);
+  const phoneTtl = Number(out.phone.commandTtlSeconds);
+  out.phone.commandTtlSeconds = Number.isFinite(phoneTtl) && phoneTtl >= 60
+    ? Math.min(Math.round(phoneTtl), 86400) : DEFAULTS.phone.commandTtlSeconds;
+  const phonePoll = Number(out.phone.pollSeconds);
+  out.phone.pollSeconds = Number.isFinite(phonePoll) && phonePoll >= 15
+    ? Math.min(Math.round(phonePoll), 86400) : DEFAULTS.phone.pollSeconds;
   out.permissions = merge(clone(DEFAULTS.permissions), out.permissions || {});
   out.permissions.grants = out.permissions.grants && typeof out.permissions.grants === 'object' ? out.permissions.grants : {};
   out.permissions.autoSendRules = Array.isArray(out.permissions.autoSendRules) ? out.permissions.autoSendRules : [];
@@ -134,6 +176,9 @@ function publicConfig(cfg) {
   out.llm.openai.apiKeyConfigured = !!openaiSecret(src);
   out.smtp = out.smtp || {}; out.smtp.pass = ''; out.smtp.passConfigured = !!(src && src.smtp && src.smtp.pass);
   out.telegram = out.telegram || {}; out.telegram.token = ''; out.telegram.tokenConfigured = !!(src && src.telegram && src.telegram.token);
+  out.phone = out.phone || {};
+  out.phone.bridgeToken = '';
+  out.phone.bridgeTokenConfigured = !!(src && src.phone && src.phone.bridgeToken);
   return out;
 }
 function openaiSecret(cfg) { return String((cfg && cfg.llm && cfg.llm.openai && cfg.llm.openai.apiKey) || process.env.OPENAI_API_KEY || '').trim(); }
@@ -149,4 +194,4 @@ async function save(patch) {
 /* Test helper — drops the in-memory cache so the next load() re-reads the store. */
 function _reset() { cache = null; }
 
-module.exports = { init, load, save, normalize, publicConfig, DEFAULTS, _reset };
+module.exports = { init, load, save, normalize, publicConfig, DEFAULTS, LANGUAGES, _reset };

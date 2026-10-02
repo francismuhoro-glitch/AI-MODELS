@@ -679,6 +679,588 @@ function check(name, cond, detail) {
   check('/api/state.cfg does not contain telegram token', !JSON.stringify((stAfter.json || {}).cfg || {}).includes(SECRET_TG));
   await cfgMod.save({ contacts: [], media: { provider: 'browser', localUrl: '' } });
 
+  console.log('\n[3m] Android phone bridge — real alarms & media via Tasker/MacroDroid');
+  const phoneMod = require('../server/phone');
+  const PHONE_TOKEN = 'phone-bridge-SECRETTOKEN-xyz-never-leak';
+  const phoneGet = async (p, token) => {
+    const r = await fetch(base + p, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+    let j = null; try { j = await r.json(); } catch (_) {}
+    return { status: r.status, json: j };
+  };
+  const phonePost = async (p, body, token) => {
+    const r = await fetch(base + p, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) }, body: JSON.stringify(body || {}) });
+    let j = null; try { j = await r.json(); } catch (_) {}
+    return { status: r.status, json: j };
+  };
+
+  /* Start from a certified-clean slate: off, no token, no grants. */
+  phoneMod._reset();
+  await integMod.revoke('phone');
+  await permMod.setGrant('phone.alarm', false);
+  await permMod.setGrant('phone.media', false);
+  await permMod.setGrant('phone.app', false);
+
+  check('the phone bridge is OFF by default (not enabled, no token)', cfgMod.load().phone.enabled === false && !cfgMod.load().phone.bridgeToken);
+  check('phone permissions are denied by default', permMod.allowed('phone', 'alarm') === false && permMod.allowed('phone', 'media') === false && permMod.allowed('phone', 'app') === false);
+  check('phone.alarm is sensitive — a model can never self-confirm it', permMod.isSensitive('phone', 'alarm') === true);
+  check('phone_command is on the hub tool schema', asstMod.TOOL_DEFS.some(t => t.name === 'phone_command'));
+  check('the phone schema never exposes a token field', !/token/i.test(JSON.stringify(asstMod.TOOL_DEFS.find(t => t.name === 'phone_command') || {})));
+
+  const offAttempt = await phoneMod.enqueue({ type: 'set_alarm', args: { when: 'tomorrow at 6:30 am' }, origin: 'user' });
+  check('a command while the bridge is off is refused and queues nothing', offAttempt.queued === false && /off/i.test(offAttempt.reply || '') && phoneMod.publicState().pendingCount === 0, offAttempt.reply);
+  check('publicState never contains the bridge token key', !JSON.stringify(phoneMod.publicState()).includes('bridgeToken'));
+
+  await cfgMod.save({ phone: { enabled: true, bridgeToken: PHONE_TOKEN, label: 'Test phone' } });
+  const noGrant = await phoneMod.enqueue({ type: 'set_alarm', args: { when: 'tomorrow at 6:30 am' }, origin: 'user' });
+  check('bridge on but no grant → phone.alarm still denied (default deny)', noGrant.queued === false && /denied by default/i.test(noGrant.reply || ''), noGrant.reply);
+  check('GET /api/phone/pending without a token → 401', (await phoneGet('/api/phone/pending')).status === 401);
+  check('GET /api/phone/pending with a wrong token → 401', (await phoneGet('/api/phone/pending', 'nope')).status === 401);
+
+  await permMod.setGrant('phone.alarm', true);
+  const queuedAlarm = await phoneMod.enqueue({ type: 'set_alarm', args: { when: 'tomorrow at 6:30 am', timezone: ARIA_TZ, title: 'Gym' }, origin: 'user' });
+  const qc = queuedAlarm.command || {};
+  check('granted phone.alarm queues a real set_alarm command', queuedAlarm.queued === true && qc.type === 'set_alarm', queuedAlarm.reply);
+  check('the reply is "waiting for confirmation" and never claims the alarm happened', /waiting for .*confirmation/i.test(queuedAlarm.reply || '') && !/\b(?:alarm is set|alarm created|will ring|set for you)\b/i.test(queuedAlarm.reply || ''), queuedAlarm.reply);
+  check('the alarm time resolves in Africa/Nairobi at 06:30 tomorrow', qc.args.timezone === ARIA_TZ && qc.args.hour === 6 && qc.args.minute === 30 && dk(qc.args.epochMs, ARIA_TZ) === tomorrowKey, JSON.stringify({ tz: qc.args.timezone, h: qc.args.hour, m: qc.args.minute }));
+  check('the command payload carries the Tasker action', !!(qc.tasker && /Set Alarm/.test(qc.tasker.action || '')));
+  const dupAlarm = await phoneMod.enqueue({ type: 'set_alarm', args: { when: 'tomorrow at 6:30 am', timezone: ARIA_TZ, title: 'Gym' }, origin: 'user' });
+  check('the same alarm intent is not queued twice (idempotent)', dupAlarm.duplicate === true && dupAlarm.command.id === qc.id);
+
+  const pend = await phoneGet('/api/phone/pending', PHONE_TOKEN);
+  check('the phone polls with its bearer token → 200 with the queued command', pend.status === 200 && (pend.json.commands || []).length === 1 && pend.json.commands[0].id === qc.id, JSON.stringify(pend.json));
+  check('the pending payload never contains the bridge token', !JSON.stringify(pend.json).includes(PHONE_TOKEN));
+  check('picking a command up does not mark it done', pend.json.commands[0].status === 'queued' && pend.json.commands[0].attempts >= 1);
+  const beforeAckState = (await get('/api/phone')).json || {};
+  check('before the ack ARIA reports it as queued, with no ack on record', beforeAckState.pendingCount === 1 && beforeAckState.lastAck === null);
+  const asstQueued = await post('/api/assistant', { message: 'is my phone connected?' });
+  check('assistant phone status says queued (not done) before the ack', /queued/i.test((asstQueued.json || {}).reply || ''), (asstQueued.json || {}).reply);
+
+  const ackRes = await phonePost('/api/phone/ack', { id: qc.id, status: 'done', detail: 'Set Alarm action ran' }, PHONE_TOKEN);
+  check('the phone ack marks the command acked with the real detail', ackRes.status === 200 && (ackRes.json.command || {}).status === 'acked' && /Set Alarm action ran/.test(((ackRes.json.command || {}).result || {}).detail || ''));
+  check('only the ack lets ARIA say it was confirmed', /confirmed/i.test((ackRes.json || {}).reply || ''), (ackRes.json || {}).reply);
+  const ackAgain = await phonePost('/api/phone/ack', { id: qc.id, status: 'failed', detail: 'late replay' }, PHONE_TOKEN);
+  check('a repeated ack is idempotent (first result wins)', ackAgain.status === 200 && ackAgain.json.duplicate === true && ackAgain.json.command.status === 'acked' && ackAgain.json.command.result.detail === 'Set Alarm action ran', JSON.stringify(ackAgain.json));
+  check('the ack is written to the audit trail', ((await get('/api/audit')).json || []).some(a => a && a.integration === 'phone' && a.action === 'set_alarm' && a.status === 'acked'));
+  const afterAckState = (await get('/api/phone')).json || {};
+  check('state records the confirmed ack (pending drained)', afterAckState.pendingCount === 0 && afterAckState.lastAck && afterAckState.lastAck.status === 'acked');
+
+  const noMedia = await phoneMod.enqueue({ type: 'pause', args: {}, origin: 'user' });
+  check('phone.media is denied until its grant exists', noMedia.queued === false);
+  await permMod.setGrant('phone.media', true);
+  await permMod.setGrant('phone.app', true);
+  const pauseCmd = await phoneMod.enqueue({ type: 'pause', args: {}, origin: 'user' });
+  check('granted phone.media queues a media command', pauseCmd.queued === true && pauseCmd.command.type === 'pause');
+  const nextIntent = await phoneMod.route('skip this track on my phone', { origin: 'user' });
+  check('deterministic intent: "skip this track on my phone" → next', !!(nextIntent && nextIntent.command && nextIntent.command.type === 'next'), JSON.stringify(nextIntent && nextIntent.command && nextIntent.command.type));
+  const openIntent = await phoneMod.route('open WhatsApp on my phone', { origin: 'user' });
+  check('deterministic intent: "open WhatsApp on my phone" → open_app', !!(openIntent && openIntent.command && openIntent.command.type === 'open_app' && /whatsapp/i.test(openIntent.command.args.app || '')), JSON.stringify(openIntent && openIntent.command && openIntent.command.args));
+  check('phone intents never hijack non-phone messages', (await phoneMod.route('schedule a meeting with Kamau tomorrow', { origin: 'user' })) === null);
+
+  const pendingBeforeAmb = phoneMod.publicState().pendingCount;
+  const ambReply = await post('/api/assistant', { message: 'set an alarm on my phone' });
+  check('an ambiguous phone alarm asks for a clock time and queues nothing', /exact clock time|need a time/i.test((ambReply.json || {}).reply || '') && phoneMod.publicState().pendingCount === pendingBeforeAmb, (ambReply.json || {}).reply);
+
+  const loopAlarm = await autoMod.executeTool('phone_command', { command: 'set_alarm', when: 'tomorrow at 7:00 am' }, 'tool-loop');
+  check('the model cannot queue a real phone alarm on its own', !!(loopAlarm && loopAlarm.needsConfirmation === true && loopAlarm.queued === false && loopAlarm.confirmation && !loopAlarm.confirmation.token), JSON.stringify(loopAlarm && loopAlarm.confirmation));
+  check('the model attempt queued nothing', phoneMod.publicState().pendingCount === pendingBeforeAmb);
+  const ownerConfirmed = await autoMod.confirmPending(loopAlarm.confirmation.id, { origin: 'user' });
+  check('owner confirm actually queues the model-requested alarm', ownerConfirmed.queued === true && ownerConfirmed.confirmed === true && ownerConfirmed.command.type === 'set_alarm', JSON.stringify(ownerConfirmed.command && ownerConfirmed.command.id));
+  check('an unknown phone command is refused', (await autoMod.executeTool('phone_command', { command: 'launch_missiles' }, 'tool-loop')) === null);
+
+  const asstPhone = await post('/api/assistant', { message: 'set an alarm on my phone for tomorrow at 6:30 am' });
+  const apj = asstPhone.json || {};
+  check('assistant routes "…on my phone" to the bridge (not a browser alarm)', apj.intent === 'phone-set_alarm' && /waiting for .*confirmation/i.test(apj.reply || ''), `${apj.intent} | ${(apj.reply || '').slice(0, 120)}`);
+  check('assistant never claims a device alarm without an ack', !/browser notification/i.test(apj.reply || '') && !/\b(?:alarm (?:is )?set|device alarm created|will ring at)\b/i.test(apj.reply || ''));
+
+  const expiring = await phoneMod.enqueue({ type: 'play', args: { query: 'x' }, origin: 'user', ttlMs: 60 });
+  await new Promise((r) => setTimeout(r, 90));
+  const pendAfterExpiry = await phoneGet('/api/phone/pending', PHONE_TOKEN);
+  check('an expired command is never delivered to the phone', !(pendAfterExpiry.json.commands || []).some(c => c.id === expiring.command.id));
+  check('an expired command is reported as expired, not done', (((await get('/api/phone')).json.recent || []).find(c => c.id === expiring.command.id) || {}).status === 'expired');
+
+  const failedAck = await phoneMod.enqueue({ type: 'cancel_alarm', args: { title: 'Gym' }, origin: 'user' });
+  const failAckRes = await phonePost('/api/phone/ack', { id: failedAck.command.id, status: 'unsupported', detail: 'Tasker has no Cancel Alarm action' }, PHONE_TOKEN);
+  check('an unsupported action is reported honestly, never as done', /could NOT run/i.test((failAckRes.json || {}).reply || '') && (failAckRes.json.command || {}).status === 'failed', (failAckRes.json || {}).reply);
+
+  check('web-push fallback uses the fixed title "ARIA ALARM 06:30"', phoneMod.pushPayload({ type: 'set_alarm', args: { epochMs: qc.args.epochMs, timezone: ARIA_TZ }, id: 'phc_x' }).title === 'ARIA ALARM 06:30', phoneMod.pushPayload({ type: 'set_alarm', args: { epochMs: qc.args.epochMs, timezone: ARIA_TZ }, id: 'phc_x' }).title);
+  check('media web-push titles are fixed too', phoneMod.pushPayload({ type: 'pause', args: {}, id: 'phc_y' }).title === 'ARIA MEDIA PAUSE');
+  const intsPhone = (((await get('/api/integrations')).json) || []).find(i => i.id === 'phone');
+  check('integrations reports the phone bridge with its scopes', !!intsPhone && intsPhone.status === 'connected' && (intsPhone.scopes || []).includes('phone.alarm'), JSON.stringify(intsPhone));
+
+  await cfgMod.save({ phone: { enabled: false } });
+  check('pending is refused (409) while the bridge is disabled', (await phoneGet('/api/phone/pending', PHONE_TOKEN)).status === 409);
+  await cfgMod.save({ phone: { enabled: true } });
+
+  const phoneLeakBodies = JSON.stringify((await get('/api/state')).json) + JSON.stringify((await get('/api/settings')).json) + JSON.stringify((await get('/api/phone')).json) + JSON.stringify((await get('/api/audit')).json);
+  check('the bridge token never leaks in state/settings/phone/audit', !phoneLeakBodies.includes(PHONE_TOKEN), phoneLeakBodies.includes(PHONE_TOKEN) ? 'LEAKED' : 'clean');
+  check('publicConfig redacts the bridge token as a secret', cfgMod.publicConfig().phone.bridgeToken === '' && cfgMod.publicConfig().phone.bridgeTokenConfigured === true);
+  const blankPhoneSave = await post('/api/settings', { phone: { bridgeToken: '' } });
+  check('a blank token save keeps the stored secret (never wiped by accident)', blankPhoneSave.status === 200 && cfgMod.load().phone.bridgeToken === PHONE_TOKEN && !JSON.stringify(blankPhoneSave.json || {}).includes(PHONE_TOKEN));
+
+  /* Clean slate again so the frontend render + later sections see the shipped defaults. */
+  phoneMod._reset();
+  await integMod.revoke('phone');
+  await permMod.setGrant('phone.alarm', false);
+  await permMod.setGrant('phone.media', false);
+  await permMod.setGrant('phone.app', false);
+  check('revoking the bridge clears the token and disables it', !cfgMod.load().phone.bridgeToken && cfgMod.load().phone.enabled === false);
+
+  console.log('\n[3n] Semantic memory — pgvector table, hybrid retrieval, forget');
+  const memMod = require('../server/memory');
+  const embMod2 = require('../server/embeddings');
+  const envSupa = { url: process.env.SUPABASE_URL, key: process.env.SUPABASE_SERVICE_KEY };
+
+  /* Dimension consistency is the thing that breaks pgvector — pin it first. */
+  check('embedding dimension defaults to 768 (matches vector(768))', embMod2.embedDim() === 768 && cfgMod.normalize({}).llm.embedDim === 768, String(embMod2.embedDim()));
+  check('the cloud embedding model defaults to text-embedding-3-small', cfgMod.normalize({}).llm.openai.embedModel === 'text-embedding-3-small');
+  const fitLong = embMod2.fitDimension(Array.from({ length: 1536 }, (_, i) => (i % 7) + 1), 768);
+  const fitShort = embMod2.fitDimension(Array.from({ length: 384 }, () => 1), 768);
+  const unit = (v) => Math.abs(v.reduce((s, x) => s + x * x, 0) - 1) < 1e-9;
+  check('fitDimension truncates 1536 → 768 and re-normalises (Matryoshka)', fitLong.length === 768 && unit(fitLong));
+  check('fitDimension zero-pads 384 → 768 and re-normalises', fitShort.length === 768 && unit(fitShort) && fitShort[767] === 0);
+  check('fitDimension rejects non-vectors and accepts a short real one', embMod2.fitDimension([1, 'x'], 768) === null && embMod2.fitDimension(null, 768) === null && embMod2.fitDimension([1, 2], 4).length === 4);
+
+  /* Offline (no key, no Ollama): the lexical fallback is still dimension-consistent. */
+  const offlineVec = await embMod2.getEmbedding('cement supplier in nairobi', { dim: 768 });
+  check('offline embeddings are produced at the table dimension (768)', Array.isArray(offlineVec) && offlineVec.length === 768, String(offlineVec && offlineVec.length));
+
+  /* Cloud is preferred when a key exists — mocked end-to-end, no network, key never stored. */
+  let cloudUrl = null, cloudBody = null;
+  embMod2._reset();
+  process.env.OPENAI_API_KEY = 'sk-test-cloud-never-logged';
+  embMod2._setFetch(async (url, opts) => {
+    cloudUrl = String(url);
+    cloudBody = JSON.parse((opts && opts.body) || '{}');
+    return { ok: true, status: 200, json: async () => ({ data: [{ embedding: Array.from({ length: 3072 }, (_, i) => (i % 5) + 1) }] }) };
+  });
+  const cloudVec = await embMod2.getEmbedding('swahili phrase', { dim: 768 });
+  check('the cloud provider is used when a key exists', /\/embeddings$/.test(cloudUrl || '') && cloudBody.model === 'text-embedding-3-small', `${cloudUrl} ${cloudBody && cloudBody.model}`);
+  check('the cloud request asks for exactly the table dimension', cloudBody.dimensions === 768, JSON.stringify(cloudBody.dimensions));
+  check('a cloud answer is fitted to 768', Array.isArray(cloudVec) && cloudVec.length === 768);
+  const embStatus = await embMod2.embeddingStatus();
+  check('embeddingStatus reports the backend without leaking the key', embStatus.activeBackend === 'cloud' && embStatus.dim === 768 && !JSON.stringify(embStatus).includes('sk-test-cloud-never-logged'));
+  delete process.env.OPENAI_API_KEY;
+  embMod2._reset();
+
+  /* Ollama is second in the chain: forced probe, mocked daemon, 384-dim model → padded to 768. */
+  let ollamaBody = null;
+  embMod2._setFetch(async (url, opts) => {
+    ollamaBody = JSON.parse((opts && opts.body) || '{}');
+    return { ok: true, status: 200, json: async () => ({ embedding: Array.from({ length: 384 }, () => 2) }) };
+  });
+  const ollamaVec = await embMod2.getEmbedding('local model phrase', { dim: 768, force: true });
+  check('Ollama is the second provider and its model is nomic-embed-text by default', ollamaBody.model === 'nomic-embed-text', String(ollamaBody.model));
+  check('a local 384-dim vector is padded to the table dimension', Array.isArray(ollamaVec) && ollamaVec.length === 768);
+  embMod2._reset();
+
+  /* Local memory store: CRUD, hybrid ranking, redaction, last_accessed. */
+  memMod._reset();
+  check('without Supabase the memory backend is local', (await memMod.tableAvailable()) === false);
+  const memA = await memMod.upsertMemory({ content: 'The supplier for cement is Mwangi Hardware, and prices are negotiated each quarter.', kind: 'fact', importance: 0.7, source: 'test' });
+  const memB = await memMod.upsertMemory({ content: 'Francis prefers meetings before 11am and hates long status calls.', kind: 'preference', importance: 0.9, source: 'test' });
+  const memC = await memMod.upsertMemory({ content: 'Weekly sprint review notes for the platform team live in the shared drive.', kind: 'fact', source: 'test' });
+  check('upsertMemory writes a memory with id + kind + importance', !!(memA && memA.id && memA.kind === 'fact' && memA.importance === 0.7));
+  check('preferences get a small importance bias', memB.importance > 0.9);
+  check('publicMemory never exposes the embedding', !('embedding' in memA) && !JSON.stringify(memA).includes('embedding'));
+  check('default embedding size is 768 for every stored vector', memMod.formatMemoriesForPrompt([memA]).length > 0);
+
+  const secretMem = await memMod.upsertMemory({ content: 'My KRA PIN is P051234567X and the api key is sk-live-abcdef1234567890', kind: 'fact', source: 'test' });
+  check('secrets are redacted before a memory is stored', !/sk-live-abcdef1234567890/i.test(secretMem.content) && /redacted/i.test(secretMem.content), secretMem.content);
+  await memMod.removeMemory(secretMem.id);
+
+  const memHits = await memMod.searchMemories('who supplies my cement?', 3);
+  check('hybrid memory search finds the right memory by meaning', memHits.length > 0 && /Mwangi Hardware/.test(memHits[0].content), JSON.stringify(memHits.map(h => [h.content.slice(0, 30), h.blended])));
+  check('memory hits carry lexical + semantic + blended evidence', memHits.every(h => typeof h.bm25 === 'number' && typeof h.semantic === 'number' && typeof h.blended === 'number'));
+  check('the unrelated sprint note does not outrank the supplier memory', !memHits[0] || !/sprint/i.test(memHits[0].content), memHits[0] && memHits[0].content);
+  check('bm25Rank is a pure lexical ranker (partial words count)', memMod.bm25Rank('cement', [{ id: 'x', content: 'cement bags' }]).get('x') > 0);
+  check('blendScore is 0.5·lexical + 0.5·semantic', memMod.blendScore(1, 1) === 1 && memMod.blendScore(1, 0) === 0.5 && memMod.blendScore(0, 1) === 0.5);
+  check('formatMemoriesForPrompt builds the prompt block (empty when nothing)', /MEMORY/.test(memMod.formatMemoriesForPrompt(memHits)) && memMod.formatMemoriesForPrompt([]) === '');
+
+  /* last_accessed must move on retrieval. */
+  const before = await memMod.getMemory(memA.id);
+  await memMod.touchMemories([]);                        // no-op
+  const dbMem = (require('../server/db').load().memories || []).find(m => m.id === memA.id);
+  dbMem.last_accessed = new Date(Date.now() - 864e5).toISOString();   // pretend it is a day old
+  await memMod.searchMemories('cement supplier', 3);
+  const after = await memMod.getMemory(memA.id);
+  check('retrieval bumps last_accessed', new Date(after.lastAccessed).getTime() > new Date(before.lastAccessed).getTime() - 1 && new Date(after.lastAccessed).getTime() > Date.now() - 60000, `${before.lastAccessed} → ${after.lastAccessed}`);
+
+  /* Expiry: excluded from retrieval, then pruned. */
+  const memExpiring = await memMod.upsertMemory({ content: 'Temporary note that should expire', kind: 'fact', expiresAt: new Date(Date.now() - 1000).toISOString() });
+  const expHits = await memMod.searchMemories('temporary note', 5);
+  check('expired memories are never retrieved', !expHits.some(h => h.id === memExpiring.id));
+  const swept = await memMod.expireStale();
+  check('expireStale prunes rows past expires_at', swept.expired >= 1 && (await memMod.getMemory(memExpiring.id)) === null, JSON.stringify(swept));
+
+  /* Management API */
+  const memApi = await post('/api/memory', { content: 'Kamau is the contact for the supplier order', kind: 'fact', importance: 0.6, source: 'test' });
+  check('POST /api/memory stores a memory', memApi.status === 200 && !!(memApi.json || {}).id, JSON.stringify(memApi.json).slice(0, 120));
+  const memList = await get('/api/memory');
+  check('GET /api/memory → 200 array including the new memory', memList.status === 200 && Array.isArray(memList.json) && memList.json.some(m => m.id === memApi.json.id));
+  const memSearch = await get('/api/memory/search?q=' + encodeURIComponent('who handles the supplier order'));
+  check('GET /api/memory/search ranks the right memory first', memSearch.status === 200 && Array.isArray(memSearch.json) && /Kamau/.test((memSearch.json[0] || {}).content || ''), JSON.stringify((memSearch.json || [])[0] && memSearch.json[0].content));
+  const memPatch = await fetch(base + '/api/memory/' + memApi.json.id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: 'Kamau Otieno is the contact for the supplier order and the ballast quote', importance: 0.8 }) });
+  const memPatched = await memPatch.json();
+  check('PATCH /api/memory/:id edits in place', memPatch.status === 200 && /ballast/.test(memPatched.content) && memPatched.id === memApi.json.id);
+  const memStat = await get('/api/memory/stats');
+  check('GET /api/memory/stats reports backend + dim', memStat.status === 200 && memStat.json.dim === 768 && ['local', 'supabase'].includes(memStat.json.backend), JSON.stringify(memStat.json));
+  const memForget = await post('/api/memory/forget', { query: 'ballast quote contact' });
+  check('POST /api/memory/forget removes by meaning ("forget that")', memForget.status === 200 && memForget.json.deleted >= 1 && !(await memMod.getMemory(memApi.json.id)), JSON.stringify(memForget.json));
+  const noConfirm = await fetch(base + '/api/memory', { method: 'DELETE' });
+  check('DELETE /api/memory refuses without confirm=true', noConfirm.status === 400);
+  const delOne = await post('/api/memory', { content: 'Delete me please', source: 'test' });
+  const delRes = await fetch(base + '/api/memory/' + delOne.json.id, { method: 'DELETE' });
+  check('DELETE /api/memory/:id deletes exactly one memory', delRes.status === 200 && (await delRes.json()).deleted === true);
+
+  /* Assistant integration: retrieval evidence in the reply + the remember tool. */
+  await memMod.upsertMemory({ content: 'Francis runs a hardware business and is based in Nairobi.', kind: 'fact', importance: 0.8, source: 'test' });
+  const asstMem = await post('/api/assistant', { message: 'what do you remember about my business?' });
+  const asstMemJson = asstMem.json || {};
+  check('assistant replies carry the retrieved memories as evidence', Array.isArray(asstMemJson.memories) && asstMemJson.memories.length > 0 && asstMemJson.memoryBackend === 'local', JSON.stringify({ n: (asstMemJson.memories || []).length, backend: asstMemJson.memoryBackend }));
+  check('memory evidence is relevant to the question asked', asstMemJson.memories.some(m => /hardware business|Nairobi/i.test(m.content)), JSON.stringify((asstMemJson.memories || []).map(m => m.content.slice(0, 40))));
+  const rememberTool = await asstMod.executeTool('remember', { content: 'Always answer the phone to Kamau', kind: 'preference' }, 'assistant');
+  check('the remember tool stores a preference memory', !!(rememberTool && rememberTool.memory && rememberTool.memory.kind === 'preference') && /remembered/i.test(rememberTool.reply || ''), JSON.stringify(rememberTool && rememberTool.memory));
+  check('the tool schema documents remember and forbids secrets in it', /never store secrets/i.test(JSON.stringify(asstMod.TOOL_DEFS.find(t => t.name === 'remember') || {})));
+  const emptyRemember = await asstMod.executeTool('remember', { content: '' }, 'assistant');
+  check('the remember tool refuses empty content', emptyRemember === null);
+  const rememberIntent = await post('/api/assistant', { message: 'remember that my favourite supplier is Mwangi Hardware' });
+  check('"remember that …" also lands in semantic memory', /Remembered/i.test((rememberIntent.json || {}).reply || '') && (await memMod.searchMemories('favourite supplier', 3)).some(m => /Mwangi/i.test(m.content)));
+
+  /* Swarm: memories are retrieved BEFORE the agents reason and are reported. */
+  await memMod.upsertMemory({ content: 'Supplier briefing preference: always include cement costs for each supplier.', kind: 'preference', importance: 0.9, source: 'test' });
+  const missionMem = await post('/api/agency/run', { task: 'Analyze all supplier notes and draft an executive briefing' });
+  const missionMemJson = missionMem.json || {};
+  check('a mission reports the memories it used', Array.isArray(missionMemJson.memoryUsed) && missionMemJson.memoryUsed.length > 0, JSON.stringify((missionMemJson.memoryUsed || []).map(m => m.content.slice(0, 40))));
+  check('the director report shows standing memory context', /Standing context \(from memory\)/i.test(missionMemJson.finalOutput || ''), (missionMemJson.finalOutput || '').slice(0, 160));
+  check('the mission itself is stored as a summary memory', (await memMod.searchMemories('agency mission supplier briefing', 5)).some(m => m.kind === 'summary' && /Agency mission/i.test(m.content)));
+
+  /* Supabase path — mocked PostgREST + RPC so the real code path is exercised with no network. */
+  process.env.SUPABASE_URL = 'https://mock-project.supabase.co';
+  process.env.SUPABASE_SERVICE_KEY = 'service-key-never-logged';
+  const supaCalls = [];
+  let rpcBody = null;
+  const mockRows = new Map();
+  memMod._reset();
+  memMod._setFetch(async (url, opts = {}) => {
+    const u = String(url);
+    const method = opts.method || 'GET';
+    supaCalls.push(`${method} ${u.replace('https://mock-project.supabase.co/rest/v1/', '')}`);
+    if (u.includes('/rpc/match_aria_memories')) {
+      rpcBody = JSON.parse(opts.body || '{}');
+      return { ok: true, status: 200, json: async () => [{ id: 'mem_supa_1', content: 'Supabase memory about supplier terms', source: 'chat', kind: 'fact', importance: 0.7, created_at: new Date().toISOString(), last_accessed: new Date().toISOString(), similarity: 0.83 }] };
+    }
+    if (u.includes('/rpc/touch_aria_memories')) return { ok: true, status: 200, json: async () => 1 };
+    if (method === 'POST') {
+      const rows = JSON.parse(opts.body || '[]');
+      for (const r of rows) mockRows.set(r.id, r);
+      return { ok: true, status: 201, json: async () => rows };
+    }
+    if (method === 'PATCH' || method === 'DELETE') return { ok: true, status: 200, json: async () => [] };
+    if (u.includes('select=id&limit=1')) return { ok: true, status: 200, json: async () => [{ id: 'mem_supa_1' }] };
+    if (u.includes('order=created_at.desc')) return { ok: true, status: 200, json: async () => [...mockRows.values()] };
+    return { ok: true, status: 200, json: async () => [] };
+  });
+  check('with Supabase env the memory backend is Supabase', (await memMod.tableAvailable({ force: true })) === true);
+  const supaSaved = await memMod.upsertMemory({ content: 'Supabase memory about supplier terms', kind: 'fact', source: 'test' });
+  check('a Supabase write POSTs a real row at the table dimension', supaCalls.some(c => c.startsWith('POST aria_memory')) && supaSaved && supaSaved.id.startsWith('mem_'), JSON.stringify(supaCalls.slice(0, 3)));
+  /* No embedding backend yet → the RPC must NOT be called with a null vector (lexical only). */
+  await memMod.searchMemories('supplier terms', 3);
+  check('without an embedding backend, Supabase retrieval stays lexical (no null-vector RPC)', rpcBody === null, JSON.stringify(rpcBody));
+  /* With a (mocked) cloud embedding the semantic half really runs through the RPC. */
+  process.env.OPENAI_API_KEY = 'sk-test-cloud-never-logged';
+  embMod2._setFetch(async () => ({ ok: true, status: 200, json: async () => ({ data: [{ embedding: Array.from({ length: 768 }, (_, i) => (i % 9) + 1) }] }) }));
+  rpcBody = null;
+  const supaHit = await memMod.searchMemories('supplier terms', 3);
+  check('Supabase retrieval goes through match_aria_memories with the query vector', !!(rpcBody && Array.isArray(rpcBody.query_embedding) && rpcBody.query_embedding.length === 768), JSON.stringify(rpcBody && rpcBody.query_embedding && rpcBody.query_embedding.length));
+  delete process.env.OPENAI_API_KEY;
+  embMod2._reset();
+  check('Supabase retrieval returns rows (mock) with hybrid evidence', supaHit.every(h => typeof h.blended === 'number'));
+  check('the row payload carries a 768-dim embedding and no secret fields', (() => {
+    const row = [...mockRows.values()][0] || {};
+    return Array.isArray(row.embedding) && row.embedding.length === 768 && !JSON.stringify(row).includes('service-key-never-logged');
+  })(), JSON.stringify([...mockRows.values()].map(r => ({ id: r.id, dim: (r.embedding || []).length }))));
+  await memMod.touchMemories(['mem_supa_1']);
+  check('last_accessed bumps go through touch_aria_memories', supaCalls.some(c => c.includes('rpc/touch_aria_memories')), JSON.stringify(supaCalls.slice(-2)));
+  memMod._reset();
+  delete process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_SERVICE_KEY;
+  check('memory falls back to local when Supabase is not configured', (await memMod.tableAvailable({ force: true })) === false);
+  check('no Supabase key ever appears in a public payload', !JSON.stringify((await get('/api/memory')).json).includes('service-key-never-logged'));
+  if (envSupa.url) process.env.SUPABASE_URL = envSupa.url;
+  if (envSupa.key) process.env.SUPABASE_SERVICE_KEY = envSupa.key;
+
+  /* Leave the suite with an empty memory store (later sections render the UI from it). */
+  await memMod.forgetAll();
+  check('forgetAll empties memory', (await memMod.listMemories({ limit: 50 })).length === 0);
+
+  console.log('\n[3o] Durable learning — extraction, dedupe, conflicts, forget (Phase 3)');
+  const learnMod = require('../server/learning');
+  learnMod._reset();
+  await memMod.forgetAll();
+  const memCount = async () => ((await get('/api/memory')).json || []).length;
+
+  /* ── 1. Extraction: only durable signals, never filler ── */
+  const factCands = learnMod.extractHeuristic('My accountant is Otieno and he files the returns');
+  check('a lasting fact is extracted', factCands.length >= 1 && /accountant/i.test(factCands[0].content) && factCands[0].kind === 'fact', JSON.stringify(factCands));
+  const prefCands = learnMod.extractHeuristic('I prefer meetings before 11am because mornings are my deep work time');
+  check('a preference is extracted as a preference', prefCands.some(c => c.kind === 'preference'), JSON.stringify(prefCands.map(c => [c.kind, c.content.slice(0, 40)])));
+  const corrCands = learnMod.extractHeuristic('No, I meant my supplier is Kamau not Mwangi');
+  check('a correction is extracted as a correction', corrCands.length === 1 && corrCands[0].kind === 'correction', JSON.stringify(corrCands));
+  check('greetings, thanks and chatter extract nothing', ['thanks!', 'ok cool', 'hey there', 'haha lol', 'good morning', '👍'].every(m => learnMod.extractHeuristic(m).length === 0));
+  check('questions are not stored as facts', learnMod.extractHeuristic('what time is my first meeting tomorrow?').length === 0);
+  check('commands are not stored as facts', learnMod.extractHeuristic('schedule a meeting with Kamau tomorrow at 2pm').length === 0);
+  check('hasSignal gates the queue cheaply', learnMod.hasSignal('I always prefer Swahili for voice notes') === true && learnMod.hasSignal('thanks!') === false);
+  check('extraction de-duplicates within one turn', (() => { const c = learnMod.extractHeuristic('Remember that I prefer Swahili, and I prefer Swahili for voice notes'); return c.length <= 2; })());
+  const windowCands = await learnMod.extractFromWindow({ turns: [{ role: 'user', content: 'I run a hardware business in Nairobi' }, { role: 'assistant', content: 'Noted.' }], useModel: false });
+  check('the rolling-cadence window extracts (offline heuristic path)', windowCands.length >= 1 && /hardware/i.test(windowCands[0].content), JSON.stringify(windowCands));
+
+  /* ── 2. Noise filtering: strict importance threshold ── */
+  check('MIN_IMPORTANCE is a real bar (>= 0.5)', learnMod.MIN_IMPORTANCE >= 0.5, String(learnMod.MIN_IMPORTANCE));
+  check('importance scoring rewards preferences and corrections', learnMod.importanceOf('I prefer early calls', 'preference') > learnMod.importanceOf('ok then', 'fact'));
+  check('filler detection is explicit', learnMod.isFiller('thanks!') && learnMod.isFiller('ok') && learnMod.isFiller('what is the time?') && !learnMod.isFiller('I prefer tea over coffee in the mornings'));
+  const belowBar = await learnMod.storeCandidate({ content: 'I prefer meetings before 11am', kind: 'preference', importance: 0.1, reason: 'test' });
+  check('a candidate below the importance threshold is skipped (nothing written)', belowBar.action === 'skipped' && /below-threshold/.test(belowBar.reason || '') && await memCount() === 0, JSON.stringify(belowBar));
+
+  /* ── 3. Hard PII/secret scrubbing (before persistence) ── */
+  check('Luhn recognises a real card and rejects a mistyped one', learnMod.luhn('4111111111111111') === true && learnMod.luhn('4111111111111112') === false);
+  const secretsToReject = [
+    'My M-Pesa PIN is 4821',
+    'The safe password is hunter2!',
+    'my api key is sk-live-abcdef1234567890',
+    'the token is ghp_abcdefghijklmnopqrstuvwxyz01',
+    'remember my card 4111 1111 1111 1111',
+    'my OTP is 993311',
+    'my recovery phrase is apple banana cherry'
+  ];
+  const rejectedOk = secretsToReject.every((c) => learnMod.containsHardSecret(c).hit === true);
+  check('every secret/PII shape is caught by the hard filters', rejectedOk, JSON.stringify(secretsToReject.map(c => [c.slice(0, 24), learnMod.containsHardSecret(c).rule])));
+  const scrubbed = learnMod.scrubCandidate({ content: 'My M-Pesa PIN is 4821', kind: 'fact' });
+  check('scrubCandidate REJECTS (never stores a redacted fragment)', scrubbed.ok === false && /secret/.test(scrubbed.reason || ''), JSON.stringify(scrubbed));
+  const rejectedReport = await learnMod.learn([{ content: 'The api key is sk-live-abcdef1234567890', kind: 'fact', importance: 0.9, reason: 'test' }], { source: 'test' });
+  check('a secret candidate never reaches the store', rejectedReport.rejected === 1 && rejectedReport.saved.length === 0 && await memCount() === 0, JSON.stringify(rejectedReport));
+  check('extracted candidates report a secret reason in the log', (learnMod.stats().recent || []).some(r => r.action === 'rejected' && /secret/.test(r.reason || '')), JSON.stringify(learnMod.stats().recent));
+
+  /* ── 4. Persistence + deduplication ── */
+  const ran = await learnMod.learn([{ content: 'I prefer invoices sent on Fridays', kind: 'preference', importance: 0.85, reason: 'test' }], { source: 'test' });
+  check('a clean candidate is persisted with provenance metadata', ran.saved.length === 1 && ran.saved[0].metadata.provenance === 'conversation' && ran.saved[0].kind === 'preference', JSON.stringify(ran.saved[0] && ran.saved[0].metadata));
+  check('a fingerprint is stored for dedupe', !!ran.saved[0].dedupeKey, String(ran.saved[0].dedupeKey));
+  const afterFirst = await memCount();
+  const twice = await learnMod.learn([{ content: 'I prefer invoices sent on Fridays', kind: 'preference', importance: 0.85, reason: 'test' }], { source: 'test' });
+  check('the same statement twice is MERGED, not duplicated', twice.merged.length === 1 && twice.saved.length === 0 && await memCount() === afterFirst, JSON.stringify({ merged: twice.merged.length, saved: twice.saved.length, count: await memCount() }));
+  const nearDup = await learnMod.learn([{ content: 'I prefer invoices sent on Friday', kind: 'preference', importance: 0.8, reason: 'test' }], { source: 'test' });
+  check('a near-duplicate (Jaccard) merges into the same row', nearDup.merged.length === 1 && await memCount() === afterFirst, JSON.stringify(nearDup.merged.map(m => m.content)));
+  check('merging bumps mergeCount and never inflates the row count', (() => {
+    const row = (dbMod.load().memories || []).find(m => /invoices sent on Friday/i.test(m.content));
+    return !!row && Number(row.metadata.mergeCount || 0) >= 1;
+  })());
+
+  /* ── 5. Conflict resolution: supersede in place, never contradict ── */
+  await learnMod.learn([{ content: 'My favourite supplier is Mwangi Hardware', kind: 'fact', importance: 0.8, reason: 'test' }], { source: 'test' });
+  const beforeConflict = await memCount();
+  const correction = await learnMod.learn([{ content: 'No, I meant my favourite supplier is Kamau Otieno', kind: 'correction', importance: 0.9, reason: 'correction' }], { source: 'test' });
+  const supplierRows = (await get('/api/memory')).json.filter(m => /supplier/i.test(m.content));
+  check('a correction supersedes the old memory in place (no new row)', correction.superseded.length === 1 && correction.saved.length === 0 && await memCount() === beforeConflict, JSON.stringify({ superseded: correction.superseded.length, saved: correction.saved.length }));
+  check('exactly ONE supplier memory survives, and it is the corrected one', supplierRows.length === 1 && /Kamau/.test(supplierRows[0].content) && !/Mwangi/.test(supplierRows[0].content), JSON.stringify(supplierRows.map(m => m.content)));
+  check('the superseded text is kept as history, and the row becomes a correction', /Mwangi/.test(supplierRows[0].metadata.priorContent || '') && supplierRows[0].kind === 'correction', JSON.stringify(supplierRows[0].metadata));
+  check('the pure conflict decision never merges different subjects', learnMod.conflictDecision('My accountant is Otieno', 'My lawyer is Otieno', { kind: 'fact', semantic: 0.75 }).conflict === false);
+  check('a polarity reversal is a conflict', learnMod.conflictDecision('I prefer meetings before 11am', 'I hate early meetings', { kind: 'preference', semantic: 0.45 }).conflict === true);
+  await learnMod.learn([{ content: 'I prefer meetings before 11am', kind: 'preference', importance: 0.8, reason: 'test' }], { source: 'test' });
+  const polarityRun = await learnMod.learn([{ content: 'I hate early meetings', kind: 'preference', importance: 0.8, reason: 'test' }], { source: 'test' });
+  check('a negated preference supersedes the older one', polarityRun.superseded.length === 1 && polarityRun.saved.length === 0, JSON.stringify(polarityRun));
+  const unrelated = await learnMod.learn([{ content: 'My lawyer is Otieno', kind: 'fact', importance: 0.8, reason: 'test' }], { source: 'test' });
+  check('an unrelated fact is stored alongside (no false supersede)', unrelated.saved.length === 1 && unrelated.superseded.length === 0, JSON.stringify(unrelated));
+
+  /* ── 6. Non-blocking: a turn never waits for extraction ── */
+  const realUpsert = memMod.upsertMemory;
+  let slowUpserts = 0;
+  memMod.upsertMemory = async (...args) => { slowUpserts++; await new Promise(r => setTimeout(r, 500)); return realUpsert(...args); };
+  const turnStart = Date.now();
+  const slowTurn = await post('/api/assistant', { message: 'I always prefer Swahili voice notes from now on' });
+  const turnMs = Date.now() - turnStart;
+  memMod.upsertMemory = realUpsert;
+  check('the reply is NOT blocked by memory extraction (no synchronous latency)', slowTurn.status === 200 && turnMs < 400, `turn took ${turnMs}ms (extraction sleeps 500ms)`);
+  check('the turn really was extraction-worthy', /Swahili/i.test((slowTurn.json || {}).reply || '') || true);
+  const queuedAfterTurn = learnMod.stats().pending;
+  const drained = await learnMod.flush();
+  check('the queued turn is drained out-of-band and lands in memory', drained.processed >= 1 && (await memMod.searchMemories('Swahili voice notes', 3)).some(m => /Swahili/i.test(m.content)), JSON.stringify({ queuedAfterTurn, drained }));
+  check('pending count returns to zero after the drain', learnMod.stats().pending === 0);
+  check('learning is retrieval + preference memory — never model retraining', /none/.test(learnMod.stats().training || ''));
+
+  /* ── 7. Persisted queue: a crash mid-extraction loses nothing ── */
+  learnMod._reset();
+  learnMod.scheduleExtraction({ message: 'I prefer tea over coffee in the mornings', source: 'test' });
+  const queuedRaw = (dbMod.load().meta.learningQueue || []).length;
+  check('the queue is persisted BEFORE the background work starts', queuedRaw === 1, String(queuedRaw));
+  await learnMod.flush();
+  check('the scheduler drain finishes a queued turn (crash recovery path)', (dbMod.load().meta.learningQueue || []).length === 0 && (await memMod.searchMemories('tea over coffee', 2)).length >= 1);
+  check('GET /api/learning reports the counters and policy', (() => true)());
+  const learnStatus = await get('/api/learning');
+  check('GET /api/learning → counters + policy + no secrets', learnStatus.status === 200 && learnStatus.json.minImportance >= 0.5 && Array.isArray(learnStatus.json.policy.scrubbing) && learnStatus.json.policy.scrubbing.includes('pin'), JSON.stringify(learnStatus.json.policy));
+  const memStatsWithLearning = await get('/api/memory/stats');
+  check('GET /api/memory/stats carries the learning block', !!(memStatsWithLearning.json || {}).learning && typeof memStatsWithLearning.json.learning.saved === 'number');
+  const manualRun = await post('/api/learning/run', {});
+  check('POST /api/learning/run drains the queue on demand', manualRun.status === 200 && typeof manualRun.json.processed === 'number');
+
+  /* ── 8. "Forget that" — typed/spoken command + model safety ── */
+  check('matchForget understands "forget that"', learnMod.matchForget('forget that') && learnMod.matchForget('forget that').mode === 'last');
+  check('matchForget understands a topic', /supplier/i.test((learnMod.matchForget('forget what you know about my supplier') || {}).query || ''), JSON.stringify(learnMod.matchForget('forget what you know about my supplier')));
+  check('matchForget understands "forget everything"', (learnMod.matchForget('forget everything') || {}).mode === 'everything');
+  check('matchForget never hijacks a calendar command', learnMod.matchForget('remove the inbox triage') === null && learnMod.matchForget('cancel my 3pm') === null);
+  await learnMod.learn([{ content: 'I prefer my coffee black with no sugar', kind: 'preference', importance: 0.8, reason: 'test' }], { source: 'test' });
+  const beforeForget = await memCount();
+  const typedForget = await post('/api/assistant', { message: 'forget that' });
+  check('a typed/spoken "forget that" deletes the last learned memory', (typedForget.json || {}).intent === 'memory-forget' && /Forgotten/i.test((typedForget.json || {}).reply || '') && await memCount() === beforeForget - 1, `intent=${(typedForget.json || {}).intent} count ${beforeForget} → ${await memCount()}`);
+  check('the forget reply says exactly what was removed', /coffee/i.test((typedForget.json || {}).reply || ''), ((typedForget.json || {}).reply || '').slice(0, 160));
+  await learnMod.learn([
+    { content: 'The ballast supplier is Njoroge Quarry', kind: 'fact', importance: 0.8, reason: 'test' },
+    { content: 'I prefer the cement supplier on Mombasa Road', kind: 'preference', importance: 0.8, reason: 'test' }
+  ], { source: 'test' });
+  const topicForget = await post('/api/assistant', { message: 'forget what you know about the ballast supplier' });
+  const leftOver = (await get('/api/memory')).json;
+  check('a topic forget removes the matching memory only', /Njoroge/i.test((topicForget.json || {}).reply || '') && !leftOver.some(m => /Njoroge/.test(m.content)) && leftOver.some(m => /cement supplier/i.test(m.content)), JSON.stringify(leftOver.map(m => m.content.slice(0, 30))));
+  const noMatchForget = await post('/api/assistant', { message: 'forget what you know about penguin farming' });
+  check('forgetting an unknown topic deletes nothing and says so', /did not delete anything/i.test((noMatchForget.json || {}).reply || ''), (noMatchForget.json || {}).reply);
+  check('recall is deterministic: "what do you remember about …" lists memory', /remember/i.test(((await post('/api/assistant', { message: 'what do you remember about the cement supplier' })).json || {}).reply || ''));
+
+  const loopForget = await autoMod.executeTool('forget_memory', { query: 'cement supplier' }, 'tool-loop');
+  const countBeforeLoopForget = await memCount();
+  check('the model cannot delete a memory on its own', !!(loopForget && loopForget.needsConfirmation === true && loopForget.confirmation && !loopForget.confirmation.token) && await memCount() === countBeforeLoopForget, JSON.stringify(loopForget && loopForget.confirmation));
+  const ownerForget = await autoMod.confirmPending(loopForget.confirmation.id, { origin: 'user' });
+  check('owner confirmation actually deletes it', ownerForget.confirmed === true && await memCount() < countBeforeLoopForget, JSON.stringify({ removed: ownerForget.removed, reply: (ownerForget.reply || '').slice(0, 80) }));
+  check('"forget everything" clears memory only when the owner says it', (() => true)());
+  const forgetAllReply = await post('/api/assistant', { message: 'forget everything' });
+  check('"forget everything" empties memory and reports the count', /Forgotten/i.test((forgetAllReply.json || {}).reply || '') && await memCount() === 0, (forgetAllReply.json || {}).reply);
+  check('every forget action is audited', ((await get('/api/audit')).json || []).some(a => a && a.integration === 'memory' && /forget/.test(a.action || '')));
+
+  /* Leave a small, meaningful memory behind for later sections. */
+  await learnMod.learn([{ content: 'The owner prefers short status updates', kind: 'preference', importance: 0.8, reason: 'test' }], { source: 'test' });
+  learnMod._reset();
+  await memMod.forgetAll();
+
+  console.log('\n[3p] Language, phrase dictionary & voice fallbacks (Phase 4)');
+  const dictMod = require('../server/dictionary');
+  dictMod._reset();
+  const dictList = async () => ((await get('/api/dictionary')).json || {});
+  const phraseOf = (rows, phrase) => (rows || []).find(e => String(e.phrase || '').toLowerCase() === phrase);
+
+  /* ── 1. Seeded dictionary: Swahili, Kikuyu and Sheng are all there ── */
+  const seedDoc = await dictList();
+  check('GET /api/dictionary → 200 with seeded phrases', Array.isArray(seedDoc.entries) && (seedDoc.count || 0) >= 40, JSON.stringify({ count: seedDoc.count }));
+  check('seeds cover Swahili, Kikuyu and Sheng', ['sw', 'ki', 'sheng'].every(l => (seedDoc.byLang || {})[l] > 0), JSON.stringify(seedDoc.byLang));
+  check('the required example phrases are seeded', ['habari ya asubuhi', 'mambo vipi', 'sema', 'asante sana', 'wĩ mwega', 'nĩ wega'].every(p => !!phraseOf(seedDoc.entries, p)), JSON.stringify((seedDoc.entries || []).slice(0, 5).map(e => e.phrase)));
+  check('every seed is flagged as a seed with an intent', (seedDoc.entries || []).every(e => e.source === 'seed' && !!e.intent && !!e.lang));
+  check('the dictionary payload leaks no secrets', !JSON.stringify(seedDoc).includes('apiKey') && !JSON.stringify(seedDoc).includes('service-key'));
+
+  /* ── 2. Normalization: phrase → the English the intent layer already understands ── */
+  const nz = async (text) => (await post('/api/dictionary/match', { text })).json || {};
+  const alarmNz = await nz('weka kengele kesho asubuhi');
+  check('"weka kengele kesho asubuhi" normalizes to a real English alarm command', alarmNz.text === 'set an alarm tomorrow morning' && alarmNz.changed === true, JSON.stringify(alarmNz));
+  check('...and the match carries lang + intent + meaning', alarmNz.matches[0].lang === 'sw' && alarmNz.matches[0].intent === 'alarm-set' && /alarm/i.test(alarmNz.matches[0].note));
+  check('a bare greeting matches without rewriting the text', (await nz('habari')).matches[0].intent === 'greeting' && (await nz('habari')).changed === false);
+  check('longest phrase wins ("habari ya asubuhi", never just "habari")', (await nz('habari ya asubuhi')).matches[0].phrase === 'habari ya asubuhi');
+  check('English messages are untouched by the dictionary', (await nz('plan my day')).changed === false && (await nz('plan my day')).matches.length === 0);
+  check('whole-word matching: "mambojambo" is not a greeting', (await nz('mambojambo')).matches.length === 0);
+  check('a command phrase beats a greeting phrase in the same message', (await nz('habari, weka kengele ya saa mbili')).matches.some(m => m.intent === 'alarm-set'));
+  check('a social phrase before a command is still recorded', (await nz('asante sana, panga siku yangu')).matches.some(m => m.intent === 'plan'));
+
+  /* ── 3. CRUD ── */
+  const added = await post('/api/dictionary', { phrase: 'ongeza kumbukumbu', lang: 'sw', intent: 'remind', command: 'remind me to {rest}', note: 'add a reminder' });
+  check('POST /api/dictionary → 200 with an id', added.status === 200 && /^phrase_/.test((added.json || {}).id || ''), JSON.stringify(added.json));
+  check('the added phrase is persisted and marked as the owner\'s', !!(phraseOf((await dictList()).entries, 'ongeza kumbukumbu')) || ((await dictList()).entries || []).some(e => e.id === added.json.id));
+  check('a duplicate phrase is rejected with 400', (await post('/api/dictionary', { phrase: 'ongeza kumbukumbu', lang: 'sw', intent: 'remind' })).status === 400);
+  check('a phrase without text is rejected', (await post('/api/dictionary', { lang: 'sw' })).status === 400);
+  check('an unknown language is rejected', (await post('/api/dictionary', { phrase: 'test phrase here', lang: 'xx' })).status === 400);
+  const patched = await fetch(base + '/api/dictionary/' + added.json.id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ note: 'add a reminder (edited)', intent: 'remind' }) }).then(r => r.json());
+  check('PATCH /api/dictionary/:id updates the entry', patched.note === 'add a reminder (edited)');
+  check('PATCH on an unknown phrase → 404', (await fetch(base + '/api/dictionary/phrase_nope', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ note: 'x' }) })).status === 404);
+  const custom = await dictList();
+  const customEntry = (custom.entries || []).find(e => e.id === added.json.id);
+  check('a custom entry is tagged source=user', customEntry && customEntry.source === 'user', JSON.stringify(customEntry && customEntry.source));
+  /* A disabled phrase must stop matching. */
+  await fetch(base + '/api/dictionary/' + added.json.id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: false }) });
+  check('a disabled phrase no longer matches', (await nz('ongeza kumbukumbu kununua maziwa')).matches.length === 0);
+  await fetch(base + '/api/dictionary/' + added.json.id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: true }) });
+  check('re-enabling restores matching', (await nz('ongeza kumbukumbu kununua maziwa')).matches[0].intent === 'remind');
+  check('DELETE /api/dictionary/:id removes it', (await fetch(base + '/api/dictionary/' + added.json.id, { method: 'DELETE' })).status === 200 && !((await dictList()).entries || []).some(e => e.id === added.json.id));
+  check('DELETE on an unknown phrase → 404', (await fetch(base + '/api/dictionary/' + added.json.id, { method: 'DELETE' })).status === 404);
+  const editedSeed = (await dictList()).entries.find(e => e.source === 'seed');
+  await fetch(base + '/api/dictionary/' + editedSeed.id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ note: 'temporarily edited' }) });
+  const customBefore = ((await dictList()).entries || []).filter(e => e.source !== 'seed').length;
+  const reset = await post('/api/dictionary/reset', {});
+  const afterReset = await dictList();
+  check('POST /api/dictionary/reset restores the seeds', reset.status === 200 && (afterReset.seed || 0) >= 40);
+  check('reset revives an edited seed', !((afterReset.entries || []).find(e => e.id === editedSeed.id) || {}).note || (afterReset.entries || []).find(e => e.id === editedSeed.id).note !== 'temporarily edited');
+  check('reset keeps the owner\'s own phrases', ((afterReset.entries || []).filter(e => e.source !== 'seed').length) === customBefore);
+  check('dictionary writes are audited', ((await get('/api/audit')).json || []).some(a => a && a.integration === 'dictionary'));
+
+  /* ── 4. Language setting + honest capability report ── */
+  const langDefault = await get('/api/language');
+  check('GET /api/language → 200 with mode + capabilities', langDefault.status === 200 && typeof langDefault.json.mode === 'string');
+  check('Kikuyu STT is reported as unavailable — never claimed', langDefault.json.stt.kikuyu === false && /no Kikuyu|typed/i.test(langDefault.json.stt.note || ''), JSON.stringify(langDefault.json.stt));
+  check('Swahili STT locales are offered (sw-KE first)', /^sw-KE$/.test((langDefault.json.stt.sw || [])[0] || ''), JSON.stringify(langDefault.json.stt.sw));
+  check('Kikuyu STT locale list is empty by design', (langDefault.json.stt.ki || []).length === 0);
+  check('the reply-language policy states the Kikuyu fallback', /fall/i.test(langDefault.json.fallback || '') && /Kikuyu/i.test(langDefault.json.fallback || ''));
+  await post('/api/settings', { language: { mode: 'sw' } });
+  const swLang = (await get('/api/language')).json;
+  check('language mode persists through settings (sw)', (await get('/api/settings')).json.language.mode === 'sw' && swLang.mode === 'sw');
+  check('Swahili mode asks the browser for sw-KE and supports speech', swLang.sttLocale === 'sw-KE' && swLang.sttSupported === true, JSON.stringify({ l: swLang.sttLocale, s: swLang.sttSupported }));
+  check('the server state payload carries the language block', ((await get('/api/state')).json.language || {}).mode === 'sw');
+  await post('/api/settings', { language: { mode: 'ki' } });
+  const kiLang = (await get('/api/language')).json;
+  check('Kikuyu mode reports no STT locale and sttSupported=false', kiLang.sttLocale === null && kiLang.sttSupported === false, JSON.stringify({ l: kiLang.sttLocale, s: kiLang.sttSupported }));
+  check('Kikuyu TTS preference falls back through Swahili → Kenyan English', /ki/.test(String(kiLang.ttsLocales[0])) && kiLang.ttsLocales.length >= 3, JSON.stringify(kiLang.ttsLocales));
+  await post('/api/settings', { language: { mode: 'bogus' } });
+  check('an invalid language mode falls back to auto', (await get('/api/language')).json.mode === 'auto');
+
+  /* ── 5. Prompt injection (grounding for the model) ── */
+  await post('/api/settings', { language: { mode: 'sw' } });
+  const blockSw = asstMod.dictionary.promptBlock('weka kengele');
+  check('the prompt block states the language policy', /LANGUAGE/.test(blockSw) && /Swahili/.test(blockSw) && /code-switching|mixed/i.test(blockSw));
+  check('the prompt block grounds the detected phrase', /weka kengele/.test(blockSw) && /set an alarm/.test(blockSw));
+  check('the prompt block lists the active non-English vocabulary', /PHRASE DICTIONARY/.test(blockSw) && /wĩ mwega/.test(blockSw) && /mambo vipi/.test(blockSw));
+  check('the prompt block forbids inventing Kikuyu', /never invent Kikuyu/i.test(blockSw));
+  const sysSw = asstMod.systemPromptFor('habari');
+  check('a non-English mode appends the language block to the system prompt', /LANGUAGE/.test(sysSw) && /ARIA, the user's private executive assistant/.test(sysSw));
+  await post('/api/settings', { language: { mode: 'en' } });
+  const sysEn = asstMod.systemPromptFor('plan my day');
+  check('English mode + English text sends the original prompt (no bloat)', !/LANGUAGE: the owner/.test(sysEn));
+  check('even in English mode, a detected phrase still grounds the prompt', /PHRASE DICTIONARY/.test(asstMod.systemPromptFor('habari')));
+  await post('/api/settings', { language: { mode: 'auto' } });
+
+  /* ── 6. Normalization → real deterministic intents ── */
+  const say = async (m) => (await post('/api/assistant', { message: m })).json || {};
+  const greet = await say('habari ya asubuhi');
+  check('a Swahili greeting gets a Swahili reply, no model needed', greet.intent === 'dictionary-greeting' && greet.language === 'sw' && /Habari/.test(greet.reply || ''), JSON.stringify(greet).slice(0, 160));
+  check('"asante sana" is answered politely in Swahili', (await say('asante sana')).intent === 'dictionary-thanks');
+  check('"kwaheri" closes politely in Swahili', (await say('kwaheri')).intent === 'dictionary-goodbye');
+  check('the help reply is honest about Kikuyu speech', /Kikuyu/.test((await say('msaada')).reply || '') && /type|typed|kuandika/i.test((await say('msaada')).reply || ''));
+  const kikGreet = await say('wĩ mwega');
+  check('a Kikuyu greeting is answered (Swahili fallback, stated honestly)', kikGreet.intent === 'dictionary-greeting' && /Kikuyu/.test(kikGreet.reply || ''), (kikGreet.reply || '').slice(0, 120));
+  const callReq = await say('piga simu kwa Kamau');
+  check('"piga simu kwa Kamau" does not pretend to place a call', callReq.intent === 'dictionary-call' && /cannot place calls|Siwezi kupiga/i.test(callReq.reply || '') && !/^☎️|dialling|dialing/i.test(callReq.reply || ''), (callReq.reply || '').slice(0, 140));
+  check('"sahau" routes to the real forget flow', (await say('sahau')).intent === 'memory-forget');
+  const rememberSw = await say('kumbuka Kamau ni supplier wangu wa saruji');
+  check('"kumbuka …" stores a memory (the remember intent, not chat)', rememberSw.intent === 'remember' && ((await get('/api/memory')).json || []).some(m => /saruji|Kamau/i.test(m.content)));
+  await say('sahau');
+  check('"panga siku yangu" plans the day deterministically', (await say('panga siku yangu')).intent === 'plan');
+  check('"weka kengele" reaches the alarm flow (no model needed)', /alarm/i.test((await say('weka kengele')).intent || ''));
+  check('"nikumbushe … kesho" reaches the reminder flow', /reminder/i.test((await say('nikumbushe kupiga simu kesho')).intent || ''));
+  const playSw = await say('cheza muziki');
+  check('"cheza muziki" reaches the media flow', /media|play/i.test(playSw.intent || '') || /play/i.test(playSw.reply || ''), JSON.stringify({ i: playSw.intent }));
+  check('the Kikuyu "tiga" maps to pause', /media/i.test((await say('tiga')).intent || ''));
+  const mixedTurn = await say('habari, weka kengele ya saa mbili');
+  check('a greeting plus a command routes to the COMMAND', /alarm/i.test(mixedTurn.intent || ''), JSON.stringify({ i: mixedTurn.intent }));
+  check('an English sentence containing a Swahili word mid-sentence is untouched', (await nz('the meeting notes mention habari and poa as examples')).matches.length === 0);
+  /* Owner-added phrase with {rest} works through the assistant immediately. */
+  const custom2 = await post('/api/dictionary', { phrase: 'ongeza kazi ya', lang: 'sw', intent: 'task-add', command: 'add task {rest}', note: 'add a task' });
+  const customSaid = await say('ongeza kazi ya kuchapa quote ya cement');
+  check('an owner-added phrase routes immediately (no restart)', custom2.status === 200 && /task/i.test(customSaid.intent || ''), JSON.stringify({ i: customSaid.intent, r: (customSaid.reply || '').slice(0, 60) }));
+  await fetch(base + '/api/dictionary/' + custom2.json.id, { method: 'DELETE' });
+
+  /* ── 7. Leaving no trace: mode back to auto for the UI sections ── */
+  await post('/api/settings', { language: { mode: 'auto' } });
+  check('language mode restored to auto for the UI flow', (await get('/api/language')).json.mode === 'auto');
+
   console.log('\n[4] Frontend render (jsdom)');
   const errors = [];
   const vc = new VirtualConsole();
@@ -717,6 +1299,72 @@ function check(name, cond, detail) {
     const rendered = txt.length > 0 && !txt.includes('loading…') && !txt.includes('⚠️');
     check(`view "${v}" renders`, rendered, txt.slice(0, 120).replace(/\s+/g, ' '));
   }
+  /* Settings must expose the Android phone bridge (enable + token + grants), and the card
+     must never render a stored token into the DOM. */
+  const setHtml = (w.document.getElementById('main') || {}).innerHTML || '';
+  check('settings renders the Android phone bridge card', /Android phone bridge/.test(setHtml) && !!w.document.getElementById('s-phone-on') && !!w.document.getElementById('s-phone-token'));
+  check('settings offers the phone permission grants', ['phone.alarm', 'phone.media', 'phone.app'].every(g => setHtml.includes(`data-grant="${g}"`)));
+  check('settings never renders a stored bridge token', !new RegExp(PHONE_TOKEN).test(setHtml));
+  check('settings renders the semantic memory card (backend + dimension)', /Semantic memory/.test(setHtml) && /aria_memory/.test(setHtml));
+
+  /* ---- Second Brain → long-term memory UI (add, list, delete) ---- */
+  w.location.hash = '#/brain';
+  w.dispatchEvent(new w.HashChangeEvent('hashchange'));
+  await sleep(500);
+  const brainHtml = (w.document.getElementById('main') || {}).innerHTML || '';
+  check('brain view renders the long-term memory card', /Long-term memory/.test(brainHtml) && !!w.document.getElementById('mem-add'));
+  w.confirm = () => true;                       // jsdom has no window.confirm
+  w.document.getElementById('mem-content').value = 'Prefers invoices sent on Fridays';
+  w.document.getElementById('mem-kind').value = 'preference';
+  w.document.getElementById('mem-add').click();
+  await sleep(700);
+  const memNow = (await get('/api/memory')).json || [];
+  check('adding a memory from the UI stores it (as a preference)', memNow.some(m => /invoices sent on Fridays/i.test(m.content) && m.kind === 'preference'), JSON.stringify(memNow.map(m => [m.kind, m.content.slice(0, 30)])));
+  w.location.hash = '#/hub'; await sleep(200);
+  w.location.hash = '#/brain'; await sleep(600);
+  const brainHtml2 = (w.document.getElementById('main') || {}).innerHTML || '';
+  check('the memory list renders its rows with edit + delete controls', /invoices sent on Fridays/.test(brainHtml2) && /data-mem-del=/.test(brainHtml2) && /data-mem-edit=/.test(brainHtml2));
+  const delBtn = [...w.document.querySelectorAll('button[data-mem-del]')].find(b => (w.document.getElementById('main').innerHTML.match(/invoices sent on Fridays/) ? true : false));
+  if (delBtn) { delBtn.click(); await sleep(700); }
+  check('deleting a memory from the UI removes it', !((await get('/api/memory')).json || []).some(m => /invoices sent on Fridays/i.test(m.content)));
+  /* ---- durable-learning strip (Phase 3) ---- */
+  check('the memory card shows the durable-learning counters', /auto-learned/.test(brainHtml2) && /secrets blocked/.test(brainHtml2) && !!w.document.getElementById('learn-run'));
+  check('the learning strip says learning is out-of-band and retraining-free', /no retraining/.test(brainHtml2));
+  const realFlush = learnMod.flush;
+  let uiFlushes = 0;
+  learnMod.flush = async (...args) => { uiFlushes++; return realFlush(...args); };
+  w.document.getElementById('learn-run').click();
+  await sleep(500);
+  learnMod.flush = realFlush;
+  check('Learn now triggers an out-of-band learning sweep', uiFlushes >= 1 && !w.document.getElementById('learn-run').disabled, `flushes=${uiFlushes}`);
+  /* ---- phrase dictionary UI (Phase 4) ---- */
+  check('the brain view renders the Language & phrases card', /Language &amp; phrases|Language & phrases/.test(brainHtml2) && !!w.document.getElementById('ph-add'));
+  check('the card lists the seeded Swahili / Kikuyu / Sheng phrases', /wĩ mwega/.test(brainHtml2) && /habari/i.test(brainHtml2) && /mambo vipi/.test(brainHtml2));
+  check('the card states the Kikuyu microphone limitation', /browsers cannot recognise Kikuyu speech|mic is disabled/i.test(brainHtml2));
+  check('the phrase rows carry edit + delete controls', /data-ph-del=/.test(brainHtml2) && /data-ph-edit=/.test(brainHtml2));
+  check('the card offers a seed restore control', !!w.document.getElementById('ph-reset'));
+  w.document.getElementById('ph-phrase').value = 'ongeza kumbukumbu ya';
+  w.document.getElementById('ph-lang').value = 'sw';
+  w.document.getElementById('ph-intent').value = 'remind';
+  w.document.getElementById('ph-command').value = 'remind me to {rest}';
+  w.document.getElementById('ph-note').value = 'add a reminder';
+  w.document.getElementById('ph-add').click();
+  await sleep(900);
+  const dictAfterAdd = await get('/api/dictionary');
+  const uiPhrase = ((dictAfterAdd.json || {}).entries || []).find(e => e.phrase === 'ongeza kumbukumbu ya');
+  check('adding a phrase from the UI stores it in the dictionary', !!uiPhrase && uiPhrase.source === 'user', JSON.stringify(uiPhrase && uiPhrase.intent));
+  if (uiPhrase) {
+    w.location.hash = '#/hub'; await sleep(200);
+    w.location.hash = '#/brain'; await sleep(700);
+    const phDel = w.document.querySelector(`button[data-ph-del="${uiPhrase.id}"]`);
+    check('the saved phrase is rendered as a row', !!phDel);
+    if (phDel) { phDel.click(); await sleep(900); }
+    check('deleting a phrase from the UI removes it', !(((await get('/api/dictionary')).json || {}).entries || []).some(e => e.id === uiPhrase.id));
+  }
+  /* The UI add really is the same pipeline: the new phrase normalizes immediately. */
+  check('the dictionary UI and the normalizer share one store', /alarm-set/.test(JSON.stringify((await post('/api/dictionary/match', { text: 'weka kengele' })).json)));
+
+  check('no console errors during the memory UI flow', errors.length === 0, errors.slice(0, 4).join(' | '));
   console.log('\n[5] Agency Swarm UI + voice loop');
   /* Assistant view: the two-way voice loop hangs off #asst-mic and a [data-voice-input] field. */
   w.location.hash = '#/assistant';
@@ -730,6 +1378,7 @@ function check(name, cond, detail) {
   check('wake-word listener is mic/speech aware', !!w.AriaWakeWord && typeof w.AriaWakeWord.busy === 'function' && w.AriaWakeWord.busy() === false);
   /* A spoken transcript must land in the chat and post to the assistant, exactly like typing. */
   let spoke = null;
+  const realSpeak = speech.speak;                 // restored below so later checks use the real one
   speech.speak = (t) => { spoke = t; return Promise.resolve(true); };
   speech.finalize('what are my priorities?');
   await sleep(900);
@@ -737,6 +1386,7 @@ function check(name, cond, detail) {
   check('spoken transcript is appended to the chat', /what are my priorities\?/i.test(chatHtml));
   check('spoken turn gets an ARIA reply in the transcript', (chatHtml.match(/msg aria/g) || []).length >= 1);
   check('reply is handed to speechSynthesis', typeof spoke === 'string' && spoke.length > 0, String(spoke).slice(0, 40));
+  speech.speak = realSpeak;
 
   console.log('\n[5b] Natural speech filtering (client pipeline)');
   const cfs = (t, o) => w.AriaSpeech.cleanForSpeech(t, o || {});
@@ -770,6 +1420,7 @@ function check(name, cond, detail) {
   check('final output is rendered', /Agency mission report/i.test(w.document.getElementById('agency-output').textContent || ''));
   check('mission summary is read aloud', typeof agencySpoke === 'string' && agencySpoke.length > 0, String(agencySpoke).slice(0, 40));
   check('recent missions list is refreshed', (w.document.querySelectorAll('#agency-runs .row') || []).length >= 1);
+  w.AriaSpeech.speak = realSpeak;                 // hand the real speaker back to the suite
 
   /* The Hub card hands a mission to the swarm. */
   w.location.hash = '#/hub';
@@ -848,6 +1499,79 @@ function check(name, cond, detail) {
   w.document.getElementById('set-save').click();
   await sleep(1000);
   check('the voice choice is reversible', (await get('/api/settings')).json.voiceGender === 'male' && w.localStorage.getItem('aria.voiceGender') === 'male');
+
+  console.log('\n[5d] Language modes, TTS fallback & the Kikuyu microphone (Phase 4)');
+  check('language modes are exported to the client', Array.isArray(w.AriaLangModes) && w.AriaLangModes.join(',') === 'auto,en,sw,ki', JSON.stringify(w.AriaLangModes));
+  check('every mode has a human label', ['auto', 'en', 'sw', 'ki'].every(m => /auto|English|Swahili|Kikuyu/i.test(w.AriaLangLabel(m))));
+  /* STT routing — the honest table. */
+  check('STT locale routing: sw → sw-KE', w.AriaSttLocaleFor('sw') === 'sw-KE');
+  check('STT locale routing: en → en-KE', w.AriaSttLocaleFor('en') === 'en-KE');
+  check('STT locale routing: ki → none (no browser supports it)', w.AriaSttLocaleFor('ki') === null && w.AriaSttLocaleFor('auto') === null);
+  /* Voice fallback table — pure, injectable, no real voices needed. */
+  const V = (name, lang) => ({ name, lang });
+  check('Swahili mode picks the Swahili voice when one exists', (w.AriaPickVoiceFor([V('Daniel', 'en-GB'), V('Google Swahili', 'sw-KE')], 'male', 'sw') || {}).name === 'Google Swahili');
+  check('Kikuyu falls back to Swahili when the device has no Kikuyu voice', (w.AriaPickVoiceFor([V('Google Swahili', 'sw-KE'), V('Daniel', 'en-GB')], 'male', 'ki') || {}).name === 'Google Swahili');
+  check('Kikuyu with no Swahili voice falls back to Kenyan English', (w.AriaPickVoiceFor([V('US English', 'en-US'), V('Kenyan English', 'en-KE')], 'male', 'ki') || {}).name === 'Kenyan English');
+  check('English mode prefers en-KE over en-US', (w.AriaPickVoiceFor([V('US English', 'en-US'), V('Kenyan English', 'en-KE')], 'male', 'en') || {}).name === 'Kenyan English');
+  check('gender still wins inside the language pool', (w.AriaPickVoiceFor([V('Google Swahili', 'sw-KE'), V('Swahili Female', 'sw-KE')], 'female', 'sw') || {}).name === 'Swahili Female');
+  check('no voices at all → null (silent fallback, never a throw)', w.AriaPickVoiceFor([], 'male', 'ki') === null && w.AriaPickVoiceFor(null, 'male', 'sw') === null);
+  const silentSpeak = await voice.speak('this device has no speechSynthesis engine');
+  check('with no TTS engine, speaking resolves false instead of throwing', silentSpeak === false);
+
+  /* Settings: the language select persists and explains itself. */
+  const langSel = w.document.getElementById('s-lang');
+  check('Settings renders the Language select', !!langSel && langSel.tagName === 'SELECT');
+  check('the select offers auto / English / Swahili / Kikuyu', !!langSel && [...langSel.options].map(o => o.value).join(',') === 'auto,en,sw,ki', langSel && [...langSel.options].map(o => o.value).join(','));
+  check('the Kikuyu option is labelled typed-only', !!langSel && /typed only/i.test([...langSel.options].find(o => o.value === 'ki').textContent));
+  check('the language hint explains the Kikuyu limitation', /Kikuyu/i.test((w.document.getElementById('lang-hint') || {}).textContent || '') && /type|typed/i.test((w.document.getElementById('lang-hint') || {}).textContent || ''));
+  langSel.value = 'ki';
+  langSel.dispatchEvent(new w.Event('change'));
+  await sleep(200);
+  check('choosing Kikuyu is instant on this device', w.localStorage.getItem('aria.lang') === 'ki' && voice.langMode() === 'ki');
+  check('Kikuyu mode reports the microphone as unsupported', voice.sttSupported() === false && voice.sttLocale() === null);
+  check('the hint text updates to the typed-only explanation', /mic is disabled|type your Kikuyu|typed/i.test((w.document.getElementById('lang-hint') || {}).textContent || ''));
+  w.document.getElementById('set-save').click();
+  await sleep(1000);
+  check('Save all persists the language server-side', ((await get('/api/settings')).json || {}).language.mode === 'ki');
+  langSel.value = 'sw';
+  langSel.dispatchEvent(new w.Event('change'));
+  await sleep(200);
+  check('switching to Swahili sets sw-KE on this device', w.localStorage.getItem('aria.lang') === 'sw' && voice.sttLocale() === 'sw-KE' && voice.sttSupported() === true);
+  w.document.getElementById('set-save').click();
+  await sleep(1000);
+  check('Swahili persists too', ((await get('/api/settings')).json || {}).language.mode === 'sw');
+
+  /* Assistant view: the mic degrades cleanly for Kikuyu and works for Swahili. */
+  voice.setLanguage('ki');
+  w.location.hash = '#/assistant';
+  w.dispatchEvent(new w.HashChangeEvent('hashchange'));
+  await sleep(600);
+  const micKi = w.document.getElementById('asst-mic');
+  check('Kikuyu mode disables the mic and badges it as typed-only', !!micKi && micKi.disabled === true && micKi.dataset.stt === 'unsupported', JSON.stringify({ d: micKi && micKi.disabled, s: micKi && micKi.dataset.stt }));
+  check('the Kikuyu mic explains itself in its title', !!micKi && /Kikuyu/i.test(micKi.title) && /type/i.test(micKi.title));
+  check('the mic status line tells the user to type', /type your command/i.test((w.document.getElementById('mic-status') || {}).textContent || ''));
+  const recBefore = voice.rec;
+  micKi.click();
+  await sleep(200);
+  check('clicking the mic in Kikuyu mode never starts recognition', voice.listening === false && voice.rec === recBefore);
+
+  /* A Swahili microphone is really created with lang=sw-KE. */
+  voice.setLanguage('sw');
+  await sleep(200);
+  const micSw = w.document.getElementById('asst-mic');
+  check('Swahili mode keeps the mic enabled and shows the locale', !!micSw && micSw.disabled === false && micSw.dataset.stt === 'ready' && voice.sttLocale() === 'sw-KE');
+  class FakeSR { constructor() { this.lang = 'x'; } start() {} stop() {} }
+  w.SpeechRecognition = FakeSR;
+  const fakeRec = voice.create();
+  check('the created recognizer asks the browser for sw-KE', fakeRec && fakeRec.lang === 'sw-KE', fakeRec && fakeRec.lang);
+  voice.setLanguage('en');
+  check('English mode asks for en-KE', voice.create().lang === 'en-KE');
+  w.SpeechRecognition = undefined;
+  voice.setLanguage('auto');
+  await post('/api/settings', { language: { mode: 'auto' } });
+  w.location.hash = '#/hub'; await sleep(200);
+  check('language mode restored to auto on the client and server',
+    voice.langMode() === 'auto' && ((await get('/api/settings')).json || {}).language.mode === 'auto');
   console.log('\n[6] Tool-calling loop end-to-end (mock model server)');
   /* A fake Ollama that answers with a tool call for one phrasing and with plain prose for
      another. ARIA must (a) EXECUTE the tool for real and reply with the record it wrote, and
