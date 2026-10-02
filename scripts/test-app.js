@@ -679,6 +679,132 @@ function check(name, cond, detail) {
   check('/api/state.cfg does not contain telegram token', !JSON.stringify((stAfter.json || {}).cfg || {}).includes(SECRET_TG));
   await cfgMod.save({ contacts: [], media: { provider: 'browser', localUrl: '' } });
 
+  console.log('\n[3m] Android phone bridge — real alarms & media via Tasker/MacroDroid');
+  const phoneMod = require('../server/phone');
+  const PHONE_TOKEN = 'phone-bridge-SECRETTOKEN-xyz-never-leak';
+  const phoneGet = async (p, token) => {
+    const r = await fetch(base + p, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+    let j = null; try { j = await r.json(); } catch (_) {}
+    return { status: r.status, json: j };
+  };
+  const phonePost = async (p, body, token) => {
+    const r = await fetch(base + p, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) }, body: JSON.stringify(body || {}) });
+    let j = null; try { j = await r.json(); } catch (_) {}
+    return { status: r.status, json: j };
+  };
+
+  /* Start from a certified-clean slate: off, no token, no grants. */
+  phoneMod._reset();
+  await integMod.revoke('phone');
+  await permMod.setGrant('phone.alarm', false);
+  await permMod.setGrant('phone.media', false);
+  await permMod.setGrant('phone.app', false);
+
+  check('the phone bridge is OFF by default (not enabled, no token)', cfgMod.load().phone.enabled === false && !cfgMod.load().phone.bridgeToken);
+  check('phone permissions are denied by default', permMod.allowed('phone', 'alarm') === false && permMod.allowed('phone', 'media') === false && permMod.allowed('phone', 'app') === false);
+  check('phone.alarm is sensitive — a model can never self-confirm it', permMod.isSensitive('phone', 'alarm') === true);
+  check('phone_command is on the hub tool schema', asstMod.TOOL_DEFS.some(t => t.name === 'phone_command'));
+  check('the phone schema never exposes a token field', !/token/i.test(JSON.stringify(asstMod.TOOL_DEFS.find(t => t.name === 'phone_command') || {})));
+
+  const offAttempt = await phoneMod.enqueue({ type: 'set_alarm', args: { when: 'tomorrow at 6:30 am' }, origin: 'user' });
+  check('a command while the bridge is off is refused and queues nothing', offAttempt.queued === false && /off/i.test(offAttempt.reply || '') && phoneMod.publicState().pendingCount === 0, offAttempt.reply);
+  check('publicState never contains the bridge token key', !JSON.stringify(phoneMod.publicState()).includes('bridgeToken'));
+
+  await cfgMod.save({ phone: { enabled: true, bridgeToken: PHONE_TOKEN, label: 'Test phone' } });
+  const noGrant = await phoneMod.enqueue({ type: 'set_alarm', args: { when: 'tomorrow at 6:30 am' }, origin: 'user' });
+  check('bridge on but no grant → phone.alarm still denied (default deny)', noGrant.queued === false && /denied by default/i.test(noGrant.reply || ''), noGrant.reply);
+  check('GET /api/phone/pending without a token → 401', (await phoneGet('/api/phone/pending')).status === 401);
+  check('GET /api/phone/pending with a wrong token → 401', (await phoneGet('/api/phone/pending', 'nope')).status === 401);
+
+  await permMod.setGrant('phone.alarm', true);
+  const queuedAlarm = await phoneMod.enqueue({ type: 'set_alarm', args: { when: 'tomorrow at 6:30 am', timezone: ARIA_TZ, title: 'Gym' }, origin: 'user' });
+  const qc = queuedAlarm.command || {};
+  check('granted phone.alarm queues a real set_alarm command', queuedAlarm.queued === true && qc.type === 'set_alarm', queuedAlarm.reply);
+  check('the reply is "waiting for confirmation" and never claims the alarm happened', /waiting for .*confirmation/i.test(queuedAlarm.reply || '') && !/\b(?:alarm is set|alarm created|will ring|set for you)\b/i.test(queuedAlarm.reply || ''), queuedAlarm.reply);
+  check('the alarm time resolves in Africa/Nairobi at 06:30 tomorrow', qc.args.timezone === ARIA_TZ && qc.args.hour === 6 && qc.args.minute === 30 && dk(qc.args.epochMs, ARIA_TZ) === tomorrowKey, JSON.stringify({ tz: qc.args.timezone, h: qc.args.hour, m: qc.args.minute }));
+  check('the command payload carries the Tasker action', !!(qc.tasker && /Set Alarm/.test(qc.tasker.action || '')));
+  const dupAlarm = await phoneMod.enqueue({ type: 'set_alarm', args: { when: 'tomorrow at 6:30 am', timezone: ARIA_TZ, title: 'Gym' }, origin: 'user' });
+  check('the same alarm intent is not queued twice (idempotent)', dupAlarm.duplicate === true && dupAlarm.command.id === qc.id);
+
+  const pend = await phoneGet('/api/phone/pending', PHONE_TOKEN);
+  check('the phone polls with its bearer token → 200 with the queued command', pend.status === 200 && (pend.json.commands || []).length === 1 && pend.json.commands[0].id === qc.id, JSON.stringify(pend.json));
+  check('the pending payload never contains the bridge token', !JSON.stringify(pend.json).includes(PHONE_TOKEN));
+  check('picking a command up does not mark it done', pend.json.commands[0].status === 'queued' && pend.json.commands[0].attempts >= 1);
+  const beforeAckState = (await get('/api/phone')).json || {};
+  check('before the ack ARIA reports it as queued, with no ack on record', beforeAckState.pendingCount === 1 && beforeAckState.lastAck === null);
+  const asstQueued = await post('/api/assistant', { message: 'is my phone connected?' });
+  check('assistant phone status says queued (not done) before the ack', /queued/i.test((asstQueued.json || {}).reply || ''), (asstQueued.json || {}).reply);
+
+  const ackRes = await phonePost('/api/phone/ack', { id: qc.id, status: 'done', detail: 'Set Alarm action ran' }, PHONE_TOKEN);
+  check('the phone ack marks the command acked with the real detail', ackRes.status === 200 && (ackRes.json.command || {}).status === 'acked' && /Set Alarm action ran/.test(((ackRes.json.command || {}).result || {}).detail || ''));
+  check('only the ack lets ARIA say it was confirmed', /confirmed/i.test((ackRes.json || {}).reply || ''), (ackRes.json || {}).reply);
+  const ackAgain = await phonePost('/api/phone/ack', { id: qc.id, status: 'failed', detail: 'late replay' }, PHONE_TOKEN);
+  check('a repeated ack is idempotent (first result wins)', ackAgain.status === 200 && ackAgain.json.duplicate === true && ackAgain.json.command.status === 'acked' && ackAgain.json.command.result.detail === 'Set Alarm action ran', JSON.stringify(ackAgain.json));
+  check('the ack is written to the audit trail', ((await get('/api/audit')).json || []).some(a => a && a.integration === 'phone' && a.action === 'set_alarm' && a.status === 'acked'));
+  const afterAckState = (await get('/api/phone')).json || {};
+  check('state records the confirmed ack (pending drained)', afterAckState.pendingCount === 0 && afterAckState.lastAck && afterAckState.lastAck.status === 'acked');
+
+  const noMedia = await phoneMod.enqueue({ type: 'pause', args: {}, origin: 'user' });
+  check('phone.media is denied until its grant exists', noMedia.queued === false);
+  await permMod.setGrant('phone.media', true);
+  await permMod.setGrant('phone.app', true);
+  const pauseCmd = await phoneMod.enqueue({ type: 'pause', args: {}, origin: 'user' });
+  check('granted phone.media queues a media command', pauseCmd.queued === true && pauseCmd.command.type === 'pause');
+  const nextIntent = await phoneMod.route('skip this track on my phone', { origin: 'user' });
+  check('deterministic intent: "skip this track on my phone" → next', !!(nextIntent && nextIntent.command && nextIntent.command.type === 'next'), JSON.stringify(nextIntent && nextIntent.command && nextIntent.command.type));
+  const openIntent = await phoneMod.route('open WhatsApp on my phone', { origin: 'user' });
+  check('deterministic intent: "open WhatsApp on my phone" → open_app', !!(openIntent && openIntent.command && openIntent.command.type === 'open_app' && /whatsapp/i.test(openIntent.command.args.app || '')), JSON.stringify(openIntent && openIntent.command && openIntent.command.args));
+  check('phone intents never hijack non-phone messages', (await phoneMod.route('schedule a meeting with Kamau tomorrow', { origin: 'user' })) === null);
+
+  const pendingBeforeAmb = phoneMod.publicState().pendingCount;
+  const ambReply = await post('/api/assistant', { message: 'set an alarm on my phone' });
+  check('an ambiguous phone alarm asks for a clock time and queues nothing', /exact clock time|need a time/i.test((ambReply.json || {}).reply || '') && phoneMod.publicState().pendingCount === pendingBeforeAmb, (ambReply.json || {}).reply);
+
+  const loopAlarm = await autoMod.executeTool('phone_command', { command: 'set_alarm', when: 'tomorrow at 7:00 am' }, 'tool-loop');
+  check('the model cannot queue a real phone alarm on its own', !!(loopAlarm && loopAlarm.needsConfirmation === true && loopAlarm.queued === false && loopAlarm.confirmation && !loopAlarm.confirmation.token), JSON.stringify(loopAlarm && loopAlarm.confirmation));
+  check('the model attempt queued nothing', phoneMod.publicState().pendingCount === pendingBeforeAmb);
+  const ownerConfirmed = await autoMod.confirmPending(loopAlarm.confirmation.id, { origin: 'user' });
+  check('owner confirm actually queues the model-requested alarm', ownerConfirmed.queued === true && ownerConfirmed.confirmed === true && ownerConfirmed.command.type === 'set_alarm', JSON.stringify(ownerConfirmed.command && ownerConfirmed.command.id));
+  check('an unknown phone command is refused', (await autoMod.executeTool('phone_command', { command: 'launch_missiles' }, 'tool-loop')) === null);
+
+  const asstPhone = await post('/api/assistant', { message: 'set an alarm on my phone for tomorrow at 6:30 am' });
+  const apj = asstPhone.json || {};
+  check('assistant routes "…on my phone" to the bridge (not a browser alarm)', apj.intent === 'phone-set_alarm' && /waiting for .*confirmation/i.test(apj.reply || ''), `${apj.intent} | ${(apj.reply || '').slice(0, 120)}`);
+  check('assistant never claims a device alarm without an ack', !/browser notification/i.test(apj.reply || '') && !/\b(?:alarm (?:is )?set|device alarm created|will ring at)\b/i.test(apj.reply || ''));
+
+  const expiring = await phoneMod.enqueue({ type: 'play', args: { query: 'x' }, origin: 'user', ttlMs: 60 });
+  await new Promise((r) => setTimeout(r, 90));
+  const pendAfterExpiry = await phoneGet('/api/phone/pending', PHONE_TOKEN);
+  check('an expired command is never delivered to the phone', !(pendAfterExpiry.json.commands || []).some(c => c.id === expiring.command.id));
+  check('an expired command is reported as expired, not done', (((await get('/api/phone')).json.recent || []).find(c => c.id === expiring.command.id) || {}).status === 'expired');
+
+  const failedAck = await phoneMod.enqueue({ type: 'cancel_alarm', args: { title: 'Gym' }, origin: 'user' });
+  const failAckRes = await phonePost('/api/phone/ack', { id: failedAck.command.id, status: 'unsupported', detail: 'Tasker has no Cancel Alarm action' }, PHONE_TOKEN);
+  check('an unsupported action is reported honestly, never as done', /could NOT run/i.test((failAckRes.json || {}).reply || '') && (failAckRes.json.command || {}).status === 'failed', (failAckRes.json || {}).reply);
+
+  check('web-push fallback uses the fixed title "ARIA ALARM 06:30"', phoneMod.pushPayload({ type: 'set_alarm', args: { epochMs: qc.args.epochMs, timezone: ARIA_TZ }, id: 'phc_x' }).title === 'ARIA ALARM 06:30', phoneMod.pushPayload({ type: 'set_alarm', args: { epochMs: qc.args.epochMs, timezone: ARIA_TZ }, id: 'phc_x' }).title);
+  check('media web-push titles are fixed too', phoneMod.pushPayload({ type: 'pause', args: {}, id: 'phc_y' }).title === 'ARIA MEDIA PAUSE');
+  const intsPhone = (((await get('/api/integrations')).json) || []).find(i => i.id === 'phone');
+  check('integrations reports the phone bridge with its scopes', !!intsPhone && intsPhone.status === 'connected' && (intsPhone.scopes || []).includes('phone.alarm'), JSON.stringify(intsPhone));
+
+  await cfgMod.save({ phone: { enabled: false } });
+  check('pending is refused (409) while the bridge is disabled', (await phoneGet('/api/phone/pending', PHONE_TOKEN)).status === 409);
+  await cfgMod.save({ phone: { enabled: true } });
+
+  const phoneLeakBodies = JSON.stringify((await get('/api/state')).json) + JSON.stringify((await get('/api/settings')).json) + JSON.stringify((await get('/api/phone')).json) + JSON.stringify((await get('/api/audit')).json);
+  check('the bridge token never leaks in state/settings/phone/audit', !phoneLeakBodies.includes(PHONE_TOKEN), phoneLeakBodies.includes(PHONE_TOKEN) ? 'LEAKED' : 'clean');
+  check('publicConfig redacts the bridge token as a secret', cfgMod.publicConfig().phone.bridgeToken === '' && cfgMod.publicConfig().phone.bridgeTokenConfigured === true);
+  const blankPhoneSave = await post('/api/settings', { phone: { bridgeToken: '' } });
+  check('a blank token save keeps the stored secret (never wiped by accident)', blankPhoneSave.status === 200 && cfgMod.load().phone.bridgeToken === PHONE_TOKEN && !JSON.stringify(blankPhoneSave.json || {}).includes(PHONE_TOKEN));
+
+  /* Clean slate again so the frontend render + later sections see the shipped defaults. */
+  phoneMod._reset();
+  await integMod.revoke('phone');
+  await permMod.setGrant('phone.alarm', false);
+  await permMod.setGrant('phone.media', false);
+  await permMod.setGrant('phone.app', false);
+  check('revoking the bridge clears the token and disables it', !cfgMod.load().phone.bridgeToken && cfgMod.load().phone.enabled === false);
+
   console.log('\n[4] Frontend render (jsdom)');
   const errors = [];
   const vc = new VirtualConsole();
@@ -717,6 +843,12 @@ function check(name, cond, detail) {
     const rendered = txt.length > 0 && !txt.includes('loading…') && !txt.includes('⚠️');
     check(`view "${v}" renders`, rendered, txt.slice(0, 120).replace(/\s+/g, ' '));
   }
+  /* Settings must expose the Android phone bridge (enable + token + grants), and the card
+     must never render a stored token into the DOM. */
+  const setHtml = (w.document.getElementById('main') || {}).innerHTML || '';
+  check('settings renders the Android phone bridge card', /Android phone bridge/.test(setHtml) && !!w.document.getElementById('s-phone-on') && !!w.document.getElementById('s-phone-token'));
+  check('settings offers the phone permission grants', ['phone.alarm', 'phone.media', 'phone.app'].every(g => setHtml.includes(`data-grant="${g}"`)));
+  check('settings never renders a stored bridge token', !new RegExp(PHONE_TOKEN).test(setHtml));
   console.log('\n[5] Agency Swarm UI + voice loop');
   /* Assistant view: the two-way voice loop hangs off #asst-mic and a [data-voice-input] field. */
   w.location.hash = '#/assistant';

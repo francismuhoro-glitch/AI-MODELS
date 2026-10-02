@@ -859,6 +859,8 @@ function normalizeSettings(raw) {
     telegram: { enabled: false, token: '', allowedChatId: '', tokenConfigured: false, ...(s.telegram || {}) },
     sms: { enabled: false, bridgeUrl: '', token: '', tokenConfigured: false, ...(s.sms || {}) },
     media: { provider: 'browser', localUrl: '', ...(s.media || {}) },
+    /* Android phone bridge — token always blank from the server (secret redaction). */
+    phone: { enabled: false, bridgeToken: '', bridgeTokenConfigured: false, label: 'Android phone', commandTtlSeconds: 1800, pollSeconds: 300, ...(s.phone || {}) },
     contacts: Array.isArray(s.contacts) ? s.contacts : [],
     permissions: { grants: {}, allowGroupSend: false, autoSendRules: [], ...(s.permissions || {}) },
     brief: { email: false, ...(s.brief || {}) },
@@ -1589,13 +1591,14 @@ const voiceGenderHint = () => {
 };
 
 async function viewSettings(main) {
-  const [rawSettings, rawConns, rawInts, rawPerms, rawAlarms, rawReminders, rawAudit] = await Promise.all([
+  const [rawSettings, rawConns, rawInts, rawPerms, rawAlarms, rawReminders, rawAudit, rawPhone] = await Promise.all([
     api('/api/settings'), api('/api/connectors'),
     api('/api/integrations').catch(() => []),
     api('/api/permissions').catch(() => ({ grants: {}, allowGroupSend: false })),
     api('/api/alarms').catch(() => []),
     api('/api/reminders').catch(() => []),
-    api('/api/audit').catch(() => [])
+    api('/api/audit').catch(() => []),
+    api('/api/phone').catch(() => null)
   ]);
   const s = normalizeSettings(rawSettings);
   const conns = A(rawConns);
@@ -1604,6 +1607,8 @@ async function viewSettings(main) {
   const alarmList = A(rawAlarms);
   const reminderList = A(rawReminders);
   const auditList = A(rawAudit).slice(0, 8);
+  const ph = rawPhone && typeof rawPhone === 'object' ? rawPhone : { enabled: false, tokenConfigured: false, recent: [], pendingCount: 0 };
+  const phoneEndpoint = location.origin + '/api/phone/pending';
   const intById = Object.fromEntries(ints.map(i => [i.id, i]));
   SETTINGS = s; CONNECTORS = conns;
   syncVoiceGender(s.voiceGender);
@@ -1728,9 +1733,30 @@ async function viewSettings(main) {
         <label class="field">Local audio URL<input id="s-media-url" value="${esc(s.media.localUrl)}" placeholder="https://…/track.mp3 or /audio/morning.mp3"></label>
       </div>
 
+      <div class="card"><h3>📱 Android phone bridge (Tasker / MacroDroid)</h3>
+        <p style="color:var(--dim);font-size:12.5px;margin:0 0 10px"><strong>Off by default.</strong> When on, ARIA queues real phone commands (set alarm, media keys, open app) in an outbox; your phone polls <code>${esc(phoneEndpoint)}</code> with a bearer token and acks what it really did. Until the ack arrives ARIA says <em>“sent to phone, waiting for confirmation”</em> — it never claims the alarm rang.</p>
+        <label class="switch" style="display:flex;gap:9px;align-items:center;margin-bottom:10px"><input type="checkbox" id="s-phone-on" ${ph.enabled ? 'checked' : ''}><span>Enable the phone bridge</span></label>
+        <div class="form-grid">
+          <label class="field">Device label<input id="s-phone-label" value="${esc(s.phone ? s.phone.label : 'Android phone')}" placeholder="My Pixel"></label>
+          <label class="field">Bridge token<input id="s-phone-token" type="password" value="" placeholder="${ph.tokenConfigured ? 'Configured — leave blank to keep' : 'paste a long random string'}" autocomplete="off"></label>
+          <label class="field">Command TTL (seconds)<input id="s-phone-ttl" type="number" min="60" max="86400" value="${esc(String((s.phone && s.phone.commandTtlSeconds) || 1800))}"></label>
+          <label class="field">Tasker poll interval (s)<input id="s-phone-poll" type="number" min="15" max="86400" value="${esc(String((s.phone && s.phone.pollSeconds) || 300))}"></label>
+        </div>
+        <p style="color:var(--faint);font-size:12px;margin-top:8px">Token is stored as a secret: blanked in every GET, never logged, never sent to the model. Grants needed: <code>phone.alarm</code>, <code>phone.media</code>, <code>phone.app</code> (Permissions card below). Full walkthrough: <code>docs/ANDROID_BRIDGE.md</code>.</p>
+        <div style="display:flex;gap:9px;flex-wrap:wrap;margin:10px 0">
+          <button class="btn" id="btn-phone-test" ${ph.configured ? '' : 'disabled'}>⏰ Queue a test alarm (2 min)</button>
+          <span style="color:var(--faint);font-size:12px;align-self:center">Queued: ${ph.pendingCount || 0} · last poll: ${ph.lastPollAt ? esc(new Date(ph.lastPollAt).toISOString().slice(11, 19)) + 'Z' : 'never'}</span>
+        </div>
+        ${A(ph.recent).length ? A(ph.recent).slice(0, 6).map(c => `<div class="alarm-row">
+          <div class="ar-main"><strong>${esc(c.human || c.type)}</strong><div class="r-sub">${esc(c.type)} · <span class="chip ${c.status === 'acked' ? 'green' : (c.status === 'failed' ? 'red' : 'yellow')}">${esc(c.status)}</span> ${c.result && c.result.detail ? esc(c.result.detail) : ''}</div></div>
+          ${c.status === 'queued' ? `<button class="btn small" data-phone-cancel="${esc(c.id)}">cancel</button>` : ''}
+        </div>`).join('') : '<div class="empty">No phone commands yet.</div>'}
+      </div>
+
       <div class="card"><h3>🔐 Permissions</h3>
         <p style="color:var(--dim);font-size:12.5px;margin:0 0 8px">Default deny. Sending, deleting, publishing or purchasing never happens without an explicit grant <em>and</em> a confirmation (or a matching auto-send rule you wrote).</p>
-        ${['whatsapp.send','telegram.send','sms.send','email.send','calendar.write'].map(g => `<label class="perm-row"><span>${esc(g)}</span><input type="checkbox" data-grant="${g}" ${(perms.grants && perms.grants[g]) ? 'checked' : ''}></label>`).join('')}
+        ${['whatsapp.send','telegram.send','sms.send','email.send','calendar.write','phone.alarm','phone.media','phone.app'].map(g => `<label class="perm-row"><span>${esc(g)}</span><input type="checkbox" data-grant="${g}" ${(perms.grants && perms.grants[g]) ? 'checked' : ''}></label>`).join('')}
+        <p style="color:var(--faint);font-size:12px;margin:6px 0 0"><code>phone.alarm</code> sets a <strong>real alarm on your phone</strong> (and can cancel one) and always needs your confirmation when a model asks for it. <code>phone.media</code> covers play/pause/next/previous/volume. <code>phone.app</code> opens an app.</p>
         <label class="perm-row"><span>Allow group / broadcast sends</span><input type="checkbox" id="s-allow-group" ${perms.allowGroupSend ? 'checked' : ''}></label>
         <h3 style="margin-top:14px">Recent audit</h3>
         ${auditList.length ? auditList.map(a => `<div class="audit-row">${esc(a.ts ? new Date(a.ts).toISOString().slice(11, 19) : '')} · ${esc(a.action)} · ${esc(a.integration || a.target || '')} · ${esc(a.result || '')}</div>`).join('') : '<div class="empty">No audited actions yet.</div>'}
@@ -1757,6 +1783,13 @@ async function viewSettings(main) {
       telegram: { enabled: !!( $('#s-tg-on') && $('#s-tg-on').checked ), token: ($('#s-tg-token') && $('#s-tg-token').value) || '', allowedChatId: ($('#s-tg-chat') && $('#s-tg-chat').value) || '' },
       sms: { enabled: !!( $('#s-sms-on') && $('#s-sms-on').checked ), bridgeUrl: ($('#s-sms-url') && $('#s-sms-url').value) || '', token: ($('#s-sms-token') && $('#s-sms-token').value) || '' },
       media: { provider: 'browser', localUrl: ($('#s-media-url') && $('#s-media-url').value) || '' },
+      phone: {
+        enabled: !!( $('#s-phone-on') && $('#s-phone-on').checked ),
+        bridgeToken: ($('#s-phone-token') && $('#s-phone-token').value) || '',
+        label: ($('#s-phone-label') && $('#s-phone-label').value.trim()) || 'Android phone',
+        commandTtlSeconds: +( ($('#s-phone-ttl') && $('#s-phone-ttl').value) || 1800 ),
+        pollSeconds: +( ($('#s-phone-poll') && $('#s-phone-poll').value) || 300 )
+      },
       discretion: $('#s-discretion').checked
     });
     const grants = {};
@@ -1836,6 +1869,22 @@ async function viewSettings(main) {
   });
   $$('button[data-contact-del]', main).forEach(b => b.onclick = async () => {
     try { await api('/api/contacts/' + encodeURIComponent(b.dataset.contactDel), { method: 'DELETE' }); toast('Contact removed'); route(); }
+    catch (e) { toast(e.message); }
+  });
+  /* ── Android phone bridge: test alarm + cancel a queued command ──
+     A test alarm is explicitly "queued, not confirmed" — the toast repeats that so nobody
+     can mistake a queued command for a ringing phone. */
+  const phoneTest = $('#btn-phone-test');
+  if (phoneTest) phoneTest.onclick = async () => {
+    const when = new Date(Date.now() + 2 * 60000).toISOString();
+    try {
+      const r = await POST('/api/phone/command', { type: 'set_alarm', args: { fireAt: when, title: 'ARIA test alarm' } });
+      toast((r && r.reply) ? String(r.reply).replace(/[*`]/g, '').slice(0, 220) : 'Queued — waiting for the phone to ack');
+      route();
+    } catch (e) { toast('⚠️ ' + e.message); }
+  };
+  $$('button[data-phone-cancel]', main).forEach(b => b.onclick = async () => {
+    try { await POST('/api/phone/commands/' + encodeURIComponent(b.dataset.phoneCancel) + '/cancel'); toast('Queued command cancelled'); route(); }
     catch (e) { toast(e.message); }
   });
   const addCt = $('#ct-add');

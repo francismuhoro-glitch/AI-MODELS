@@ -39,6 +39,16 @@ const DEFAULTS = {
   telegram: { enabled: false, token: '', allowedChatId: '' },
   sms: { enabled: false, bridgeUrl: '', token: '' },
   media: { provider: 'browser', localUrl: '' },
+  /* Android phone bridge (Tasker / MacroDroid). OFF by default: with no token saved and no
+     explicit phone.* grants, no command can ever reach a device. Commands are queued in the
+     outbox and stay unconfirmed until the phone acks them. */
+  phone: {
+    enabled: false,
+    bridgeToken: '',
+    label: 'Android phone',
+    commandTtlSeconds: 1800,     // must be longer than the Tasker poll interval
+    pollSeconds: 300
+  },
   contacts: [],
   permissions: { grants: {}, allowGroupSend: false, autoSendRules: [] },
   routines: { morning: { enabled: true, steps: ['calendar_today', 'unread_summary'] } },
@@ -91,6 +101,16 @@ function normalize(cfg) {
   out.telegram = merge(clone(DEFAULTS.telegram), out.telegram || {});
   out.sms = merge(clone(DEFAULTS.sms), out.sms || {});
   out.media = merge(clone(DEFAULTS.media), out.media || {});
+  out.phone = merge(clone(DEFAULTS.phone), out.phone || {});
+  out.phone.enabled = !!out.phone.enabled;
+  out.phone.bridgeToken = String(out.phone.bridgeToken || '').trim();
+  out.phone.label = String(out.phone.label || DEFAULTS.phone.label).slice(0, 60);
+  const phoneTtl = Number(out.phone.commandTtlSeconds);
+  out.phone.commandTtlSeconds = Number.isFinite(phoneTtl) && phoneTtl >= 60
+    ? Math.min(Math.round(phoneTtl), 86400) : DEFAULTS.phone.commandTtlSeconds;
+  const phonePoll = Number(out.phone.pollSeconds);
+  out.phone.pollSeconds = Number.isFinite(phonePoll) && phonePoll >= 15
+    ? Math.min(Math.round(phonePoll), 86400) : DEFAULTS.phone.pollSeconds;
   out.permissions = merge(clone(DEFAULTS.permissions), out.permissions || {});
   out.permissions.grants = out.permissions.grants && typeof out.permissions.grants === 'object' ? out.permissions.grants : {};
   out.permissions.autoSendRules = Array.isArray(out.permissions.autoSendRules) ? out.permissions.autoSendRules : [];
@@ -134,6 +154,9 @@ function publicConfig(cfg) {
   out.llm.openai.apiKeyConfigured = !!openaiSecret(src);
   out.smtp = out.smtp || {}; out.smtp.pass = ''; out.smtp.passConfigured = !!(src && src.smtp && src.smtp.pass);
   out.telegram = out.telegram || {}; out.telegram.token = ''; out.telegram.tokenConfigured = !!(src && src.telegram && src.telegram.token);
+  out.phone = out.phone || {};
+  out.phone.bridgeToken = '';
+  out.phone.bridgeTokenConfigured = !!(src && src.phone && src.phone.bridgeToken);
   return out;
 }
 function openaiSecret(cfg) { return String((cfg && cfg.llm && cfg.llm.openai && cfg.llm.openai.apiKey) || process.env.OPENAI_API_KEY || '').trim(); }

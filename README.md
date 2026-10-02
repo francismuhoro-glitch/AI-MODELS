@@ -135,6 +135,24 @@ Settings → Connectors / Permissions / Alarms / Messaging. Default **deny**. Se
 | `POST /api/messages/draft`, `POST /api/messages/send` | Draft ≠ send; send is idempotent and confirm-gated. |
 | `GET/POST /api/media/*` | Browser/local playback; `POST /api/media/report` is what confirms it. |
 | `GET/POST /api/permissions`, `GET /api/audit`, `POST /api/confirm` | Grants, audit log (no secrets), owner confirmation. |
+| `GET /api/phone`, `POST /api/phone/command` | Android bridge status / queue a command (owner side). |
+| `GET /api/phone/pending`, `POST /api/phone/ack` | Phone side — bearer-token authed. Poll for commands, ack what really ran. |
+
+### 📱 Android phone bridge — real alarms & music (Tasker / MacroDroid)
+
+Off by default. Turn it on in Settings → **Android phone bridge**, paste a bridge token (stored as a
+secret: blanked in every GET, never logged, never given to the model), grant `phone.alarm`,
+`phone.media` and/or `phone.app`, then follow **[docs/ANDROID_BRIDGE.md](docs/ANDROID_BRIDGE.md)**
+for the copy-paste Tasker profile.
+
+ARIA queues commands (`set_alarm`, `cancel_alarm`, `play`, `pause`, `next`, `previous`, `volume`,
+`open_app`) into an outbox. Your phone polls with `Authorization: Bearer <token>`, runs the real
+action (Tasker *Set Alarm* / *Media Control* / *Launch App*) and acks. **Until the ack arrives ARIA
+only ever says “sent to phone, waiting for confirmation”** — it never claims an alarm rang or a
+track played. Commands expire, repeat intents are idempotent, repeat acks are ignored, and a model
+can never self-confirm a real device alarm. Every queued command is audited, and an optional
+web-push with a fixed title (`ARIA ALARM 06:30`) can wake a Tasker/AutoNotification profile when
+polling is not enough.
 
 ```bash
 npm install
@@ -187,6 +205,7 @@ server/
   assistant.js    executive assistant: intent routing · tool calling · planner · discretion · hub route
   automation.js   extra tools + deterministic alarms/messages/media/routines
   alarms.js       browser-notification alarms & reminders (never a device alarm)
+  phone.js        Android bridge outbox: real device alarms/media via Tasker/MacroDroid + acks
   permissions.js  default-deny grants, confirmations, audit
   messaging.js    draft ≠ send, idempotent sends, group deny
   media.js        browser / local audio only

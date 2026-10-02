@@ -26,6 +26,7 @@ const permissions = require('./permissions');
 const integrations = require('./integrations');
 const messaging = require('./messaging');
 const media = require('./media');
+const phone = require('./phone');
 const secrets = require('./secrets');
 const automation = require('./automation');
 
@@ -124,6 +125,8 @@ function buildState() {
     alarms: alarmItems,
     reminders: reminderItems,
     integrations: integrations.status(),
+    /* Android phone bridge: pending/acked commands. NEVER the bridge token. */
+    phone: (() => { try { return phone.publicState(); } catch (_) { return null; } })(),
     pendingConfirmation: permissions.publicConfirmation(permissions.latestPending()),
     stats: {
       engine: engine.activeEngine || 'offline',
@@ -174,8 +177,9 @@ api.get('/state', (req, res) => {
       engine: { activeEngine: 'offline', model: '' }, llm: { activeEngine: 'offline', model: '' },
       activeEngine: 'offline', unread: 0,
       events: [], allEvents: [], emails: [], inbox: [], tasks: [], messages: [], notes: [], chats: [], briefs: [], brief: null,
-      agencyRuns: [], agents: [],
-      stats: { engine: 'offline', lastSync: null, notes: 0, briefs: 0, emails: 0, messages: 0, events: 0, tasks: 0, agencyRuns: 0 },
+      agencyRuns: [], agents: [], phone: null, alarms: [], reminders: [],
+      integrations: [],
+      stats: { engine: 'offline', lastSync: null, notes: 0, briefs: 0, emails: 0, messages: 0, events: 0, tasks: 0, agencyRuns: 0, alarms: 0, reminders: 0 },
       counts: { events: 0, emails: 0, inbox: 0, notes: 0, messages: 0, chats: 0, briefs: 0, agencyRuns: 0 }
     });
   }
@@ -675,6 +679,45 @@ api.post('/permissions', async (req, res) => {
 api.get('/audit', (req, res) => {
   try { ok(res, arr(permissions.listAudit(req.query.limit))); }
   catch (e) { fail(res, e, []); }
+});
+
+/* ---------------- Android phone bridge (Tasker / MacroDroid) ----------------
+   Owner routes:  GET /api/phone, POST /api/phone/command, POST /api/phone/commands/:id/cancel
+   Phone routes:  GET /api/phone/pending, POST /api/phone/ack
+   The phone authenticates with `Authorization: Bearer <bridgeToken>` (header only — the token
+   is never accepted in the query string, so it cannot end up in a log or a URL share). */
+api.get('/phone', (req, res) => { try { ok(res, phone.publicState()); } catch (e) { fail(res, e); } });
+api.post('/phone/command', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const result = await phone.enqueue({
+      type: b.type || b.command,
+      args: b.args || b,
+      idempotencyKey: b.idempotencyKey,
+      origin: 'user'
+    });
+    ok(res, result);
+  } catch (e) { fail(res, e); }
+});
+api.post('/phone/commands/:id/cancel', async (req, res) => {
+  try { ok(res, await phone.cancel(req.params.id)); } catch (e) { fail(res, e); }
+});
+api.get('/phone/pending', async (req, res) => {
+  try {
+    const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+    const result = await phone.pending({ token });
+    if (!result.ok) return res.status(result.status || 401).json({ error: result.error });
+    ok(res, result);
+  } catch (e) { fail(res, e); }
+});
+api.post('/phone/ack', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+    const result = await phone.ack({ token, id: b.id, status: b.status, detail: b.detail });
+    if (!result.ok) return res.status(result.status || 400).json({ error: result.error });
+    ok(res, result);
+  } catch (e) { fail(res, e); }
 });
 api.post('/confirm', async (req, res) => {
   try {

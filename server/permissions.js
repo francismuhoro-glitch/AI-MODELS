@@ -11,7 +11,10 @@ const { uid } = require('./util');
 
 const SENSITIVE = new Set([
   'email.send', 'telegram.send', 'whatsapp.send', 'sms.send',
-  'message.send', 'slack.send', 'calendar.delete', 'message.delete'
+  'message.send', 'slack.send', 'calendar.delete', 'message.delete',
+  /* A REAL device alarm on the owner's phone: the model may ask, but only the owner
+     can confirm it (grants are checked separately, in phone.enqueue()). */
+  'phone.alarm'
 ]);
 
 const CONFIRM_TTL_MS = 5 * 60 * 1000;

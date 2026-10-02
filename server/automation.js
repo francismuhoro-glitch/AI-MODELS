@@ -5,6 +5,7 @@
 const alarms = require('./alarms');
 const messaging = require('./messaging');
 const media = require('./media');
+const phone = require('./phone');
 const permissions = require('./permissions');
 const integrations = require('./integrations');
 const cfgm = require('./config');
@@ -32,7 +33,7 @@ const TOOL_DEFS = [
   { name: 'search_free_slots', description: 'Show free slots on the calendar for a day.', args: { dayLabel: { type: 'today | tomorrow | weekday | YYYY-MM-DD', optional: true } } },
   { name: 'start_routine', description: 'Start a named local routine (default: morning). Messaging steps still require confirmation.', args: { name: { type: '"morning"', optional: true } } },
   { name: 'confirm_action', description: 'Confirm a pending sensitive action. Only the owner can do this — not the model.', args: { id: { type: 'confirmation id from the UI or chat' } } }
-];
+].concat(phone.TOOL_DEFS);
 
 function str(v) { return String(v === null || v === undefined ? '' : v).replace(/\s+/g, ' ').trim(); }
 
@@ -102,6 +103,17 @@ async function confirmPending(id, { origin } = {}) {
     if (!draft) return { reply: 'The draft disappeared — nothing was sent.', intent: 'confirm', confirmed: false };
     const result = await messaging.performSend(draft, { idempotencyKey: payload.idempotencyKey });
     return { ...result, intent: 'message-send', confirmed: !!result.sent };
+  }
+  /* Owner confirmed a REAL phone command the model asked for (phone alarm / media / app).
+     Only this path (origin 'user') can push it into the outbox. */
+  if (payload.type === 'phone' || /^phone_/.test(String(rec.action || ''))) {
+    const result = await phone.enqueue({
+      type: payload.command || String(rec.action || '').replace(/^phone_/, ''),
+      args: payload.args || {},
+      idempotencyKey: payload.idempotencyKey,
+      origin: 'user'
+    });
+    return { ...result, intent: result.intent || 'phone-command', confirmed: !!result.queued };
   }
   if (payload.kind === 'alarm' || payload.kind === 'reminder' || rec.action === 'create_alarm' || rec.action === 'create_reminder') {
     const result = await alarms.create({
@@ -237,8 +249,12 @@ async function executeTool(name, args, origin = 'assistant') {
         if (!id) return null;
         return await confirmPending(id, { origin });
       }
-      default:
+      default: {
+        /* Android phone bridge commands (phone_command) — real device alarm / media / app. */
+        const viaPhone = await phone.executeTool(tool, a, origin);
+        if (viaPhone) return viaPhone;
         return null;
+      }
     }
   } catch (e) {
     return { reply: 'That action failed: ' + require('./secrets').safeError(e), intent: 'error' };
@@ -306,6 +322,14 @@ async function route(msg) {
     permissions.cancel(pending.id);
     return { reply: 'Cancelled — nothing was sent or changed.', intent: 'confirm-cancel' };
   }
+
+  /* Android phone bridge — "set an alarm on my phone for 6:30", "pause the music on my phone".
+     Runs BEFORE the browser alarm / browser media matchers so a phone request is never turned
+     into a browser notification or a tab-local playback action. */
+  try {
+    const ph = await phone.route(s, { origin: 'user' });
+    if (ph && ph.reply) return ph;
+  } catch (_) {}
 
   const al = matchAlarm(s);
   if (al) {

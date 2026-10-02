@@ -125,6 +125,27 @@ function extraStatus() {
     note: 'Spotify and Apple Music are not connected. Local audio URL is optional.'
   });
 
+  /* Android phone bridge (Tasker / MacroDroid) — off by default, needs a token + explicit grants. */
+  const ph = cfg.phone || {};
+  const phConfigured = !!(ph.enabled && ph.bridgeToken);
+  let phonePending = 0;
+  try { phonePending = require('./phone').publicState().pendingCount; } catch (_) { phonePending = 0; }
+  items.push({
+    id: 'phone',
+    label: 'Android phone bridge (Tasker / MacroDroid)',
+    enabled: !!ph.enabled,
+    configured: phConfigured,
+    setupRequired: !phConfigured,
+    scopes: ['phone.alarm', 'phone.media', 'phone.app'],
+    status: classify({ enabled: !!ph.enabled, configured: phConfigured, expired: false, unavailable: false }),
+    authorized: phConfigured,
+    actions: ['set_alarm', 'cancel_alarm', 'play', 'pause', 'next', 'previous', 'volume', 'open_app'],
+    pendingCommands: phonePending,
+    note: phConfigured
+      ? `Phone polls GET /api/phone/pending with a bearer token; ${phonePending} command(s) queued. ARIA never claims an alarm/playback until the phone acks.`
+      : 'Off by default. Enable in Settings → Android phone bridge and follow docs/ANDROID_BRIDGE.md.'
+  });
+
   const contacts = Array.isArray(cfg.contacts) ? cfg.contacts.length : 0;
   items.push({
     id: 'contacts',
@@ -273,6 +294,9 @@ async function revoke(id) {
     await wipePath(['smtp'], { ...(cfg.smtp || {}), pass: '' });
   } else if (key === 'sms') {
     await wipePath(['sms'], { enabled: false, bridgeUrl: (cfg.sms && cfg.sms.bridgeUrl) || '', token: '' });
+  } else if (key === 'phone') {
+    /* Genuinely clear the bridge token (blank saves normally preserve secrets — revoke must not). */
+    await wipePath(['phone'], { enabled: false, bridgeToken: '', label: (cfg.phone && cfg.phone.label) || 'Android phone' });
   } else {
     return { ok: false, error: 'unknown integration' };
   }
