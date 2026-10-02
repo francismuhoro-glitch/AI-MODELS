@@ -29,6 +29,7 @@ const media = require('./media');
 const phone = require('./phone');
 const memory = require('./memory');
 const learning = require('./learning');
+const dictionary = require('./dictionary');
 const secrets = require('./secrets');
 const automation = require('./automation');
 
@@ -107,6 +108,8 @@ function buildState() {
     timezone: tz,
     wakeTime: cfg.wakeTime,
     voiceGender: cfg.voiceGender || 'male',
+    /* Language mode (Phase 4). Kikuyu has no browser STT — the client disables the mic for it. */
+    language: (() => { try { return dictionary.languageInfo(); } catch (_) { return { mode: 'auto', sttLocale: null, sttSupported: true }; } })(),
     engine,
     llm: engine,
     activeEngine: engine.activeEngine || 'offline',
@@ -824,6 +827,64 @@ api.get('/learning', (req, res) => {
 });
 api.post('/learning/run', async (req, res) => {
   try { ok(res, await learning.flush()); } catch (e) { fail(res, e, { processed: 0 }); }
+});
+
+/* ---------------- phrase dictionary & language (Phase 4) ----------------
+   One editable store: Swahili / Kikuyu / Sheng phrases mapped to the English phrasing the
+   deterministic intent layer already understands, injected into the LLM prompt for grounding.
+   CRUD is open to the owner (this is the same trust boundary as settings/notes); every write is
+   audited. GET /api/language answers "what can this device actually do?" honestly. */
+api.get('/language', (req, res) => {
+  try { ok(res, { ...dictionary.languageInfo(), phrases: dictionary.stats() }); }
+  catch (e) { fail(res, e, { mode: 'auto', sttLocale: null, sttSupported: true }); }
+});
+
+api.get('/dictionary', (req, res) => {
+  try {
+    const entries = dictionary.list({ lang: req.query.lang, enabledOnly: req.query.enabled === 'true' });
+    ok(res, { ...dictionary.stats(), entries });
+  } catch (e) { fail(res, e, { entries: [], count: 0 }); }
+});
+
+api.post('/dictionary', async (req, res) => {
+  try {
+    const out = await dictionary.add(req.body || {});
+    if (out && out.error) return res.status(400).json({ error: out.error });
+    ok(res, out);
+  } catch (e) { fail(res, e); }
+});
+
+async function updatePhrase(req, res) {
+  try {
+    const out = await dictionary.update(req.params.id, req.body || {});
+    if (!out) return res.status(404).json({ error: 'phrase not found' });
+    if (out.error) return res.status(400).json({ error: out.error });
+    ok(res, out);
+  } catch (e) { fail(res, e); }
+}
+api.put('/dictionary/:id', updatePhrase);
+api.patch('/dictionary/:id', updatePhrase);
+
+api.delete('/dictionary/:id', async (req, res) => {
+  try {
+    const out = await dictionary.remove(req.params.id);
+    if (!out.deleted) return res.status(404).json({ error: 'phrase not found' });
+    ok(res, out);
+  } catch (e) { fail(res, e); }
+});
+
+api.post('/dictionary/reset', async (req, res) => {
+  try { ok(res, { entries: await dictionary.reset(), ...dictionary.stats() }); }
+  catch (e) { fail(res, e, { entries: [] }); }
+});
+
+/* Debug/verification helper: what would the normalizer do with this message? */
+api.post('/dictionary/match', (req, res) => {
+  try {
+    const text = String((req.body || {}).text || '');
+    const applied = dictionary.apply(text);
+    ok(res, { original: applied.original, text: applied.text, matches: applied.matches, changed: applied.text !== applied.original });
+  } catch (e) { fail(res, e, { matches: [] }); }
 });
 
 api.get('/contacts', (req, res) => {

@@ -32,6 +32,7 @@ const dbm = require('./db');
 const brain = require('./brain');
 const memoryMod = require('./memory');
 const learning = require('./learning');
+const dictionary = require('./dictionary');
 const cfgm = require('./config');
 const weblearn = require('./weblearn');
 const websearch = require('./websearch');
@@ -49,6 +50,20 @@ A MEMORY block may be provided: it holds durable facts and preferences about the
 by meaning. Trust it, never contradict it, and never invent memories beyond it. When the user
 states a lasting fact, preference or correction, store it with the remember tool (one short
 sentence — never secrets, PINs, tokens, card numbers or full message bodies).`;
+
+/* LANGUAGE — Swahili / Kikuyu / Sheng grounding (Phase 4). The block is only added when it can
+   change behaviour (a non-English mode, or a dictionary phrase in this message), so an
+   English-only install sends the exact same prompt as before. */
+function systemPromptFor(text) {
+  try {
+    const mode = dictionary.mode();
+    const matched = text ? dictionary.match(text) : null;
+    if (mode === 'en' && !matched) return SYSTEM_PROMPT;
+    return `${SYSTEM_PROMPT}\n\n${dictionary.promptBlock(text)}`;
+  } catch (_) {
+    return SYSTEM_PROMPT;
+  }
+}
 
 /* ════════════════════════════════════════════════════════════════════════
    0. NATURAL PHRASING — strip politeness/filler, then match the intent
@@ -342,13 +357,20 @@ async function respond(message) {
   const resolved = resolveFollowUp(raw, memory);
   const effective = resolved.message || raw;
 
+  /* LANGUAGE NORMALIZATION (Phase 4) — a Swahili/Sheng/Kikuyu command phrase is rewritten into
+     the English phrasing the deterministic layer already understands BEFORE anything routes.
+     The original message is what the model sees; the rewrite is routing sugar. */
+  const lang = dictionary.apply(effective);
+  const routed = lang.text || effective;
+  memory.language = lang;
+
   /* SEMANTIC MEMORY — embed the incoming message, fetch the top memories and inject them into
      the prompt BEFORE the director/assistant reasons. Retrieval also bumps last_accessed. */
   const recalled = await recallMemory(effective);
   const memoryBlock = recalled.text;
 
   let reply, source, intent = null, toolCall = null, extra = {};
-  const pre = await routeIntent(effective, memory);
+  const pre = await routeIntent(routed, memory);
   if (pre) {
     reply = pre.reply;
     intent = pre.intent || null;
@@ -356,7 +378,9 @@ async function respond(message) {
     extra = {
       ...(pre.confirmation ? { confirmation: pre.confirmation } : {}),
       ...(pre.clientAction ? { clientAction: pre.clientAction } : {}),
-      ...(pre.needsConfirmation ? { needsConfirmation: true } : {})
+      ...(pre.needsConfirmation ? { needsConfirmation: true } : {}),
+      /* Which language the reply came back in (Phase 4) — the UI badges it. */
+      ...(pre.language ? { language: pre.language } : {})
     };
   } else {
     /* TOOL PASS FIRST — whatever the deterministic layer did not recognise is offered to the
@@ -385,8 +409,8 @@ async function respond(message) {
       const history = memory.history.filter((h, i) => !(i === memory.history.length - 1 && h.role === 'user'));
       const followUpNote = resolved.isFollowUp ? `\n\n(This message is a FOLLOW-UP. ${resolved.note || ''})` : '';
       const { text, engine: usedEngine } = await llmChat(
-        SYSTEM_PROMPT,
-        `CONTEXT:\n${contextWithMemory}\n\nCURRENT TIME: ${dayLabel(Date.now(), cfg.owner.timezone)} ${timeStr(Date.now(), cfg.owner.timezone)} (${cfg.owner.timezone})\n\nUSER: ${effective}${followUpNote}`,
+        systemPromptFor(effective),
+        `CONTEXT:\n${contextWithMemory}\n\nCURRENT TIME: ${dayLabel(Date.now(), cfg.owner.timezone)} ${timeStr(Date.now(), cfg.owner.timezone)} (${cfg.owner.timezone})\n\nUSER: ${effective}${followUpNote}${lang.note || ''}`,
         history
       );
       if (text) {
@@ -520,6 +544,17 @@ async function routeIntent(msg, memory) {
   const cfg = cfgm.load();
   const tz = (cfg.owner && cfg.owner.timezone) || 'Africa/Nairobi';
   const conv = convState(db);
+
+  /* ---- Language layer (Phase 4) ----
+     A Swahili/Sheng/Kikuyu phrase that is purely social (greeting, thanks, goodbye, help, or the
+     honest "I cannot dial" reply) is answered deterministically in the user's language. A phrase
+     that carries a COMMAND was already rewritten to English before this function was called, so
+     the normal intent layer below handles it. */
+  try {
+    const applied = memory && memory.language ? memory.language : dictionary.apply(m);
+    const scripted = dictionary.scriptedReply(applied.matches, applied);
+    if (scripted) return scripted;
+  } catch (_) {}
 
   /* ---- Automation hub (alarms, reminders, messaging, media, confirmations) ----
      Runs before calendar/task regexes so "set an alarm" is never a meeting, and
@@ -1148,7 +1183,7 @@ async function tryToolPass(message, memory, cfg, memoryBlock = '') {
   for (let iteration = 0; iteration < 5 && Date.now() - started < 45_000; iteration++) {
     let out;
     try {
-      out = await llmChat(SYSTEM_PROMPT,
+      out = await llmChat(systemPromptFor(message),
         `CONTEXT:\n${context}\n\nCURRENT TIME: ${dayLabel(Date.now(), tz)} ${timeStr(Date.now(), tz)} (${tz})\n\nUSER: ${message}`,
         messages, TOOL_DEFS);
     } catch (_) { return null; }
@@ -1767,6 +1802,8 @@ module.exports = {
   respond, offlineEngine, isWebSearchQuery, isPersonalQuery,
   /* natural phrasing */
   stripFiller, matchScheduleRequest, cleanEventTitle, parseRelativeDateTime,
+  /* language layer (Phase 4) */
+  systemPromptFor,
   /* internal actions — shared by the regex layer and LLM tool calls */
   routeIntent, createEvent, createEventFromText, addTask, addTaskFromText, completeTaskByQuery,
   calendarSummary, brainSummary, guessContext,
@@ -1781,5 +1818,4 @@ module.exports = {
   /* autonomous scheduler */
   isPlannerRequest, planTargetDays, generateSchedule, confirmPlan, cancelPlan, moveEvent, removeEvent, findEventByWords,
   /* speech discretion */
-  toSpeechText, redactSensitive, applyDiscretion, parseQueryDay
-};
+  toSpeechText, redactSensitive, applyDiscretion, parseQueryDay, dictionary };

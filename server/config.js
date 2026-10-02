@@ -6,6 +6,7 @@ const store = require('./store');
 const secrets = require('./secrets');
 
 const LLM_PROVIDERS = ['auto', 'ollama', 'openai', 'offline'];
+const LANGUAGES = ['auto', 'en', 'sw', 'ki'];
 const VOICE_GENDERS = ['male', 'female'];
 
 const DEFAULTS = {
@@ -20,6 +21,11 @@ const DEFAULTS = {
      fresh install; the client mirrors it in localStorage 'aria.voiceGender' for an instant,
      per-device switch (Settings → "ARIA's voice"). */
   voiceGender: 'male',
+  /* Language of the conversation (and of ARIA's replies). 'auto' = mirror whatever the user
+     writes in; 'en' | 'sw' | 'ki' pin it. sttLocale overrides the SpeechRecognition locale
+     ('', = derive it from the mode: sw → sw-KE, en → en-KE, ki → none, auto → device default).
+     Kikuyu has NO browser speech recognition — the mic degrades to typed input by design. */
+  language: { mode: 'auto', sttLocale: '' },
   llm: {
     /* 'auto' = cloud (only when a key exists) → local Ollama → built-in offline engine. */
     provider: 'auto',
@@ -105,6 +111,11 @@ function normalize(cfg) {
   }
   out.voiceGender = VOICE_GENDERS.includes(String(out.voiceGender || '').toLowerCase())
     ? String(out.voiceGender).toLowerCase() : DEFAULTS.voiceGender;
+  out.language = merge(clone(DEFAULTS.language), out.language || {});
+  const langMode = String(out.language.mode || 'auto').toLowerCase();
+  out.language.mode = ['auto', 'en', 'sw', 'ki'].includes(langMode) ? langMode : 'auto';
+  out.language.sttLocale = String(out.language.sttLocale || '').trim().slice(0, 20);
+  if (out.language.sttLocale && !/^[a-z]{2}(-[A-Za-z]{2})?$/.test(out.language.sttLocale)) out.language.sttLocale = '';
   out.smtp = merge(clone(DEFAULTS.smtp), out.smtp || {});
   out.brief = merge(clone(DEFAULTS.brief), out.brief || {});
   out.rhythm = merge(clone(DEFAULTS.rhythm), out.rhythm || {});
@@ -183,4 +194,4 @@ async function save(patch) {
 /* Test helper — drops the in-memory cache so the next load() re-reads the store. */
 function _reset() { cache = null; }
 
-module.exports = { init, load, save, normalize, publicConfig, DEFAULTS, _reset };
+module.exports = { init, load, save, normalize, publicConfig, DEFAULTS, LANGUAGES, _reset };

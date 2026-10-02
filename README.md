@@ -24,6 +24,8 @@ Installed, it runs full-screen, works **offline** (your latest brief stays reada
 
 ARIA talks — a real voice greeting plays with your fresh morning brief, priority items announce themselves with a chime + voice, task completions chirp, sends pop. Mute with the **🔊 button** in the sidebar (per-device, remembered).
 
+**Which language?** Settings → *Install · Sound · Notifications* → **Language** switches ARIA between **Auto (mirror me)**, **English (en-KE)**, **Swahili (sw-KE)** and **Kikuyu (ki)** — per device instantly, and server-side as the default for a new device. Kikuyu is honest by design: **no browser recognises Kikuyu speech**, so the mic is disabled, badged ⌨️ and says *type your Kikuyu instead*, while typed Kikuyu (and any phrase you add to the dictionary) works. ARIA answers in the language you used and, when unsure in Kikuyu, falls back to Swahili/English — stated in the reply. TTS picks a Swahili voice when the device has one, then Kenyan English, and stays silently text-only if the device has neither (never an uncaught error). Full guide: **[docs/LANGUAGE_VOICE.md](docs/LANGUAGE_VOICE.md)**.
+
 **Whose voice?** Settings → *Install · Sound · Notifications* → **ARIA's voice** picks a **Male** (default) or **Female** voice, and **▶ Test ARIA's voice** previews it straight away. The choice is stored twice: in `localStorage 'aria.voiceGender'` (instant, per device) and in `settings.voiceGender` (the default a new device adopts). Voice names differ per OS, so ARIA looks for explicitly male voices first (Daniel, Alex, David, Mark, Guy, Fred, Thomas, George, Oliver, Liam, Rishi, Google UK English Male…), keeps the female list for the other setting, and — when a device only offers neutral names — drops the pitch to 0.85 (male) or raises it to 1.05 (female) so ARIA still sounds right.
 
 ## 🔔 Morning notifications on your lock screen
@@ -160,6 +162,26 @@ npm test          # verification suite (jsdom + real HTTP, mocked providers only
 npm start         # http://localhost:3000
 ```
 
+### 🗣️ Swahili, Kikuyu, Sheng — the editable phrase dictionary
+
+A real, editable store (`/api/dictionary`, seeded with 55 phrases) rewrites Swahili/Kikuyu/Sheng
+commands into the English the intent layer already understands — **deterministically, with no model
+round-trip** — and injects the whole vocabulary into the prompt as grounding for anything longer:
+
+```
+"weka kengele kesho asubuhi"  →  set an alarm tomorrow morning   (real alarm created)
+"panga siku yangu"            →  plan my day                     (real plan generated)
+"nikumbushe kupiga simu kesho"→  reminder created · "sahau" → forget that
+"habari ya asubuhi"           →  a Swahili greeting, answered in Swahili
+"wĩ mwega" / "ũhoro waku"     →  a Kikuyu greeting, answered in Swahili (stated honestly)
+"piga simu kwa Kamau"         →  "I cannot place calls — I can set a reminder or draft a message"
+```
+
+Edit or add phrases in **Second Brain → 🗣️ Language & phrases** (add / edit / delete / restore seeds):
+`{ phrase, lang, intent, command }`, where `{rest}` keeps whatever followed the phrase. An owner-added
+Kikuyu command works on the very next message. Details, capability table and the custom-STT future
+path: **[docs/LANGUAGE_VOICE.md](docs/LANGUAGE_VOICE.md)**.
+
 ### 🧠 Semantic memory
 
 Two layers, same idea — recall by meaning, not just keywords:
@@ -201,6 +223,8 @@ secrets blocked · queue) with a **⚙ Learn now** button. Full guide: **[docs/D
 | `POST /api/memory`, `PATCH\|PUT /api/memory/:id`, `DELETE /api/memory/:id` | Store / edit (re-embeds) / delete — all audited. |
 | `POST /api/memory/forget`, `DELETE /api/memory?confirm=true` | *"Forget that"* by id or meaning / clear everything. |
 | `GET /api/learning`, `POST /api/learning/run` | Durable-learning counters + policy / drain the learning queue now. |
+| `GET /api/language` | Honest voice capability table (mode, STT locales, Kikuyu unavailable, TTS fallback). |
+| `GET /api/dictionary`, `POST /api/dictionary`, `PUT\|PATCH\|DELETE /api/dictionary/:id`, `POST /api/dictionary/reset`, `POST /api/dictionary/match` | Phrase dictionary CRUD (Swahili/Kikuyu/Sheng → intents) + seed restore + normalizer debug. |
 
 ### 🗣️ Say it however you like
 
@@ -246,6 +270,7 @@ server/
   phone.js        Android bridge outbox: real device alarms/media via Tasker/MacroDroid + acks
   memory.js       semantic memory: pgvector store (Supabase) / local fallback, hybrid retrieval, forget
   learning.js     durable learning: extraction, noise filter, secret scrubbing, dedupe, conflict supersede, forget
+  dictionary.js   language layer: Swahili/Kikuyu/Sheng phrase dictionary, STT/TTS policy, prompt grounding
   permissions.js  default-deny grants, confirmations, audit
   messaging.js    draft ≠ send, idempotent sends, group deny
   media.js        browser / local audio only

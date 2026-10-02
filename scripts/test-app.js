@@ -1137,6 +1137,130 @@ function check(name, cond, detail) {
   learnMod._reset();
   await memMod.forgetAll();
 
+  console.log('\n[3p] Language, phrase dictionary & voice fallbacks (Phase 4)');
+  const dictMod = require('../server/dictionary');
+  dictMod._reset();
+  const dictList = async () => ((await get('/api/dictionary')).json || {});
+  const phraseOf = (rows, phrase) => (rows || []).find(e => String(e.phrase || '').toLowerCase() === phrase);
+
+  /* ── 1. Seeded dictionary: Swahili, Kikuyu and Sheng are all there ── */
+  const seedDoc = await dictList();
+  check('GET /api/dictionary → 200 with seeded phrases', Array.isArray(seedDoc.entries) && (seedDoc.count || 0) >= 40, JSON.stringify({ count: seedDoc.count }));
+  check('seeds cover Swahili, Kikuyu and Sheng', ['sw', 'ki', 'sheng'].every(l => (seedDoc.byLang || {})[l] > 0), JSON.stringify(seedDoc.byLang));
+  check('the required example phrases are seeded', ['habari ya asubuhi', 'mambo vipi', 'sema', 'asante sana', 'wĩ mwega', 'nĩ wega'].every(p => !!phraseOf(seedDoc.entries, p)), JSON.stringify((seedDoc.entries || []).slice(0, 5).map(e => e.phrase)));
+  check('every seed is flagged as a seed with an intent', (seedDoc.entries || []).every(e => e.source === 'seed' && !!e.intent && !!e.lang));
+  check('the dictionary payload leaks no secrets', !JSON.stringify(seedDoc).includes('apiKey') && !JSON.stringify(seedDoc).includes('service-key'));
+
+  /* ── 2. Normalization: phrase → the English the intent layer already understands ── */
+  const nz = async (text) => (await post('/api/dictionary/match', { text })).json || {};
+  const alarmNz = await nz('weka kengele kesho asubuhi');
+  check('"weka kengele kesho asubuhi" normalizes to a real English alarm command', alarmNz.text === 'set an alarm tomorrow morning' && alarmNz.changed === true, JSON.stringify(alarmNz));
+  check('...and the match carries lang + intent + meaning', alarmNz.matches[0].lang === 'sw' && alarmNz.matches[0].intent === 'alarm-set' && /alarm/i.test(alarmNz.matches[0].note));
+  check('a bare greeting matches without rewriting the text', (await nz('habari')).matches[0].intent === 'greeting' && (await nz('habari')).changed === false);
+  check('longest phrase wins ("habari ya asubuhi", never just "habari")', (await nz('habari ya asubuhi')).matches[0].phrase === 'habari ya asubuhi');
+  check('English messages are untouched by the dictionary', (await nz('plan my day')).changed === false && (await nz('plan my day')).matches.length === 0);
+  check('whole-word matching: "mambojambo" is not a greeting', (await nz('mambojambo')).matches.length === 0);
+  check('a command phrase beats a greeting phrase in the same message', (await nz('habari, weka kengele ya saa mbili')).matches.some(m => m.intent === 'alarm-set'));
+  check('a social phrase before a command is still recorded', (await nz('asante sana, panga siku yangu')).matches.some(m => m.intent === 'plan'));
+
+  /* ── 3. CRUD ── */
+  const added = await post('/api/dictionary', { phrase: 'ongeza kumbukumbu', lang: 'sw', intent: 'remind', command: 'remind me to {rest}', note: 'add a reminder' });
+  check('POST /api/dictionary → 200 with an id', added.status === 200 && /^phrase_/.test((added.json || {}).id || ''), JSON.stringify(added.json));
+  check('the added phrase is persisted and marked as the owner\'s', !!(phraseOf((await dictList()).entries, 'ongeza kumbukumbu')) || ((await dictList()).entries || []).some(e => e.id === added.json.id));
+  check('a duplicate phrase is rejected with 400', (await post('/api/dictionary', { phrase: 'ongeza kumbukumbu', lang: 'sw', intent: 'remind' })).status === 400);
+  check('a phrase without text is rejected', (await post('/api/dictionary', { lang: 'sw' })).status === 400);
+  check('an unknown language is rejected', (await post('/api/dictionary', { phrase: 'test phrase here', lang: 'xx' })).status === 400);
+  const patched = await fetch(base + '/api/dictionary/' + added.json.id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ note: 'add a reminder (edited)', intent: 'remind' }) }).then(r => r.json());
+  check('PATCH /api/dictionary/:id updates the entry', patched.note === 'add a reminder (edited)');
+  check('PATCH on an unknown phrase → 404', (await fetch(base + '/api/dictionary/phrase_nope', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ note: 'x' }) })).status === 404);
+  const custom = await dictList();
+  const customEntry = (custom.entries || []).find(e => e.id === added.json.id);
+  check('a custom entry is tagged source=user', customEntry && customEntry.source === 'user', JSON.stringify(customEntry && customEntry.source));
+  /* A disabled phrase must stop matching. */
+  await fetch(base + '/api/dictionary/' + added.json.id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: false }) });
+  check('a disabled phrase no longer matches', (await nz('ongeza kumbukumbu kununua maziwa')).matches.length === 0);
+  await fetch(base + '/api/dictionary/' + added.json.id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: true }) });
+  check('re-enabling restores matching', (await nz('ongeza kumbukumbu kununua maziwa')).matches[0].intent === 'remind');
+  check('DELETE /api/dictionary/:id removes it', (await fetch(base + '/api/dictionary/' + added.json.id, { method: 'DELETE' })).status === 200 && !((await dictList()).entries || []).some(e => e.id === added.json.id));
+  check('DELETE on an unknown phrase → 404', (await fetch(base + '/api/dictionary/' + added.json.id, { method: 'DELETE' })).status === 404);
+  const editedSeed = (await dictList()).entries.find(e => e.source === 'seed');
+  await fetch(base + '/api/dictionary/' + editedSeed.id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ note: 'temporarily edited' }) });
+  const customBefore = ((await dictList()).entries || []).filter(e => e.source !== 'seed').length;
+  const reset = await post('/api/dictionary/reset', {});
+  const afterReset = await dictList();
+  check('POST /api/dictionary/reset restores the seeds', reset.status === 200 && (afterReset.seed || 0) >= 40);
+  check('reset revives an edited seed', !((afterReset.entries || []).find(e => e.id === editedSeed.id) || {}).note || (afterReset.entries || []).find(e => e.id === editedSeed.id).note !== 'temporarily edited');
+  check('reset keeps the owner\'s own phrases', ((afterReset.entries || []).filter(e => e.source !== 'seed').length) === customBefore);
+  check('dictionary writes are audited', ((await get('/api/audit')).json || []).some(a => a && a.integration === 'dictionary'));
+
+  /* ── 4. Language setting + honest capability report ── */
+  const langDefault = await get('/api/language');
+  check('GET /api/language → 200 with mode + capabilities', langDefault.status === 200 && typeof langDefault.json.mode === 'string');
+  check('Kikuyu STT is reported as unavailable — never claimed', langDefault.json.stt.kikuyu === false && /no Kikuyu|typed/i.test(langDefault.json.stt.note || ''), JSON.stringify(langDefault.json.stt));
+  check('Swahili STT locales are offered (sw-KE first)', /^sw-KE$/.test((langDefault.json.stt.sw || [])[0] || ''), JSON.stringify(langDefault.json.stt.sw));
+  check('Kikuyu STT locale list is empty by design', (langDefault.json.stt.ki || []).length === 0);
+  check('the reply-language policy states the Kikuyu fallback', /fall/i.test(langDefault.json.fallback || '') && /Kikuyu/i.test(langDefault.json.fallback || ''));
+  await post('/api/settings', { language: { mode: 'sw' } });
+  const swLang = (await get('/api/language')).json;
+  check('language mode persists through settings (sw)', (await get('/api/settings')).json.language.mode === 'sw' && swLang.mode === 'sw');
+  check('Swahili mode asks the browser for sw-KE and supports speech', swLang.sttLocale === 'sw-KE' && swLang.sttSupported === true, JSON.stringify({ l: swLang.sttLocale, s: swLang.sttSupported }));
+  check('the server state payload carries the language block', ((await get('/api/state')).json.language || {}).mode === 'sw');
+  await post('/api/settings', { language: { mode: 'ki' } });
+  const kiLang = (await get('/api/language')).json;
+  check('Kikuyu mode reports no STT locale and sttSupported=false', kiLang.sttLocale === null && kiLang.sttSupported === false, JSON.stringify({ l: kiLang.sttLocale, s: kiLang.sttSupported }));
+  check('Kikuyu TTS preference falls back through Swahili → Kenyan English', /ki/.test(String(kiLang.ttsLocales[0])) && kiLang.ttsLocales.length >= 3, JSON.stringify(kiLang.ttsLocales));
+  await post('/api/settings', { language: { mode: 'bogus' } });
+  check('an invalid language mode falls back to auto', (await get('/api/language')).json.mode === 'auto');
+
+  /* ── 5. Prompt injection (grounding for the model) ── */
+  await post('/api/settings', { language: { mode: 'sw' } });
+  const blockSw = asstMod.dictionary.promptBlock('weka kengele');
+  check('the prompt block states the language policy', /LANGUAGE/.test(blockSw) && /Swahili/.test(blockSw) && /code-switching|mixed/i.test(blockSw));
+  check('the prompt block grounds the detected phrase', /weka kengele/.test(blockSw) && /set an alarm/.test(blockSw));
+  check('the prompt block lists the active non-English vocabulary', /PHRASE DICTIONARY/.test(blockSw) && /wĩ mwega/.test(blockSw) && /mambo vipi/.test(blockSw));
+  check('the prompt block forbids inventing Kikuyu', /never invent Kikuyu/i.test(blockSw));
+  const sysSw = asstMod.systemPromptFor('habari');
+  check('a non-English mode appends the language block to the system prompt', /LANGUAGE/.test(sysSw) && /ARIA, the user's private executive assistant/.test(sysSw));
+  await post('/api/settings', { language: { mode: 'en' } });
+  const sysEn = asstMod.systemPromptFor('plan my day');
+  check('English mode + English text sends the original prompt (no bloat)', !/LANGUAGE: the owner/.test(sysEn));
+  check('even in English mode, a detected phrase still grounds the prompt', /PHRASE DICTIONARY/.test(asstMod.systemPromptFor('habari')));
+  await post('/api/settings', { language: { mode: 'auto' } });
+
+  /* ── 6. Normalization → real deterministic intents ── */
+  const say = async (m) => (await post('/api/assistant', { message: m })).json || {};
+  const greet = await say('habari ya asubuhi');
+  check('a Swahili greeting gets a Swahili reply, no model needed', greet.intent === 'dictionary-greeting' && greet.language === 'sw' && /Habari/.test(greet.reply || ''), JSON.stringify(greet).slice(0, 160));
+  check('"asante sana" is answered politely in Swahili', (await say('asante sana')).intent === 'dictionary-thanks');
+  check('"kwaheri" closes politely in Swahili', (await say('kwaheri')).intent === 'dictionary-goodbye');
+  check('the help reply is honest about Kikuyu speech', /Kikuyu/.test((await say('msaada')).reply || '') && /type|typed|kuandika/i.test((await say('msaada')).reply || ''));
+  const kikGreet = await say('wĩ mwega');
+  check('a Kikuyu greeting is answered (Swahili fallback, stated honestly)', kikGreet.intent === 'dictionary-greeting' && /Kikuyu/.test(kikGreet.reply || ''), (kikGreet.reply || '').slice(0, 120));
+  const callReq = await say('piga simu kwa Kamau');
+  check('"piga simu kwa Kamau" does not pretend to place a call', callReq.intent === 'dictionary-call' && /cannot place calls|Siwezi kupiga/i.test(callReq.reply || '') && !/^☎️|dialling|dialing/i.test(callReq.reply || ''), (callReq.reply || '').slice(0, 140));
+  check('"sahau" routes to the real forget flow', (await say('sahau')).intent === 'memory-forget');
+  const rememberSw = await say('kumbuka Kamau ni supplier wangu wa saruji');
+  check('"kumbuka …" stores a memory (the remember intent, not chat)', rememberSw.intent === 'remember' && ((await get('/api/memory')).json || []).some(m => /saruji|Kamau/i.test(m.content)));
+  await say('sahau');
+  check('"panga siku yangu" plans the day deterministically', (await say('panga siku yangu')).intent === 'plan');
+  check('"weka kengele" reaches the alarm flow (no model needed)', /alarm/i.test((await say('weka kengele')).intent || ''));
+  check('"nikumbushe … kesho" reaches the reminder flow', /reminder/i.test((await say('nikumbushe kupiga simu kesho')).intent || ''));
+  const playSw = await say('cheza muziki');
+  check('"cheza muziki" reaches the media flow', /media|play/i.test(playSw.intent || '') || /play/i.test(playSw.reply || ''), JSON.stringify({ i: playSw.intent }));
+  check('the Kikuyu "tiga" maps to pause', /media/i.test((await say('tiga')).intent || ''));
+  const mixedTurn = await say('habari, weka kengele ya saa mbili');
+  check('a greeting plus a command routes to the COMMAND', /alarm/i.test(mixedTurn.intent || ''), JSON.stringify({ i: mixedTurn.intent }));
+  check('an English sentence containing a Swahili word mid-sentence is untouched', (await nz('the meeting notes mention habari and poa as examples')).matches.length === 0);
+  /* Owner-added phrase with {rest} works through the assistant immediately. */
+  const custom2 = await post('/api/dictionary', { phrase: 'ongeza kazi ya', lang: 'sw', intent: 'task-add', command: 'add task {rest}', note: 'add a task' });
+  const customSaid = await say('ongeza kazi ya kuchapa quote ya cement');
+  check('an owner-added phrase routes immediately (no restart)', custom2.status === 200 && /task/i.test(customSaid.intent || ''), JSON.stringify({ i: customSaid.intent, r: (customSaid.reply || '').slice(0, 60) }));
+  await fetch(base + '/api/dictionary/' + custom2.json.id, { method: 'DELETE' });
+
+  /* ── 7. Leaving no trace: mode back to auto for the UI sections ── */
+  await post('/api/settings', { language: { mode: 'auto' } });
+  check('language mode restored to auto for the UI flow', (await get('/api/language')).json.mode === 'auto');
+
   console.log('\n[4] Frontend render (jsdom)');
   const errors = [];
   const vc = new VirtualConsole();
@@ -1213,6 +1337,33 @@ function check(name, cond, detail) {
   await sleep(500);
   learnMod.flush = realFlush;
   check('Learn now triggers an out-of-band learning sweep', uiFlushes >= 1 && !w.document.getElementById('learn-run').disabled, `flushes=${uiFlushes}`);
+  /* ---- phrase dictionary UI (Phase 4) ---- */
+  check('the brain view renders the Language & phrases card', /Language &amp; phrases|Language & phrases/.test(brainHtml2) && !!w.document.getElementById('ph-add'));
+  check('the card lists the seeded Swahili / Kikuyu / Sheng phrases', /wĩ mwega/.test(brainHtml2) && /habari/i.test(brainHtml2) && /mambo vipi/.test(brainHtml2));
+  check('the card states the Kikuyu microphone limitation', /browsers cannot recognise Kikuyu speech|mic is disabled/i.test(brainHtml2));
+  check('the phrase rows carry edit + delete controls', /data-ph-del=/.test(brainHtml2) && /data-ph-edit=/.test(brainHtml2));
+  check('the card offers a seed restore control', !!w.document.getElementById('ph-reset'));
+  w.document.getElementById('ph-phrase').value = 'ongeza kumbukumbu ya';
+  w.document.getElementById('ph-lang').value = 'sw';
+  w.document.getElementById('ph-intent').value = 'remind';
+  w.document.getElementById('ph-command').value = 'remind me to {rest}';
+  w.document.getElementById('ph-note').value = 'add a reminder';
+  w.document.getElementById('ph-add').click();
+  await sleep(900);
+  const dictAfterAdd = await get('/api/dictionary');
+  const uiPhrase = ((dictAfterAdd.json || {}).entries || []).find(e => e.phrase === 'ongeza kumbukumbu ya');
+  check('adding a phrase from the UI stores it in the dictionary', !!uiPhrase && uiPhrase.source === 'user', JSON.stringify(uiPhrase && uiPhrase.intent));
+  if (uiPhrase) {
+    w.location.hash = '#/hub'; await sleep(200);
+    w.location.hash = '#/brain'; await sleep(700);
+    const phDel = w.document.querySelector(`button[data-ph-del="${uiPhrase.id}"]`);
+    check('the saved phrase is rendered as a row', !!phDel);
+    if (phDel) { phDel.click(); await sleep(900); }
+    check('deleting a phrase from the UI removes it', !(((await get('/api/dictionary')).json || {}).entries || []).some(e => e.id === uiPhrase.id));
+  }
+  /* The UI add really is the same pipeline: the new phrase normalizes immediately. */
+  check('the dictionary UI and the normalizer share one store', /alarm-set/.test(JSON.stringify((await post('/api/dictionary/match', { text: 'weka kengele' })).json)));
+
   check('no console errors during the memory UI flow', errors.length === 0, errors.slice(0, 4).join(' | '));
   console.log('\n[5] Agency Swarm UI + voice loop');
   /* Assistant view: the two-way voice loop hangs off #asst-mic and a [data-voice-input] field. */
@@ -1227,6 +1378,7 @@ function check(name, cond, detail) {
   check('wake-word listener is mic/speech aware', !!w.AriaWakeWord && typeof w.AriaWakeWord.busy === 'function' && w.AriaWakeWord.busy() === false);
   /* A spoken transcript must land in the chat and post to the assistant, exactly like typing. */
   let spoke = null;
+  const realSpeak = speech.speak;                 // restored below so later checks use the real one
   speech.speak = (t) => { spoke = t; return Promise.resolve(true); };
   speech.finalize('what are my priorities?');
   await sleep(900);
@@ -1234,6 +1386,7 @@ function check(name, cond, detail) {
   check('spoken transcript is appended to the chat', /what are my priorities\?/i.test(chatHtml));
   check('spoken turn gets an ARIA reply in the transcript', (chatHtml.match(/msg aria/g) || []).length >= 1);
   check('reply is handed to speechSynthesis', typeof spoke === 'string' && spoke.length > 0, String(spoke).slice(0, 40));
+  speech.speak = realSpeak;
 
   console.log('\n[5b] Natural speech filtering (client pipeline)');
   const cfs = (t, o) => w.AriaSpeech.cleanForSpeech(t, o || {});
@@ -1267,6 +1420,7 @@ function check(name, cond, detail) {
   check('final output is rendered', /Agency mission report/i.test(w.document.getElementById('agency-output').textContent || ''));
   check('mission summary is read aloud', typeof agencySpoke === 'string' && agencySpoke.length > 0, String(agencySpoke).slice(0, 40));
   check('recent missions list is refreshed', (w.document.querySelectorAll('#agency-runs .row') || []).length >= 1);
+  w.AriaSpeech.speak = realSpeak;                 // hand the real speaker back to the suite
 
   /* The Hub card hands a mission to the swarm. */
   w.location.hash = '#/hub';
@@ -1345,6 +1499,79 @@ function check(name, cond, detail) {
   w.document.getElementById('set-save').click();
   await sleep(1000);
   check('the voice choice is reversible', (await get('/api/settings')).json.voiceGender === 'male' && w.localStorage.getItem('aria.voiceGender') === 'male');
+
+  console.log('\n[5d] Language modes, TTS fallback & the Kikuyu microphone (Phase 4)');
+  check('language modes are exported to the client', Array.isArray(w.AriaLangModes) && w.AriaLangModes.join(',') === 'auto,en,sw,ki', JSON.stringify(w.AriaLangModes));
+  check('every mode has a human label', ['auto', 'en', 'sw', 'ki'].every(m => /auto|English|Swahili|Kikuyu/i.test(w.AriaLangLabel(m))));
+  /* STT routing — the honest table. */
+  check('STT locale routing: sw → sw-KE', w.AriaSttLocaleFor('sw') === 'sw-KE');
+  check('STT locale routing: en → en-KE', w.AriaSttLocaleFor('en') === 'en-KE');
+  check('STT locale routing: ki → none (no browser supports it)', w.AriaSttLocaleFor('ki') === null && w.AriaSttLocaleFor('auto') === null);
+  /* Voice fallback table — pure, injectable, no real voices needed. */
+  const V = (name, lang) => ({ name, lang });
+  check('Swahili mode picks the Swahili voice when one exists', (w.AriaPickVoiceFor([V('Daniel', 'en-GB'), V('Google Swahili', 'sw-KE')], 'male', 'sw') || {}).name === 'Google Swahili');
+  check('Kikuyu falls back to Swahili when the device has no Kikuyu voice', (w.AriaPickVoiceFor([V('Google Swahili', 'sw-KE'), V('Daniel', 'en-GB')], 'male', 'ki') || {}).name === 'Google Swahili');
+  check('Kikuyu with no Swahili voice falls back to Kenyan English', (w.AriaPickVoiceFor([V('US English', 'en-US'), V('Kenyan English', 'en-KE')], 'male', 'ki') || {}).name === 'Kenyan English');
+  check('English mode prefers en-KE over en-US', (w.AriaPickVoiceFor([V('US English', 'en-US'), V('Kenyan English', 'en-KE')], 'male', 'en') || {}).name === 'Kenyan English');
+  check('gender still wins inside the language pool', (w.AriaPickVoiceFor([V('Google Swahili', 'sw-KE'), V('Swahili Female', 'sw-KE')], 'female', 'sw') || {}).name === 'Swahili Female');
+  check('no voices at all → null (silent fallback, never a throw)', w.AriaPickVoiceFor([], 'male', 'ki') === null && w.AriaPickVoiceFor(null, 'male', 'sw') === null);
+  const silentSpeak = await voice.speak('this device has no speechSynthesis engine');
+  check('with no TTS engine, speaking resolves false instead of throwing', silentSpeak === false);
+
+  /* Settings: the language select persists and explains itself. */
+  const langSel = w.document.getElementById('s-lang');
+  check('Settings renders the Language select', !!langSel && langSel.tagName === 'SELECT');
+  check('the select offers auto / English / Swahili / Kikuyu', !!langSel && [...langSel.options].map(o => o.value).join(',') === 'auto,en,sw,ki', langSel && [...langSel.options].map(o => o.value).join(','));
+  check('the Kikuyu option is labelled typed-only', !!langSel && /typed only/i.test([...langSel.options].find(o => o.value === 'ki').textContent));
+  check('the language hint explains the Kikuyu limitation', /Kikuyu/i.test((w.document.getElementById('lang-hint') || {}).textContent || '') && /type|typed/i.test((w.document.getElementById('lang-hint') || {}).textContent || ''));
+  langSel.value = 'ki';
+  langSel.dispatchEvent(new w.Event('change'));
+  await sleep(200);
+  check('choosing Kikuyu is instant on this device', w.localStorage.getItem('aria.lang') === 'ki' && voice.langMode() === 'ki');
+  check('Kikuyu mode reports the microphone as unsupported', voice.sttSupported() === false && voice.sttLocale() === null);
+  check('the hint text updates to the typed-only explanation', /mic is disabled|type your Kikuyu|typed/i.test((w.document.getElementById('lang-hint') || {}).textContent || ''));
+  w.document.getElementById('set-save').click();
+  await sleep(1000);
+  check('Save all persists the language server-side', ((await get('/api/settings')).json || {}).language.mode === 'ki');
+  langSel.value = 'sw';
+  langSel.dispatchEvent(new w.Event('change'));
+  await sleep(200);
+  check('switching to Swahili sets sw-KE on this device', w.localStorage.getItem('aria.lang') === 'sw' && voice.sttLocale() === 'sw-KE' && voice.sttSupported() === true);
+  w.document.getElementById('set-save').click();
+  await sleep(1000);
+  check('Swahili persists too', ((await get('/api/settings')).json || {}).language.mode === 'sw');
+
+  /* Assistant view: the mic degrades cleanly for Kikuyu and works for Swahili. */
+  voice.setLanguage('ki');
+  w.location.hash = '#/assistant';
+  w.dispatchEvent(new w.HashChangeEvent('hashchange'));
+  await sleep(600);
+  const micKi = w.document.getElementById('asst-mic');
+  check('Kikuyu mode disables the mic and badges it as typed-only', !!micKi && micKi.disabled === true && micKi.dataset.stt === 'unsupported', JSON.stringify({ d: micKi && micKi.disabled, s: micKi && micKi.dataset.stt }));
+  check('the Kikuyu mic explains itself in its title', !!micKi && /Kikuyu/i.test(micKi.title) && /type/i.test(micKi.title));
+  check('the mic status line tells the user to type', /type your command/i.test((w.document.getElementById('mic-status') || {}).textContent || ''));
+  const recBefore = voice.rec;
+  micKi.click();
+  await sleep(200);
+  check('clicking the mic in Kikuyu mode never starts recognition', voice.listening === false && voice.rec === recBefore);
+
+  /* A Swahili microphone is really created with lang=sw-KE. */
+  voice.setLanguage('sw');
+  await sleep(200);
+  const micSw = w.document.getElementById('asst-mic');
+  check('Swahili mode keeps the mic enabled and shows the locale', !!micSw && micSw.disabled === false && micSw.dataset.stt === 'ready' && voice.sttLocale() === 'sw-KE');
+  class FakeSR { constructor() { this.lang = 'x'; } start() {} stop() {} }
+  w.SpeechRecognition = FakeSR;
+  const fakeRec = voice.create();
+  check('the created recognizer asks the browser for sw-KE', fakeRec && fakeRec.lang === 'sw-KE', fakeRec && fakeRec.lang);
+  voice.setLanguage('en');
+  check('English mode asks for en-KE', voice.create().lang === 'en-KE');
+  w.SpeechRecognition = undefined;
+  voice.setLanguage('auto');
+  await post('/api/settings', { language: { mode: 'auto' } });
+  w.location.hash = '#/hub'; await sleep(200);
+  check('language mode restored to auto on the client and server',
+    voice.langMode() === 'auto' && ((await get('/api/settings')).json || {}).language.mode === 'auto');
   console.log('\n[6] Tool-calling loop end-to-end (mock model server)');
   /* A fake Ollama that answers with a tool call for one phrasing and with plain prose for
      another. ARIA must (a) EXECUTE the tool for real and reply with the record it wrote, and
