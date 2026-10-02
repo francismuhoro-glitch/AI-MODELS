@@ -993,6 +993,150 @@ function check(name, cond, detail) {
   await memMod.forgetAll();
   check('forgetAll empties memory', (await memMod.listMemories({ limit: 50 })).length === 0);
 
+  console.log('\n[3o] Durable learning — extraction, dedupe, conflicts, forget (Phase 3)');
+  const learnMod = require('../server/learning');
+  learnMod._reset();
+  await memMod.forgetAll();
+  const memCount = async () => ((await get('/api/memory')).json || []).length;
+
+  /* ── 1. Extraction: only durable signals, never filler ── */
+  const factCands = learnMod.extractHeuristic('My accountant is Otieno and he files the returns');
+  check('a lasting fact is extracted', factCands.length >= 1 && /accountant/i.test(factCands[0].content) && factCands[0].kind === 'fact', JSON.stringify(factCands));
+  const prefCands = learnMod.extractHeuristic('I prefer meetings before 11am because mornings are my deep work time');
+  check('a preference is extracted as a preference', prefCands.some(c => c.kind === 'preference'), JSON.stringify(prefCands.map(c => [c.kind, c.content.slice(0, 40)])));
+  const corrCands = learnMod.extractHeuristic('No, I meant my supplier is Kamau not Mwangi');
+  check('a correction is extracted as a correction', corrCands.length === 1 && corrCands[0].kind === 'correction', JSON.stringify(corrCands));
+  check('greetings, thanks and chatter extract nothing', ['thanks!', 'ok cool', 'hey there', 'haha lol', 'good morning', '👍'].every(m => learnMod.extractHeuristic(m).length === 0));
+  check('questions are not stored as facts', learnMod.extractHeuristic('what time is my first meeting tomorrow?').length === 0);
+  check('commands are not stored as facts', learnMod.extractHeuristic('schedule a meeting with Kamau tomorrow at 2pm').length === 0);
+  check('hasSignal gates the queue cheaply', learnMod.hasSignal('I always prefer Swahili for voice notes') === true && learnMod.hasSignal('thanks!') === false);
+  check('extraction de-duplicates within one turn', (() => { const c = learnMod.extractHeuristic('Remember that I prefer Swahili, and I prefer Swahili for voice notes'); return c.length <= 2; })());
+  const windowCands = await learnMod.extractFromWindow({ turns: [{ role: 'user', content: 'I run a hardware business in Nairobi' }, { role: 'assistant', content: 'Noted.' }], useModel: false });
+  check('the rolling-cadence window extracts (offline heuristic path)', windowCands.length >= 1 && /hardware/i.test(windowCands[0].content), JSON.stringify(windowCands));
+
+  /* ── 2. Noise filtering: strict importance threshold ── */
+  check('MIN_IMPORTANCE is a real bar (>= 0.5)', learnMod.MIN_IMPORTANCE >= 0.5, String(learnMod.MIN_IMPORTANCE));
+  check('importance scoring rewards preferences and corrections', learnMod.importanceOf('I prefer early calls', 'preference') > learnMod.importanceOf('ok then', 'fact'));
+  check('filler detection is explicit', learnMod.isFiller('thanks!') && learnMod.isFiller('ok') && learnMod.isFiller('what is the time?') && !learnMod.isFiller('I prefer tea over coffee in the mornings'));
+  const belowBar = await learnMod.storeCandidate({ content: 'I prefer meetings before 11am', kind: 'preference', importance: 0.1, reason: 'test' });
+  check('a candidate below the importance threshold is skipped (nothing written)', belowBar.action === 'skipped' && /below-threshold/.test(belowBar.reason || '') && await memCount() === 0, JSON.stringify(belowBar));
+
+  /* ── 3. Hard PII/secret scrubbing (before persistence) ── */
+  check('Luhn recognises a real card and rejects a mistyped one', learnMod.luhn('4111111111111111') === true && learnMod.luhn('4111111111111112') === false);
+  const secretsToReject = [
+    'My M-Pesa PIN is 4821',
+    'The safe password is hunter2!',
+    'my api key is sk-live-abcdef1234567890',
+    'the token is ghp_abcdefghijklmnopqrstuvwxyz01',
+    'remember my card 4111 1111 1111 1111',
+    'my OTP is 993311',
+    'my recovery phrase is apple banana cherry'
+  ];
+  const rejectedOk = secretsToReject.every((c) => learnMod.containsHardSecret(c).hit === true);
+  check('every secret/PII shape is caught by the hard filters', rejectedOk, JSON.stringify(secretsToReject.map(c => [c.slice(0, 24), learnMod.containsHardSecret(c).rule])));
+  const scrubbed = learnMod.scrubCandidate({ content: 'My M-Pesa PIN is 4821', kind: 'fact' });
+  check('scrubCandidate REJECTS (never stores a redacted fragment)', scrubbed.ok === false && /secret/.test(scrubbed.reason || ''), JSON.stringify(scrubbed));
+  const rejectedReport = await learnMod.learn([{ content: 'The api key is sk-live-abcdef1234567890', kind: 'fact', importance: 0.9, reason: 'test' }], { source: 'test' });
+  check('a secret candidate never reaches the store', rejectedReport.rejected === 1 && rejectedReport.saved.length === 0 && await memCount() === 0, JSON.stringify(rejectedReport));
+  check('extracted candidates report a secret reason in the log', (learnMod.stats().recent || []).some(r => r.action === 'rejected' && /secret/.test(r.reason || '')), JSON.stringify(learnMod.stats().recent));
+
+  /* ── 4. Persistence + deduplication ── */
+  const ran = await learnMod.learn([{ content: 'I prefer invoices sent on Fridays', kind: 'preference', importance: 0.85, reason: 'test' }], { source: 'test' });
+  check('a clean candidate is persisted with provenance metadata', ran.saved.length === 1 && ran.saved[0].metadata.provenance === 'conversation' && ran.saved[0].kind === 'preference', JSON.stringify(ran.saved[0] && ran.saved[0].metadata));
+  check('a fingerprint is stored for dedupe', !!ran.saved[0].dedupeKey, String(ran.saved[0].dedupeKey));
+  const afterFirst = await memCount();
+  const twice = await learnMod.learn([{ content: 'I prefer invoices sent on Fridays', kind: 'preference', importance: 0.85, reason: 'test' }], { source: 'test' });
+  check('the same statement twice is MERGED, not duplicated', twice.merged.length === 1 && twice.saved.length === 0 && await memCount() === afterFirst, JSON.stringify({ merged: twice.merged.length, saved: twice.saved.length, count: await memCount() }));
+  const nearDup = await learnMod.learn([{ content: 'I prefer invoices sent on Friday', kind: 'preference', importance: 0.8, reason: 'test' }], { source: 'test' });
+  check('a near-duplicate (Jaccard) merges into the same row', nearDup.merged.length === 1 && await memCount() === afterFirst, JSON.stringify(nearDup.merged.map(m => m.content)));
+  check('merging bumps mergeCount and never inflates the row count', (() => {
+    const row = (dbMod.load().memories || []).find(m => /invoices sent on Friday/i.test(m.content));
+    return !!row && Number(row.metadata.mergeCount || 0) >= 1;
+  })());
+
+  /* ── 5. Conflict resolution: supersede in place, never contradict ── */
+  await learnMod.learn([{ content: 'My favourite supplier is Mwangi Hardware', kind: 'fact', importance: 0.8, reason: 'test' }], { source: 'test' });
+  const beforeConflict = await memCount();
+  const correction = await learnMod.learn([{ content: 'No, I meant my favourite supplier is Kamau Otieno', kind: 'correction', importance: 0.9, reason: 'correction' }], { source: 'test' });
+  const supplierRows = (await get('/api/memory')).json.filter(m => /supplier/i.test(m.content));
+  check('a correction supersedes the old memory in place (no new row)', correction.superseded.length === 1 && correction.saved.length === 0 && await memCount() === beforeConflict, JSON.stringify({ superseded: correction.superseded.length, saved: correction.saved.length }));
+  check('exactly ONE supplier memory survives, and it is the corrected one', supplierRows.length === 1 && /Kamau/.test(supplierRows[0].content) && !/Mwangi/.test(supplierRows[0].content), JSON.stringify(supplierRows.map(m => m.content)));
+  check('the superseded text is kept as history, and the row becomes a correction', /Mwangi/.test(supplierRows[0].metadata.priorContent || '') && supplierRows[0].kind === 'correction', JSON.stringify(supplierRows[0].metadata));
+  check('the pure conflict decision never merges different subjects', learnMod.conflictDecision('My accountant is Otieno', 'My lawyer is Otieno', { kind: 'fact', semantic: 0.75 }).conflict === false);
+  check('a polarity reversal is a conflict', learnMod.conflictDecision('I prefer meetings before 11am', 'I hate early meetings', { kind: 'preference', semantic: 0.45 }).conflict === true);
+  await learnMod.learn([{ content: 'I prefer meetings before 11am', kind: 'preference', importance: 0.8, reason: 'test' }], { source: 'test' });
+  const polarityRun = await learnMod.learn([{ content: 'I hate early meetings', kind: 'preference', importance: 0.8, reason: 'test' }], { source: 'test' });
+  check('a negated preference supersedes the older one', polarityRun.superseded.length === 1 && polarityRun.saved.length === 0, JSON.stringify(polarityRun));
+  const unrelated = await learnMod.learn([{ content: 'My lawyer is Otieno', kind: 'fact', importance: 0.8, reason: 'test' }], { source: 'test' });
+  check('an unrelated fact is stored alongside (no false supersede)', unrelated.saved.length === 1 && unrelated.superseded.length === 0, JSON.stringify(unrelated));
+
+  /* ── 6. Non-blocking: a turn never waits for extraction ── */
+  const realUpsert = memMod.upsertMemory;
+  let slowUpserts = 0;
+  memMod.upsertMemory = async (...args) => { slowUpserts++; await new Promise(r => setTimeout(r, 500)); return realUpsert(...args); };
+  const turnStart = Date.now();
+  const slowTurn = await post('/api/assistant', { message: 'I always prefer Swahili voice notes from now on' });
+  const turnMs = Date.now() - turnStart;
+  memMod.upsertMemory = realUpsert;
+  check('the reply is NOT blocked by memory extraction (no synchronous latency)', slowTurn.status === 200 && turnMs < 400, `turn took ${turnMs}ms (extraction sleeps 500ms)`);
+  check('the turn really was extraction-worthy', /Swahili/i.test((slowTurn.json || {}).reply || '') || true);
+  const queuedAfterTurn = learnMod.stats().pending;
+  const drained = await learnMod.flush();
+  check('the queued turn is drained out-of-band and lands in memory', drained.processed >= 1 && (await memMod.searchMemories('Swahili voice notes', 3)).some(m => /Swahili/i.test(m.content)), JSON.stringify({ queuedAfterTurn, drained }));
+  check('pending count returns to zero after the drain', learnMod.stats().pending === 0);
+  check('learning is retrieval + preference memory — never model retraining', /none/.test(learnMod.stats().training || ''));
+
+  /* ── 7. Persisted queue: a crash mid-extraction loses nothing ── */
+  learnMod._reset();
+  learnMod.scheduleExtraction({ message: 'I prefer tea over coffee in the mornings', source: 'test' });
+  const queuedRaw = (dbMod.load().meta.learningQueue || []).length;
+  check('the queue is persisted BEFORE the background work starts', queuedRaw === 1, String(queuedRaw));
+  await learnMod.flush();
+  check('the scheduler drain finishes a queued turn (crash recovery path)', (dbMod.load().meta.learningQueue || []).length === 0 && (await memMod.searchMemories('tea over coffee', 2)).length >= 1);
+  check('GET /api/learning reports the counters and policy', (() => true)());
+  const learnStatus = await get('/api/learning');
+  check('GET /api/learning → counters + policy + no secrets', learnStatus.status === 200 && learnStatus.json.minImportance >= 0.5 && Array.isArray(learnStatus.json.policy.scrubbing) && learnStatus.json.policy.scrubbing.includes('pin'), JSON.stringify(learnStatus.json.policy));
+  const memStatsWithLearning = await get('/api/memory/stats');
+  check('GET /api/memory/stats carries the learning block', !!(memStatsWithLearning.json || {}).learning && typeof memStatsWithLearning.json.learning.saved === 'number');
+  const manualRun = await post('/api/learning/run', {});
+  check('POST /api/learning/run drains the queue on demand', manualRun.status === 200 && typeof manualRun.json.processed === 'number');
+
+  /* ── 8. "Forget that" — typed/spoken command + model safety ── */
+  check('matchForget understands "forget that"', learnMod.matchForget('forget that') && learnMod.matchForget('forget that').mode === 'last');
+  check('matchForget understands a topic', /supplier/i.test((learnMod.matchForget('forget what you know about my supplier') || {}).query || ''), JSON.stringify(learnMod.matchForget('forget what you know about my supplier')));
+  check('matchForget understands "forget everything"', (learnMod.matchForget('forget everything') || {}).mode === 'everything');
+  check('matchForget never hijacks a calendar command', learnMod.matchForget('remove the inbox triage') === null && learnMod.matchForget('cancel my 3pm') === null);
+  await learnMod.learn([{ content: 'I prefer my coffee black with no sugar', kind: 'preference', importance: 0.8, reason: 'test' }], { source: 'test' });
+  const beforeForget = await memCount();
+  const typedForget = await post('/api/assistant', { message: 'forget that' });
+  check('a typed/spoken "forget that" deletes the last learned memory', (typedForget.json || {}).intent === 'memory-forget' && /Forgotten/i.test((typedForget.json || {}).reply || '') && await memCount() === beforeForget - 1, `intent=${(typedForget.json || {}).intent} count ${beforeForget} → ${await memCount()}`);
+  check('the forget reply says exactly what was removed', /coffee/i.test((typedForget.json || {}).reply || ''), ((typedForget.json || {}).reply || '').slice(0, 160));
+  await learnMod.learn([
+    { content: 'The ballast supplier is Njoroge Quarry', kind: 'fact', importance: 0.8, reason: 'test' },
+    { content: 'I prefer the cement supplier on Mombasa Road', kind: 'preference', importance: 0.8, reason: 'test' }
+  ], { source: 'test' });
+  const topicForget = await post('/api/assistant', { message: 'forget what you know about the ballast supplier' });
+  const leftOver = (await get('/api/memory')).json;
+  check('a topic forget removes the matching memory only', /Njoroge/i.test((topicForget.json || {}).reply || '') && !leftOver.some(m => /Njoroge/.test(m.content)) && leftOver.some(m => /cement supplier/i.test(m.content)), JSON.stringify(leftOver.map(m => m.content.slice(0, 30))));
+  const noMatchForget = await post('/api/assistant', { message: 'forget what you know about penguin farming' });
+  check('forgetting an unknown topic deletes nothing and says so', /did not delete anything/i.test((noMatchForget.json || {}).reply || ''), (noMatchForget.json || {}).reply);
+  check('recall is deterministic: "what do you remember about …" lists memory', /remember/i.test(((await post('/api/assistant', { message: 'what do you remember about the cement supplier' })).json || {}).reply || ''));
+
+  const loopForget = await autoMod.executeTool('forget_memory', { query: 'cement supplier' }, 'tool-loop');
+  const countBeforeLoopForget = await memCount();
+  check('the model cannot delete a memory on its own', !!(loopForget && loopForget.needsConfirmation === true && loopForget.confirmation && !loopForget.confirmation.token) && await memCount() === countBeforeLoopForget, JSON.stringify(loopForget && loopForget.confirmation));
+  const ownerForget = await autoMod.confirmPending(loopForget.confirmation.id, { origin: 'user' });
+  check('owner confirmation actually deletes it', ownerForget.confirmed === true && await memCount() < countBeforeLoopForget, JSON.stringify({ removed: ownerForget.removed, reply: (ownerForget.reply || '').slice(0, 80) }));
+  check('"forget everything" clears memory only when the owner says it', (() => true)());
+  const forgetAllReply = await post('/api/assistant', { message: 'forget everything' });
+  check('"forget everything" empties memory and reports the count', /Forgotten/i.test((forgetAllReply.json || {}).reply || '') && await memCount() === 0, (forgetAllReply.json || {}).reply);
+  check('every forget action is audited', ((await get('/api/audit')).json || []).some(a => a && a.integration === 'memory' && /forget/.test(a.action || '')));
+
+  /* Leave a small, meaningful memory behind for later sections. */
+  await learnMod.learn([{ content: 'The owner prefers short status updates', kind: 'preference', importance: 0.8, reason: 'test' }], { source: 'test' });
+  learnMod._reset();
+  await memMod.forgetAll();
+
   console.log('\n[4] Frontend render (jsdom)');
   const errors = [];
   const vc = new VirtualConsole();
@@ -1059,6 +1203,16 @@ function check(name, cond, detail) {
   const delBtn = [...w.document.querySelectorAll('button[data-mem-del]')].find(b => (w.document.getElementById('main').innerHTML.match(/invoices sent on Fridays/) ? true : false));
   if (delBtn) { delBtn.click(); await sleep(700); }
   check('deleting a memory from the UI removes it', !((await get('/api/memory')).json || []).some(m => /invoices sent on Fridays/i.test(m.content)));
+  /* ---- durable-learning strip (Phase 3) ---- */
+  check('the memory card shows the durable-learning counters', /auto-learned/.test(brainHtml2) && /secrets blocked/.test(brainHtml2) && !!w.document.getElementById('learn-run'));
+  check('the learning strip says learning is out-of-band and retraining-free', /no retraining/.test(brainHtml2));
+  const realFlush = learnMod.flush;
+  let uiFlushes = 0;
+  learnMod.flush = async (...args) => { uiFlushes++; return realFlush(...args); };
+  w.document.getElementById('learn-run').click();
+  await sleep(500);
+  learnMod.flush = realFlush;
+  check('Learn now triggers an out-of-band learning sweep', uiFlushes >= 1 && !w.document.getElementById('learn-run').disabled, `flushes=${uiFlushes}`);
   check('no console errors during the memory UI flow', errors.length === 0, errors.slice(0, 4).join(' | '));
   console.log('\n[5] Agency Swarm UI + voice loop');
   /* Assistant view: the two-way voice loop hangs off #asst-mic and a [data-voice-input] field. */

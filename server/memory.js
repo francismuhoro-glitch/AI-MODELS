@@ -247,10 +247,10 @@ async function candidates(queryVector, { limit = 24, threshold = 0.05, query = '
 
 /**
  * Hybrid retrieval: embed the query, pull candidates, blend BM25 with cosine similarity,
- * bump last_accessed for everything returned.
+ * bump last_accessed for everything returned (unless { touch: false }).
  * @returns {Promise<Array<object>>} ranked memories (public shape + `bm25`/`semantic`/`blended`)
  */
-async function searchMemories(query, limit = DEFAULT_LIMIT) {
+async function searchMemories(query, limit = DEFAULT_LIMIT, opts = {}) {
   const q = String(query || '').trim();
   const n = Math.max(1, Math.min(50, Number(limit) || DEFAULT_LIMIT));
   if (!q) return [];
@@ -278,7 +278,9 @@ async function searchMemories(query, limit = DEFAULT_LIMIT) {
     .sort((a, b) => b.rank - a.rank || b.blended - a.blended)
     .slice(0, n)
     .map(({ rank, ...rest }) => rest);
-  if (out.length) touchMemories(out.map((m) => m.id)).catch(() => {});
+  /* Retrieval bookkeeping — callers that are only *inspecting* (dedupe, conflict checks,
+     "what do you remember") pass { touch: false } so reading does not fake usage. */
+  if (out.length && opts.touch !== false) touchMemories(out.map((m) => m.id)).catch(() => {});
   return out;
 }
 
@@ -365,7 +367,11 @@ async function getMemory(id) {
 
 /**
  * Edit a memory. Changing `content` re-embeds it (dimension-safe); metadata/kind/importance
- * updates are cheap. `dedupeKey` collisions are resolved by writing null (never break an edit).
+ * updates are cheap.
+ *  • metadata      → replaces the metadata object
+ *  • metadataMerge → shallow-merges into the existing metadata (used by learning.js to record
+ *                    priorContent / mergeCount / supersede provenance without losing history)
+ *  • dedupeKey     → set the (unique) fingerprint; a collision just leaves the old key alone
  */
 async function updateMemory(id, patch = {}) {
   const key = String(id || '').trim();
@@ -377,7 +383,12 @@ async function updateMemory(id, patch = {}) {
     kind: patch.kind !== undefined ? normalizeKind(patch.kind) : current.kind,
     importance: patch.importance !== undefined ? normalizeImportance(patch.importance, patch.kind !== undefined ? normalizeKind(patch.kind) : current.kind) : current.importance,
     source: patch.source !== undefined ? String(patch.source).slice(0, 40) : current.source,
-    metadata: patch.metadata && typeof patch.metadata === 'object' ? patch.metadata : current.metadata,
+    metadata: patch.metadata && typeof patch.metadata === 'object'
+      ? patch.metadata
+      : (patch.metadataMerge && typeof patch.metadataMerge === 'object'
+        ? { ...(current.metadata || {}), ...patch.metadataMerge }
+        : current.metadata),
+    dedupeKey: patch.dedupeKey !== undefined ? (patch.dedupeKey ? String(patch.dedupeKey).slice(0, 200) : null) : current.dedupeKey,
     expiresAt: patch.expiresAt !== undefined ? (patch.expiresAt ? new Date(patch.expiresAt).toISOString() : null) : current.expiresAt
   };
   if (!next.content) return null;
@@ -389,6 +400,7 @@ async function updateMemory(id, patch = {}) {
     importance: next.importance,
     source: next.source,
     metadata: next.metadata,
+    dedupe_key: next.dedupeKey || null,
     expires_at: next.expiresAt,
     updated_at: new Date().toISOString(),
     ...(isVector(vec) ? { embedding: vec } : {})
@@ -410,7 +422,7 @@ async function updateMemory(id, patch = {}) {
   const list = localList();
   const idx = list.findIndex((m) => m && m.id === key);
   if (idx < 0) return null;
-  list[idx] = { ...list[idx], ...row, id: key, dedupe_key: list[idx].dedupe_key };
+  list[idx] = { ...list[idx], ...row, id: key, dedupe_key: row.dedupe_key || list[idx].dedupe_key || null };
   try { await dbm.saveNow(); } catch (_) {}
   return publicMemory(list[idx]);
 }

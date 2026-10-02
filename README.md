@@ -173,11 +173,34 @@ supabase/migrations/20261002085317_aria_memory.sql   # paste once in the Supabas
 
 Manage them in **Second Brain → 🧠 Long-term memory** (add / search / edit / delete), or say *"remember that …"* / *"forget that"*. Secrets never reach memory: every write is redacted first. Full guide: **[docs/SEMANTIC_MEMORY.md](docs/SEMANTIC_MEMORY.md)**.
 
+#### 🌱 Durable learning — ARIA learns from the conversation
+
+ARIA **extracts lasting facts, preferences and corrections on its own** and stores them as memories —
+no model is ever retrained, learning is retrieval + preference memory (`server/learning.js`):
+
+* **Never blocks a reply.** Extraction is queued out-of-band (the queue is persisted first, drained
+  on the next tick and by an hourly sweep at :07 — it survives serverless freezes). Every 12 turns the
+  rolling summary window is also offered to the model for JSON extraction; offline, heuristics do it.
+* **Filtered hard.** Greetings, thanks, questions and commands are dropped; nothing below
+  `MIN_IMPORTANCE 0.55` is stored. PINs, passwords, OTPs, API keys/tokens, card numbers (Luhn-checked)
+  and recovery phrases are **rejected before persistence**, never stored in redacted form.
+* **Deduped and reconciled.** Near-duplicates merge into one row (Jaccard ≥ 0.86 or cosine ≥ 0.93),
+  and a correction **supersedes in place** — *"no, I meant Kamau not Mwangi"* leaves one supplier
+  memory, with the old text kept in `metadata.priorContent`. *"My accountant is Otieno"* vs *"my
+  lawyer is Otieno"* is explicitly never a conflict.
+* **Forgettable.** *"forget that"*, *"forget what you know about my supplier"*, *"forget
+  everything"* — the reply states exactly what was removed. The model itself can only *propose* a
+  forget; it takes an owner confirmation to delete.
+
+The Second Brain memory card shows the counters (auto-learned · merged · superseded · skipped noise ·
+secrets blocked · queue) with a **⚙ Learn now** button. Full guide: **[docs/DURABLE_LEARNING.md](docs/DURABLE_LEARNING.md)**.
+
 | Endpoint | What it does |
 |---|---|
 | `GET /api/memory`, `GET /api/memory/stats`, `GET /api/memory/search?q=` | List / backend+dimension / hybrid search. |
 | `POST /api/memory`, `PATCH\|PUT /api/memory/:id`, `DELETE /api/memory/:id` | Store / edit (re-embeds) / delete — all audited. |
 | `POST /api/memory/forget`, `DELETE /api/memory?confirm=true` | *"Forget that"* by id or meaning / clear everything. |
+| `GET /api/learning`, `POST /api/learning/run` | Durable-learning counters + policy / drain the learning queue now. |
 
 ### 🗣️ Say it however you like
 
@@ -222,6 +245,7 @@ server/
   alarms.js       browser-notification alarms & reminders (never a device alarm)
   phone.js        Android bridge outbox: real device alarms/media via Tasker/MacroDroid + acks
   memory.js       semantic memory: pgvector store (Supabase) / local fallback, hybrid retrieval, forget
+  learning.js     durable learning: extraction, noise filter, secret scrubbing, dedupe, conflict supersede, forget
   permissions.js  default-deny grants, confirmations, audit
   messaging.js    draft ≠ send, idempotent sends, group deny
   media.js        browser / local audio only

@@ -38,9 +38,13 @@ function start() {
     } catch (e) { console.error('[scheduler] alarm tick failed:', e.message); }
   }, { timezone: tz }));
 
-  // Memory hygiene: expire low-importance, unused memories (Phase 3 policy lives in memory.js).
+  // Memory hygiene + durable learning: drain anything the reply path queued but did not finish
+  // (serverless freezes, a crash mid-extraction), then expire stale low-importance memories.
   jobs.push(cron.schedule('7 * * * *', async () => {
     try {
+      const learning = require('./learning');
+      const learned = await learning.flush();
+      if (learned.processed) console.log(`[scheduler] learning: ${learned.saved} saved, ${learned.merged} merged, ${learned.superseded} superseded`);
       const memory = require('./memory');
       const r = await memory.expireStale();
       if (r.expired) console.log(`[scheduler] expired ${r.expired} stale memory item(s)`);

@@ -1150,9 +1150,19 @@ async function viewBrain(main) {
   const notes = A(rawNotes);
   const memories = A(rawMem);
   const memStats = rawMemStats && typeof rawMemStats === 'object' ? rawMemStats : { backend: 'local', dim: 768, count: memories.length };
+  const learn = (memStats && memStats.learning) || null;
   main.innerHTML = `<div class="view-head"><div><h1>Second Brain</h1><div class="sub">${notes.length} notes · ${memories.length} memories · grows automatically from briefs, emails & messages</div></div></div>
     <div class="card" id="memory-card"><h3>🧠 Long-term memory <span class="chip ${memStats.backend === 'supabase' ? 'green' : 'blue'}">${esc(memStats.backend)}</span> <span class="chip">${esc(String(memStats.dim))}-dim</span></h3>
       <p style="color:var(--dim);font-size:12.5px;margin:0 0 10px">Durable facts, preferences and corrections ARIA recalls by meaning on every turn (top ${6} injected before it reasons). Embeddings run <strong>cloud → Ollama → lexical</strong>; none of it stores secrets, PINs, tokens, card numbers or full messages. Edit or delete anything here — or just say <em>“forget that”</em>.</p>
+      ${learn ? `<div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:11.5px;color:var(--dim);margin:0 0 8px">
+        <span class="chip green">🧠 auto-learned ${esc(String(learn.saved || 0))}</span>
+        <span class="chip">merged ${esc(String(learn.merged || 0))}</span>
+        <span class="chip">superseded ${esc(String(learn.superseded || 0))}</span>
+        <span class="chip">skipped noise ${esc(String(learn.skipped || 0))}</span>
+        <span class="chip red">secrets blocked ${esc(String(learn.rejected || 0))}</span>
+        <span class="chip ${learn.pending ? 'blue' : ''}">queue ${esc(String(learn.pending || 0))}</span>
+        <button class="btn small" id="learn-run">⚙ Learn now</button>
+        <span style="font-family:var(--mono);font-size:10px;color:var(--faint)">extraction is out-of-band · no retraining</span></div>` : ''}
       <div class="form-grid" style="grid-template-columns:2fr auto auto;align-items:end">
         <label class="field">Teach ARIA something durable<input id="mem-content" placeholder="e.g. Kamau is my cement supplier — negotiate prices quarterly"></label>
         <label class="field">Kind<select id="mem-kind"><option value="fact">fact</option><option value="preference">preference</option><option value="correction">correction</option></select></label>
@@ -1259,6 +1269,14 @@ async function viewBrain(main) {
     });
   };
   bindMemRows();
+  if ($('#learn-run')) $('#learn-run').onclick = async (ev) => {
+    ev.preventDefault();
+    const btn = $('#learn-run');
+    btn.disabled = true;
+    const swept = await POST('/api/learning/run', {}).catch(() => null);
+    btn.disabled = false;
+    toast(`🧠 Learning sweep done — processed ${(swept && swept.processed) || 0} queued turn(s)`);
+  };
   if ($('#mem-add')) $('#mem-add').onclick = async () => {
     const content = $('#mem-content').value.trim();
     if (!content) return toast('Write the memory first');

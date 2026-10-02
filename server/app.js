@@ -28,6 +28,7 @@ const messaging = require('./messaging');
 const media = require('./media');
 const phone = require('./phone');
 const memory = require('./memory');
+const learning = require('./learning');
 const secrets = require('./secrets');
 const automation = require('./automation');
 
@@ -752,7 +753,7 @@ api.get('/memory', async (req, res) => {
   catch (e) { fail(res, e, []); }
 });
 api.get('/memory/stats', async (req, res) => {
-  try { ok(res, await memory.stats()); }
+  try { ok(res, { ...(await memory.stats()), learning: learning.stats() }); }
   catch (e) { fail(res, e, { backend: 'unavailable', count: 0 }); }
 });
 api.get('/memory/search', async (req, res) => {
@@ -813,6 +814,16 @@ api.delete('/memory', async (req, res) => {
     permissions.audit({ integration: 'memory', action: 'forget-all', status: 'ok', summary: `deleted ${result.deleted} memor(ies)` });
     ok(res, result);
   } catch (e) { fail(res, e); }
+});
+
+/* ---------------- durable learning (Phase 3) ----------------
+   Status + a manual drain. Extraction itself is out-of-band; POST /api/learning/run exists for
+   cron jobs, tests and "learn now" — it is never on a reply's critical path. */
+api.get('/learning', (req, res) => {
+  try { ok(res, learning.stats()); } catch (e) { fail(res, e, { pending: 0 }); }
+});
+api.post('/learning/run', async (req, res) => {
+  try { ok(res, await learning.flush()); } catch (e) { fail(res, e, { processed: 0 }); }
 });
 
 api.get('/contacts', (req, res) => {

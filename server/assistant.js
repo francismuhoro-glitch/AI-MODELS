@@ -31,6 +31,7 @@
 const dbm = require('./db');
 const brain = require('./brain');
 const memoryMod = require('./memory');
+const learning = require('./learning');
 const cfgm = require('./config');
 const weblearn = require('./weblearn');
 const websearch = require('./websearch');
@@ -411,6 +412,13 @@ async function respond(message) {
      The full detail stays in `reply` for the screen. */
   const speech = toSpeechText(reply, { discretion: cfg.discretion !== false });
 
+  /* DURABLE LEARNING (Phase 3) — high-signal turns are QUEUED for out-of-band extraction.
+     Deliberately fire-and-forget: the reply never waits for an embedding or a write, and the
+     queue is persisted first, so a serverless freeze is finished by the next turn/sweep. */
+  try {
+    learning.scheduleExtraction({ message: raw, reply, source: source || 'chat', chatId: null });
+  } catch (_) {}
+
   return {
     reply,
     speech,
@@ -520,6 +528,22 @@ async function routeIntent(msg, memory) {
     const hub = await automation.route(sm);
     if (hub && hub.reply) return hub;
   } catch (_) {}
+
+  /* ---- Long-term memory commands (Phase 3) ----
+     Routed HERE, before the calendar/task regexes, so "forget that memory" can never be read as
+     "remove that event". Forgetting is a real deletion: the reply reports exactly what went. */
+  const forgetCmd = learning.matchForget(sm);
+  if (forgetCmd) {
+    const result = await learning.forget(forgetCmd);
+    return { reply: result.reply, intent: 'memory-forget', memoryForgotten: result.items.map((x) => x.id), removed: result.removed };
+  }
+  let memQ = m.match(/^what do you remember(?:\s+about\s+(.+?))?\s*\??$/i)
+    || m.match(/^what have you (?:learned|noted|remembered)(?:\s+about\s+me)?\s*\??$/i)
+    || m.match(/^(?:show|list)\s+(?:me\s+)?(?:my\s+)?(?:memories|long[-\s]?term memory)\s*\??$/i);
+  if (memQ) {
+    const topic = memQ[1] ? memQ[1].trim() : '';
+    return { reply: await learning.recallReply(topic), intent: 'memory-recall' };
+  }
 
   /* ---- Plan confirmation / cancellation (before generic event removal) ---- */
   if (conv.pendingPlan && (/^(?:confirm|lock(?:\s+it)?(?:\s+in)?|approve|keep|sounds\s+good|yes(?:\s+please)?)\b/i.test(m) || /^(?:yes|confirm|lock it in|approve)[.!\s]*$/i.test(m))) {
@@ -1242,6 +1266,11 @@ async function rollConversationSummary(db) {
   conv.summaryAt = Date.now();
   conv.summaryEngine = text ? 'llm' : 'heuristic';
   try { await dbm.saveNow(); } catch (_) { /* read-only fs: the in-memory summary still serves this process */ }
+  /* DURABLE LEARNING on the rolling cadence: the window is queued for model-assisted
+     extraction out-of-band (heuristics are the offline path). Never awaited here. */
+  try {
+    learning.scheduleSummaryExtraction({ turns: windowTurns, windowText: transcript, chatId: `rolling-${conv.lastSummaryTurn}` });
+  } catch (_) {}
   return conv.summary;
 }
 
@@ -1743,8 +1772,8 @@ module.exports = {
   calendarSummary, brainSummary, guessContext,
   /* LLM tool calling */
   TOOL_DEFS, parseToolCall, tryParseJson, parseToolDate, executeTool, tryToolPass,
-  /* semantic memory */
-  recallMemory, publicRecalled,
+  /* semantic memory + durable learning */
+  recallMemory, publicRecalled, learning,
   /* rolling conversation memory */
   rollConversationSummary, heuristicSummary, SUMMARY_EVERY,
   /* conversation memory */

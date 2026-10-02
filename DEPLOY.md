@@ -43,6 +43,12 @@ function) and leaves `aria_docs` untouched. Without it, memory still works — i
 to the local document store (`GET /api/memory/stats` tells you which backend is live).
 See [docs/SEMANTIC_MEMORY.md](docs/SEMANTIC_MEMORY.md).
 
+**Durable learning needs no extra schema.** It writes to the same `aria_memory` rows and keeps its
+queue in the existing document store, so the migration above is all the SQL there is. After deploy,
+`GET /api/learning` should show counters and `training: "none …"`; extraction is queued out-of-band
+(an hourly cron at `7 * * * *` drains leftovers, which is what keeps it safe on serverless freezes).
+See [docs/DURABLE_LEARNING.md](docs/DURABLE_LEARNING.md).
+
 ### 2. Push this repo to GitHub, then import to Vercel
 1. Push the repo to your GitHub.
 2. [vercel.com](https://vercel.com) → **Add New → Project** → import the repo (framework: **Other** — it's auto-detected via `vercel.json` + `api/`).
