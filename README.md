@@ -162,7 +162,22 @@ npm start         # http://localhost:3000
 
 ### 🧠 Semantic memory
 
-The second brain is a **hybrid retriever**: BM25 lexical scoring blended 50/50 with cosine similarity over embeddings (`server/embeddings.js`). Notes are embedded lazily, once, and cached on the note — but only when an embedding backend is reachable, so without Ollama the brain stays purely lexical and just as fast. That is what makes a paraphrase land: *"who do I know that sells cement?"* now finds the supplier note even when it shares no keywords.
+Two layers, same idea — recall by meaning, not just keywords:
+
+* **Second brain** — a hybrid retriever: BM25 lexical scoring blended 50/50 with cosine similarity over embeddings (`server/embeddings.js`). Notes are embedded lazily, once, and cached on the note, so without a backend it stays purely lexical and just as fast. A paraphrase lands: *"who do I know that sells cement?"* finds the supplier note even when it shares no keywords.
+* **Long-term memory about you** (`server/memory.js`) — durable facts, preferences and corrections in a real Postgres table with pgvector (`aria_memory`), or the local JSON store when Supabase is not configured. The incoming message is embedded, the top ~6 memories are injected **before** ARIA (and the Agency Swarm's Director) reasons, and `last_accessed` is bumped for exactly what was used. Embedding chain: **cloud (only with a key) → Ollama → lexical fallback**, all fitted to the same configurable dimension (`settings.llm.embedDim`, default **768**, matching the `vector(768)` column).
+
+```
+supabase/migrations/20261002085317_aria_memory.sql   # paste once in the Supabase SQL editor
+```
+
+Manage them in **Second Brain → 🧠 Long-term memory** (add / search / edit / delete), or say *"remember that …"* / *"forget that"*. Secrets never reach memory: every write is redacted first. Full guide: **[docs/SEMANTIC_MEMORY.md](docs/SEMANTIC_MEMORY.md)**.
+
+| Endpoint | What it does |
+|---|---|
+| `GET /api/memory`, `GET /api/memory/stats`, `GET /api/memory/search?q=` | List / backend+dimension / hybrid search. |
+| `POST /api/memory`, `PATCH\|PUT /api/memory/:id`, `DELETE /api/memory/:id` | Store / edit (re-embeds) / delete — all audited. |
+| `POST /api/memory/forget`, `DELETE /api/memory?confirm=true` | *"Forget that"* by id or meaning / clear everything. |
 
 ### 🗣️ Say it however you like
 
@@ -206,12 +221,13 @@ server/
   automation.js   extra tools + deterministic alarms/messages/media/routines
   alarms.js       browser-notification alarms & reminders (never a device alarm)
   phone.js        Android bridge outbox: real device alarms/media via Tasker/MacroDroid + acks
+  memory.js       semantic memory: pgvector store (Supabase) / local fallback, hybrid retrieval, forget
   permissions.js  default-deny grants, confirmations, audit
   messaging.js    draft ≠ send, idempotent sends, group deny
   media.js        browser / local audio only
   integrations.js OAuth + Telegram/WhatsApp Cloud/SMS-bridge/SMTP
   secrets.js      preserve blank secret saves; redact GET bodies
-  embeddings.js   embedding adapter (Ollama) + cosine similarity + TF-IDF fallback vector
+  embeddings.js   embedding adapter: cloud → Ollama → lexical, dimension-fitted (768 default)
   agency.js       Agency Swarm orchestrator (sequential / parallel waves, run history)
   agents/         director · researcher · analyst · copywriter (zero-dependency agents)
   llm.js          model adapter: cloud (OpenAI-compatible) → Ollama → offline, tool prompts
@@ -221,6 +237,7 @@ server/
   scheduler.js    cron: brief at wake, sync every 30 min, alarm tick every minute
   connectors/     demo · google · microsoft · slack · whatsapp
 public/           dashboard SPA (no build step)
+supabase/         migrations you paste into the Supabase SQL editor (idempotent)
 scripts/          oauth-google helper · test-app.js verification suite (`npm test`)
 data/             your everything (gitignored — it IS your brain)
 ```

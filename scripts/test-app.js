@@ -805,6 +805,194 @@ function check(name, cond, detail) {
   await permMod.setGrant('phone.app', false);
   check('revoking the bridge clears the token and disables it', !cfgMod.load().phone.bridgeToken && cfgMod.load().phone.enabled === false);
 
+  console.log('\n[3n] Semantic memory — pgvector table, hybrid retrieval, forget');
+  const memMod = require('../server/memory');
+  const embMod2 = require('../server/embeddings');
+  const envSupa = { url: process.env.SUPABASE_URL, key: process.env.SUPABASE_SERVICE_KEY };
+
+  /* Dimension consistency is the thing that breaks pgvector — pin it first. */
+  check('embedding dimension defaults to 768 (matches vector(768))', embMod2.embedDim() === 768 && cfgMod.normalize({}).llm.embedDim === 768, String(embMod2.embedDim()));
+  check('the cloud embedding model defaults to text-embedding-3-small', cfgMod.normalize({}).llm.openai.embedModel === 'text-embedding-3-small');
+  const fitLong = embMod2.fitDimension(Array.from({ length: 1536 }, (_, i) => (i % 7) + 1), 768);
+  const fitShort = embMod2.fitDimension(Array.from({ length: 384 }, () => 1), 768);
+  const unit = (v) => Math.abs(v.reduce((s, x) => s + x * x, 0) - 1) < 1e-9;
+  check('fitDimension truncates 1536 → 768 and re-normalises (Matryoshka)', fitLong.length === 768 && unit(fitLong));
+  check('fitDimension zero-pads 384 → 768 and re-normalises', fitShort.length === 768 && unit(fitShort) && fitShort[767] === 0);
+  check('fitDimension rejects non-vectors and accepts a short real one', embMod2.fitDimension([1, 'x'], 768) === null && embMod2.fitDimension(null, 768) === null && embMod2.fitDimension([1, 2], 4).length === 4);
+
+  /* Offline (no key, no Ollama): the lexical fallback is still dimension-consistent. */
+  const offlineVec = await embMod2.getEmbedding('cement supplier in nairobi', { dim: 768 });
+  check('offline embeddings are produced at the table dimension (768)', Array.isArray(offlineVec) && offlineVec.length === 768, String(offlineVec && offlineVec.length));
+
+  /* Cloud is preferred when a key exists — mocked end-to-end, no network, key never stored. */
+  let cloudUrl = null, cloudBody = null;
+  embMod2._reset();
+  process.env.OPENAI_API_KEY = 'sk-test-cloud-never-logged';
+  embMod2._setFetch(async (url, opts) => {
+    cloudUrl = String(url);
+    cloudBody = JSON.parse((opts && opts.body) || '{}');
+    return { ok: true, status: 200, json: async () => ({ data: [{ embedding: Array.from({ length: 3072 }, (_, i) => (i % 5) + 1) }] }) };
+  });
+  const cloudVec = await embMod2.getEmbedding('swahili phrase', { dim: 768 });
+  check('the cloud provider is used when a key exists', /\/embeddings$/.test(cloudUrl || '') && cloudBody.model === 'text-embedding-3-small', `${cloudUrl} ${cloudBody && cloudBody.model}`);
+  check('the cloud request asks for exactly the table dimension', cloudBody.dimensions === 768, JSON.stringify(cloudBody.dimensions));
+  check('a cloud answer is fitted to 768', Array.isArray(cloudVec) && cloudVec.length === 768);
+  const embStatus = await embMod2.embeddingStatus();
+  check('embeddingStatus reports the backend without leaking the key', embStatus.activeBackend === 'cloud' && embStatus.dim === 768 && !JSON.stringify(embStatus).includes('sk-test-cloud-never-logged'));
+  delete process.env.OPENAI_API_KEY;
+  embMod2._reset();
+
+  /* Ollama is second in the chain: forced probe, mocked daemon, 384-dim model → padded to 768. */
+  let ollamaBody = null;
+  embMod2._setFetch(async (url, opts) => {
+    ollamaBody = JSON.parse((opts && opts.body) || '{}');
+    return { ok: true, status: 200, json: async () => ({ embedding: Array.from({ length: 384 }, () => 2) }) };
+  });
+  const ollamaVec = await embMod2.getEmbedding('local model phrase', { dim: 768, force: true });
+  check('Ollama is the second provider and its model is nomic-embed-text by default', ollamaBody.model === 'nomic-embed-text', String(ollamaBody.model));
+  check('a local 384-dim vector is padded to the table dimension', Array.isArray(ollamaVec) && ollamaVec.length === 768);
+  embMod2._reset();
+
+  /* Local memory store: CRUD, hybrid ranking, redaction, last_accessed. */
+  memMod._reset();
+  check('without Supabase the memory backend is local', (await memMod.tableAvailable()) === false);
+  const memA = await memMod.upsertMemory({ content: 'The supplier for cement is Mwangi Hardware, and prices are negotiated each quarter.', kind: 'fact', importance: 0.7, source: 'test' });
+  const memB = await memMod.upsertMemory({ content: 'Francis prefers meetings before 11am and hates long status calls.', kind: 'preference', importance: 0.9, source: 'test' });
+  const memC = await memMod.upsertMemory({ content: 'Weekly sprint review notes for the platform team live in the shared drive.', kind: 'fact', source: 'test' });
+  check('upsertMemory writes a memory with id + kind + importance', !!(memA && memA.id && memA.kind === 'fact' && memA.importance === 0.7));
+  check('preferences get a small importance bias', memB.importance > 0.9);
+  check('publicMemory never exposes the embedding', !('embedding' in memA) && !JSON.stringify(memA).includes('embedding'));
+  check('default embedding size is 768 for every stored vector', memMod.formatMemoriesForPrompt([memA]).length > 0);
+
+  const secretMem = await memMod.upsertMemory({ content: 'My KRA PIN is P051234567X and the api key is sk-live-abcdef1234567890', kind: 'fact', source: 'test' });
+  check('secrets are redacted before a memory is stored', !/sk-live-abcdef1234567890/i.test(secretMem.content) && /redacted/i.test(secretMem.content), secretMem.content);
+  await memMod.removeMemory(secretMem.id);
+
+  const memHits = await memMod.searchMemories('who supplies my cement?', 3);
+  check('hybrid memory search finds the right memory by meaning', memHits.length > 0 && /Mwangi Hardware/.test(memHits[0].content), JSON.stringify(memHits.map(h => [h.content.slice(0, 30), h.blended])));
+  check('memory hits carry lexical + semantic + blended evidence', memHits.every(h => typeof h.bm25 === 'number' && typeof h.semantic === 'number' && typeof h.blended === 'number'));
+  check('the unrelated sprint note does not outrank the supplier memory', !memHits[0] || !/sprint/i.test(memHits[0].content), memHits[0] && memHits[0].content);
+  check('bm25Rank is a pure lexical ranker (partial words count)', memMod.bm25Rank('cement', [{ id: 'x', content: 'cement bags' }]).get('x') > 0);
+  check('blendScore is 0.5·lexical + 0.5·semantic', memMod.blendScore(1, 1) === 1 && memMod.blendScore(1, 0) === 0.5 && memMod.blendScore(0, 1) === 0.5);
+  check('formatMemoriesForPrompt builds the prompt block (empty when nothing)', /MEMORY/.test(memMod.formatMemoriesForPrompt(memHits)) && memMod.formatMemoriesForPrompt([]) === '');
+
+  /* last_accessed must move on retrieval. */
+  const before = await memMod.getMemory(memA.id);
+  await memMod.touchMemories([]);                        // no-op
+  const dbMem = (require('../server/db').load().memories || []).find(m => m.id === memA.id);
+  dbMem.last_accessed = new Date(Date.now() - 864e5).toISOString();   // pretend it is a day old
+  await memMod.searchMemories('cement supplier', 3);
+  const after = await memMod.getMemory(memA.id);
+  check('retrieval bumps last_accessed', new Date(after.lastAccessed).getTime() > new Date(before.lastAccessed).getTime() - 1 && new Date(after.lastAccessed).getTime() > Date.now() - 60000, `${before.lastAccessed} → ${after.lastAccessed}`);
+
+  /* Expiry: excluded from retrieval, then pruned. */
+  const memExpiring = await memMod.upsertMemory({ content: 'Temporary note that should expire', kind: 'fact', expiresAt: new Date(Date.now() - 1000).toISOString() });
+  const expHits = await memMod.searchMemories('temporary note', 5);
+  check('expired memories are never retrieved', !expHits.some(h => h.id === memExpiring.id));
+  const swept = await memMod.expireStale();
+  check('expireStale prunes rows past expires_at', swept.expired >= 1 && (await memMod.getMemory(memExpiring.id)) === null, JSON.stringify(swept));
+
+  /* Management API */
+  const memApi = await post('/api/memory', { content: 'Kamau is the contact for the supplier order', kind: 'fact', importance: 0.6, source: 'test' });
+  check('POST /api/memory stores a memory', memApi.status === 200 && !!(memApi.json || {}).id, JSON.stringify(memApi.json).slice(0, 120));
+  const memList = await get('/api/memory');
+  check('GET /api/memory → 200 array including the new memory', memList.status === 200 && Array.isArray(memList.json) && memList.json.some(m => m.id === memApi.json.id));
+  const memSearch = await get('/api/memory/search?q=' + encodeURIComponent('who handles the supplier order'));
+  check('GET /api/memory/search ranks the right memory first', memSearch.status === 200 && Array.isArray(memSearch.json) && /Kamau/.test((memSearch.json[0] || {}).content || ''), JSON.stringify((memSearch.json || [])[0] && memSearch.json[0].content));
+  const memPatch = await fetch(base + '/api/memory/' + memApi.json.id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: 'Kamau Otieno is the contact for the supplier order and the ballast quote', importance: 0.8 }) });
+  const memPatched = await memPatch.json();
+  check('PATCH /api/memory/:id edits in place', memPatch.status === 200 && /ballast/.test(memPatched.content) && memPatched.id === memApi.json.id);
+  const memStat = await get('/api/memory/stats');
+  check('GET /api/memory/stats reports backend + dim', memStat.status === 200 && memStat.json.dim === 768 && ['local', 'supabase'].includes(memStat.json.backend), JSON.stringify(memStat.json));
+  const memForget = await post('/api/memory/forget', { query: 'ballast quote contact' });
+  check('POST /api/memory/forget removes by meaning ("forget that")', memForget.status === 200 && memForget.json.deleted >= 1 && !(await memMod.getMemory(memApi.json.id)), JSON.stringify(memForget.json));
+  const noConfirm = await fetch(base + '/api/memory', { method: 'DELETE' });
+  check('DELETE /api/memory refuses without confirm=true', noConfirm.status === 400);
+  const delOne = await post('/api/memory', { content: 'Delete me please', source: 'test' });
+  const delRes = await fetch(base + '/api/memory/' + delOne.json.id, { method: 'DELETE' });
+  check('DELETE /api/memory/:id deletes exactly one memory', delRes.status === 200 && (await delRes.json()).deleted === true);
+
+  /* Assistant integration: retrieval evidence in the reply + the remember tool. */
+  await memMod.upsertMemory({ content: 'Francis runs a hardware business and is based in Nairobi.', kind: 'fact', importance: 0.8, source: 'test' });
+  const asstMem = await post('/api/assistant', { message: 'what do you remember about my business?' });
+  const asstMemJson = asstMem.json || {};
+  check('assistant replies carry the retrieved memories as evidence', Array.isArray(asstMemJson.memories) && asstMemJson.memories.length > 0 && asstMemJson.memoryBackend === 'local', JSON.stringify({ n: (asstMemJson.memories || []).length, backend: asstMemJson.memoryBackend }));
+  check('memory evidence is relevant to the question asked', asstMemJson.memories.some(m => /hardware business|Nairobi/i.test(m.content)), JSON.stringify((asstMemJson.memories || []).map(m => m.content.slice(0, 40))));
+  const rememberTool = await asstMod.executeTool('remember', { content: 'Always answer the phone to Kamau', kind: 'preference' }, 'assistant');
+  check('the remember tool stores a preference memory', !!(rememberTool && rememberTool.memory && rememberTool.memory.kind === 'preference') && /remembered/i.test(rememberTool.reply || ''), JSON.stringify(rememberTool && rememberTool.memory));
+  check('the tool schema documents remember and forbids secrets in it', /never store secrets/i.test(JSON.stringify(asstMod.TOOL_DEFS.find(t => t.name === 'remember') || {})));
+  const emptyRemember = await asstMod.executeTool('remember', { content: '' }, 'assistant');
+  check('the remember tool refuses empty content', emptyRemember === null);
+  const rememberIntent = await post('/api/assistant', { message: 'remember that my favourite supplier is Mwangi Hardware' });
+  check('"remember that …" also lands in semantic memory', /Remembered/i.test((rememberIntent.json || {}).reply || '') && (await memMod.searchMemories('favourite supplier', 3)).some(m => /Mwangi/i.test(m.content)));
+
+  /* Swarm: memories are retrieved BEFORE the agents reason and are reported. */
+  await memMod.upsertMemory({ content: 'Supplier briefing preference: always include cement costs for each supplier.', kind: 'preference', importance: 0.9, source: 'test' });
+  const missionMem = await post('/api/agency/run', { task: 'Analyze all supplier notes and draft an executive briefing' });
+  const missionMemJson = missionMem.json || {};
+  check('a mission reports the memories it used', Array.isArray(missionMemJson.memoryUsed) && missionMemJson.memoryUsed.length > 0, JSON.stringify((missionMemJson.memoryUsed || []).map(m => m.content.slice(0, 40))));
+  check('the director report shows standing memory context', /Standing context \(from memory\)/i.test(missionMemJson.finalOutput || ''), (missionMemJson.finalOutput || '').slice(0, 160));
+  check('the mission itself is stored as a summary memory', (await memMod.searchMemories('agency mission supplier briefing', 5)).some(m => m.kind === 'summary' && /Agency mission/i.test(m.content)));
+
+  /* Supabase path — mocked PostgREST + RPC so the real code path is exercised with no network. */
+  process.env.SUPABASE_URL = 'https://mock-project.supabase.co';
+  process.env.SUPABASE_SERVICE_KEY = 'service-key-never-logged';
+  const supaCalls = [];
+  let rpcBody = null;
+  const mockRows = new Map();
+  memMod._reset();
+  memMod._setFetch(async (url, opts = {}) => {
+    const u = String(url);
+    const method = opts.method || 'GET';
+    supaCalls.push(`${method} ${u.replace('https://mock-project.supabase.co/rest/v1/', '')}`);
+    if (u.includes('/rpc/match_aria_memories')) {
+      rpcBody = JSON.parse(opts.body || '{}');
+      return { ok: true, status: 200, json: async () => [{ id: 'mem_supa_1', content: 'Supabase memory about supplier terms', source: 'chat', kind: 'fact', importance: 0.7, created_at: new Date().toISOString(), last_accessed: new Date().toISOString(), similarity: 0.83 }] };
+    }
+    if (u.includes('/rpc/touch_aria_memories')) return { ok: true, status: 200, json: async () => 1 };
+    if (method === 'POST') {
+      const rows = JSON.parse(opts.body || '[]');
+      for (const r of rows) mockRows.set(r.id, r);
+      return { ok: true, status: 201, json: async () => rows };
+    }
+    if (method === 'PATCH' || method === 'DELETE') return { ok: true, status: 200, json: async () => [] };
+    if (u.includes('select=id&limit=1')) return { ok: true, status: 200, json: async () => [{ id: 'mem_supa_1' }] };
+    if (u.includes('order=created_at.desc')) return { ok: true, status: 200, json: async () => [...mockRows.values()] };
+    return { ok: true, status: 200, json: async () => [] };
+  });
+  check('with Supabase env the memory backend is Supabase', (await memMod.tableAvailable({ force: true })) === true);
+  const supaSaved = await memMod.upsertMemory({ content: 'Supabase memory about supplier terms', kind: 'fact', source: 'test' });
+  check('a Supabase write POSTs a real row at the table dimension', supaCalls.some(c => c.startsWith('POST aria_memory')) && supaSaved && supaSaved.id.startsWith('mem_'), JSON.stringify(supaCalls.slice(0, 3)));
+  /* No embedding backend yet → the RPC must NOT be called with a null vector (lexical only). */
+  await memMod.searchMemories('supplier terms', 3);
+  check('without an embedding backend, Supabase retrieval stays lexical (no null-vector RPC)', rpcBody === null, JSON.stringify(rpcBody));
+  /* With a (mocked) cloud embedding the semantic half really runs through the RPC. */
+  process.env.OPENAI_API_KEY = 'sk-test-cloud-never-logged';
+  embMod2._setFetch(async () => ({ ok: true, status: 200, json: async () => ({ data: [{ embedding: Array.from({ length: 768 }, (_, i) => (i % 9) + 1) }] }) }));
+  rpcBody = null;
+  const supaHit = await memMod.searchMemories('supplier terms', 3);
+  check('Supabase retrieval goes through match_aria_memories with the query vector', !!(rpcBody && Array.isArray(rpcBody.query_embedding) && rpcBody.query_embedding.length === 768), JSON.stringify(rpcBody && rpcBody.query_embedding && rpcBody.query_embedding.length));
+  delete process.env.OPENAI_API_KEY;
+  embMod2._reset();
+  check('Supabase retrieval returns rows (mock) with hybrid evidence', supaHit.every(h => typeof h.blended === 'number'));
+  check('the row payload carries a 768-dim embedding and no secret fields', (() => {
+    const row = [...mockRows.values()][0] || {};
+    return Array.isArray(row.embedding) && row.embedding.length === 768 && !JSON.stringify(row).includes('service-key-never-logged');
+  })(), JSON.stringify([...mockRows.values()].map(r => ({ id: r.id, dim: (r.embedding || []).length }))));
+  await memMod.touchMemories(['mem_supa_1']);
+  check('last_accessed bumps go through touch_aria_memories', supaCalls.some(c => c.includes('rpc/touch_aria_memories')), JSON.stringify(supaCalls.slice(-2)));
+  memMod._reset();
+  delete process.env.SUPABASE_URL;
+  delete process.env.SUPABASE_SERVICE_KEY;
+  check('memory falls back to local when Supabase is not configured', (await memMod.tableAvailable({ force: true })) === false);
+  check('no Supabase key ever appears in a public payload', !JSON.stringify((await get('/api/memory')).json).includes('service-key-never-logged'));
+  if (envSupa.url) process.env.SUPABASE_URL = envSupa.url;
+  if (envSupa.key) process.env.SUPABASE_SERVICE_KEY = envSupa.key;
+
+  /* Leave the suite with an empty memory store (later sections render the UI from it). */
+  await memMod.forgetAll();
+  check('forgetAll empties memory', (await memMod.listMemories({ limit: 50 })).length === 0);
+
   console.log('\n[4] Frontend render (jsdom)');
   const errors = [];
   const vc = new VirtualConsole();
@@ -849,6 +1037,29 @@ function check(name, cond, detail) {
   check('settings renders the Android phone bridge card', /Android phone bridge/.test(setHtml) && !!w.document.getElementById('s-phone-on') && !!w.document.getElementById('s-phone-token'));
   check('settings offers the phone permission grants', ['phone.alarm', 'phone.media', 'phone.app'].every(g => setHtml.includes(`data-grant="${g}"`)));
   check('settings never renders a stored bridge token', !new RegExp(PHONE_TOKEN).test(setHtml));
+  check('settings renders the semantic memory card (backend + dimension)', /Semantic memory/.test(setHtml) && /aria_memory/.test(setHtml));
+
+  /* ---- Second Brain → long-term memory UI (add, list, delete) ---- */
+  w.location.hash = '#/brain';
+  w.dispatchEvent(new w.HashChangeEvent('hashchange'));
+  await sleep(500);
+  const brainHtml = (w.document.getElementById('main') || {}).innerHTML || '';
+  check('brain view renders the long-term memory card', /Long-term memory/.test(brainHtml) && !!w.document.getElementById('mem-add'));
+  w.confirm = () => true;                       // jsdom has no window.confirm
+  w.document.getElementById('mem-content').value = 'Prefers invoices sent on Fridays';
+  w.document.getElementById('mem-kind').value = 'preference';
+  w.document.getElementById('mem-add').click();
+  await sleep(700);
+  const memNow = (await get('/api/memory')).json || [];
+  check('adding a memory from the UI stores it (as a preference)', memNow.some(m => /invoices sent on Fridays/i.test(m.content) && m.kind === 'preference'), JSON.stringify(memNow.map(m => [m.kind, m.content.slice(0, 30)])));
+  w.location.hash = '#/hub'; await sleep(200);
+  w.location.hash = '#/brain'; await sleep(600);
+  const brainHtml2 = (w.document.getElementById('main') || {}).innerHTML || '';
+  check('the memory list renders its rows with edit + delete controls', /invoices sent on Fridays/.test(brainHtml2) && /data-mem-del=/.test(brainHtml2) && /data-mem-edit=/.test(brainHtml2));
+  const delBtn = [...w.document.querySelectorAll('button[data-mem-del]')].find(b => (w.document.getElementById('main').innerHTML.match(/invoices sent on Fridays/) ? true : false));
+  if (delBtn) { delBtn.click(); await sleep(700); }
+  check('deleting a memory from the UI removes it', !((await get('/api/memory')).json || []).some(m => /invoices sent on Fridays/i.test(m.content)));
+  check('no console errors during the memory UI flow', errors.length === 0, errors.slice(0, 4).join(' | '));
   console.log('\n[5] Agency Swarm UI + voice loop');
   /* Assistant view: the two-way voice loop hangs off #asst-mic and a [data-voice-input] field. */
   w.location.hash = '#/assistant';

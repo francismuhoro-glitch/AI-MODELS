@@ -25,11 +25,17 @@ const DEFAULTS = {
     provider: 'auto',
     ollamaUrl: 'http://127.0.0.1:11434',
     model: 'openai/gpt-oss-120b',
+    /* Embedding dimension for SEMANTIC MEMORY (aria_memory.embedding). MUST match the
+       vector(768) column and match_aria_memories(). env ARIA_EMBED_DIM overrides. */
+    embedDim: 768,
+    /* Which Ollama model to embed with (falls back to ollama's own default, then
+       nomic-embed-text). */
+    embedModel: 'nomic-embed-text',
     /* What ARIA recommends for a local model on modest hardware — shown in Settings. */
     recommendedModel: 'qwen2.5:7b',
     /* Any OpenAI-compatible endpoint (OpenAI, Groq, OpenRouter, a local vLLM…). OFF by
        default: with no apiKey (and no OPENAI_API_KEY env) it is never contacted. */
-    openai: { baseUrl: 'https://api.openai.com/v1', apiKey: '', model: 'gpt-4o-mini' }
+    openai: { baseUrl: 'https://api.openai.com/v1', apiKey: '', model: 'gpt-4o-mini', embedModel: 'text-embedding-3-small' }
   },
   /* Discretion mode: TTS output skips full email contents, long lists and sensitive strings
      (passwords, PINs, tokens, card numbers, addresses). Display text stays complete. */
@@ -86,6 +92,11 @@ function normalize(cfg) {
   out.llm.openai.baseUrl = String(out.llm.openai.baseUrl || DEFAULTS.llm.openai.baseUrl).replace(/\/+$/, '');
   out.llm.openai.apiKey = String(out.llm.openai.apiKey || '').trim();   // never logged, never echoed to /api/ai/status
   out.llm.openai.model = String(out.llm.openai.model || DEFAULTS.llm.openai.model);
+  out.llm.openai.embedModel = String(out.llm.openai.embedModel || DEFAULTS.llm.openai.embedModel);
+  /* Embedding dimension: 64..3072, default 768 — must match the aria_memory vector column. */
+  const embedDim = Number(process.env.ARIA_EMBED_DIM || out.llm.embedDim);
+  out.llm.embedDim = Number.isFinite(embedDim) && embedDim >= 64 && embedDim <= 3072 ? Math.round(embedDim) : DEFAULTS.llm.embedDim;
+  out.llm.embedModel = String(out.llm.embedModel || DEFAULTS.llm.embedModel);
   if (!out.llm.recommendedModel) out.llm.recommendedModel = DEFAULTS.llm.recommendedModel;
   // Back-compat: an older build stored { ollama: { host, model } }
   if (cfg && cfg.ollama) {

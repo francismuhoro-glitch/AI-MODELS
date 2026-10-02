@@ -34,7 +34,14 @@ create table if not exists aria_docs (
 );
 ```
 
-That's the whole schema — ARIA stores its state/settings as documents in this one table.
+That's the base schema — ARIA stores its state/settings as documents in this table.
+
+**Semantic memory (recommended, one more paste):** run
+`supabase/migrations/20261002085317_aria_memory.sql` in the same SQL editor. It enables
+`pgvector`, creates the `aria_memory` table (with its HNSW index + `match_aria_memories()`
+function) and leaves `aria_docs` untouched. Without it, memory still works — it just falls back
+to the local document store (`GET /api/memory/stats` tells you which backend is live).
+See [docs/SEMANTIC_MEMORY.md](docs/SEMANTIC_MEMORY.md).
 
 ### 2. Push this repo to GitHub, then import to Vercel
 1. Push the repo to your GitHub.

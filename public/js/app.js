@@ -1142,8 +1142,28 @@ function msgRow(m) {
 
 /* ===== BRAIN ===== */
 async function viewBrain(main) {
-  const notes = A(await api('/api/notes'));
-  main.innerHTML = `<div class="view-head"><div><h1>Second Brain</h1><div class="sub">${notes.length} notes · grows automatically from briefs, emails & messages</div></div></div>
+  const [rawNotes, rawMem, rawMemStats] = await Promise.all([
+    api('/api/notes'),
+    api('/api/memory?limit=100').catch(() => []),
+    api('/api/memory/stats').catch(() => null)
+  ]);
+  const notes = A(rawNotes);
+  const memories = A(rawMem);
+  const memStats = rawMemStats && typeof rawMemStats === 'object' ? rawMemStats : { backend: 'local', dim: 768, count: memories.length };
+  main.innerHTML = `<div class="view-head"><div><h1>Second Brain</h1><div class="sub">${notes.length} notes · ${memories.length} memories · grows automatically from briefs, emails & messages</div></div></div>
+    <div class="card" id="memory-card"><h3>🧠 Long-term memory <span class="chip ${memStats.backend === 'supabase' ? 'green' : 'blue'}">${esc(memStats.backend)}</span> <span class="chip">${esc(String(memStats.dim))}-dim</span></h3>
+      <p style="color:var(--dim);font-size:12.5px;margin:0 0 10px">Durable facts, preferences and corrections ARIA recalls by meaning on every turn (top ${6} injected before it reasons). Embeddings run <strong>cloud → Ollama → lexical</strong>; none of it stores secrets, PINs, tokens, card numbers or full messages. Edit or delete anything here — or just say <em>“forget that”</em>.</p>
+      <div class="form-grid" style="grid-template-columns:2fr auto auto;align-items:end">
+        <label class="field">Teach ARIA something durable<input id="mem-content" placeholder="e.g. Kamau is my cement supplier — negotiate prices quarterly"></label>
+        <label class="field">Kind<select id="mem-kind"><option value="fact">fact</option><option value="preference">preference</option><option value="correction">correction</option></select></label>
+        <button class="btn primary" id="mem-add" style="height:40px">🧠 Remember</button>
+      </div>
+      <div class="form-grid" style="grid-template-columns:1fr auto;align-items:end;margin-top:8px">
+        <label class="field">Search memory ("forget that" works from chat too)<input id="mem-q" placeholder="supplier, meetings, invoice…"></label>
+        <div style="display:flex;gap:8px"><button class="btn" id="mem-search">🔎 Search</button><button class="btn ghost" id="mem-clear">🗑 Delete all</button></div>
+      </div>
+      <div id="mem-list" style="margin-top:10px">${memories.map(memoryRow).join('') || '<div class="empty">No memories yet. They build up as you talk to ARIA — or add one above.</div>'}</div>
+    </div>
     <div class="card capture-box"><h3>⚡ Capture — teach your brain anything</h3>
       <div class="form-grid" style="grid-template-columns:1fr 2fr auto;align-items:end">
         <label class="field">Title (optional)<input id="cap-title" placeholder="e.g. Supplier pricing playbook"></label>
@@ -1215,6 +1235,57 @@ async function viewBrain(main) {
       <div class="sr-meta"><span class="chip blue">${h.kind}</span><span>score ${h.score}</span><span>${fmtAgo(h.ts)} ago</span></div></div>`).join('') || '<div class="empty">No matches yet.</div>';
   }, 250); };
   $$('.note-card', main).forEach(c => c.onclick = () => openNote(notes.find(n => n.id === c.dataset.id)));
+
+  /* ---- long-term memory management (add / search / edit / delete) ---- */
+  const memList = $('#mem-list');
+  const reloadMem = async (q) => {
+    const rows = q ? await api('/api/memory/search?q=' + encodeURIComponent(q)).catch(() => []) : await api('/api/memory?limit=100').catch(() => []);
+    memList.innerHTML = A(rows).map(memoryRow).join('') || `<div class="empty">${q ? 'Nothing in memory matches that.' : 'No memories yet.'}</div>`;
+    bindMemRows();
+  };
+  const bindMemRows = () => {
+    $$('button[data-mem-del]', memList).forEach(b => b.onclick = async () => {
+      if (!confirm('Delete this memory permanently?')) return;
+      await fetch('/api/memory/' + encodeURIComponent(b.dataset.memDel), { method: 'DELETE' });
+      toast('🗑 Memory deleted'); reloadMem($('#mem-q') && $('#mem-q').value.trim());
+    });
+    $$('button[data-mem-edit]', memList).forEach(b => b.onclick = async () => {
+      const id = b.dataset.memEdit;
+      const cur = A(memories).find(m => m.id === id) || (await api('/api/memory?limit=100')).find(m => m.id === id);
+      const next = prompt('Edit this memory:', (cur && cur.content) || '');
+      if (next === null || !next.trim()) return;
+      await fetch('/api/memory/' + encodeURIComponent(id), { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: next.trim() }) });
+      toast('✏️ Memory updated'); reloadMem($('#mem-q') && $('#mem-q').value.trim());
+    });
+  };
+  bindMemRows();
+  if ($('#mem-add')) $('#mem-add').onclick = async () => {
+    const content = $('#mem-content').value.trim();
+    if (!content) return toast('Write the memory first');
+    const r = await POST('/api/memory', { content, kind: $('#mem-kind').value, source: 'user' });
+    if (!r || !r.id) return toast('⚠️ Could not save that memory');
+    toast('🧠 Memory saved'); route();
+  };
+  if ($('#mem-search')) $('#mem-search').onclick = () => reloadMem($('#mem-q').value.trim());
+  if ($('#mem-q')) $('#mem-q').onkeydown = (e) => { if (e.key === 'Enter') $('#mem-search').click(); };
+  if ($('#mem-clear')) $('#mem-clear').onclick = async () => {
+    if (!confirm('Delete EVERY memory? This cannot be undone.')) return;
+    await fetch('/api/memory?confirm=true', { method: 'DELETE' });
+    toast('🗑 All memories deleted'); route();
+  };
+}
+
+/* One memory as an editable row (kind + importance + when it was learned). */
+function memoryRow(m) {
+  if (!m) return '';
+  const age = m.createdAt ? fmtAgo(new Date(m.createdAt).getTime()) : '';
+  return `<div class="alarm-row">
+    <div class="ar-main"><strong>${esc(m.content)}</strong>
+      <div class="r-sub"><span class="chip ${m.kind === 'preference' ? 'green' : (m.kind === 'correction' ? 'red' : 'blue')}">${esc(m.kind || 'fact')}</span>
+      <span>importance ${esc(String(m.importance ?? 0.5))}</span><span>${esc(m.source || 'chat')}</span>${age ? `<span>${esc(age)} ago</span>` : ''}</div></div>
+    <button class="btn small" data-mem-edit="${esc(m.id)}">edit</button>
+    <button class="btn small" data-mem-del="${esc(m.id)}">delete</button>
+  </div>`;
 }
 
 function noteCard(n) {
@@ -1591,14 +1662,15 @@ const voiceGenderHint = () => {
 };
 
 async function viewSettings(main) {
-  const [rawSettings, rawConns, rawInts, rawPerms, rawAlarms, rawReminders, rawAudit, rawPhone] = await Promise.all([
+  const [rawSettings, rawConns, rawInts, rawPerms, rawAlarms, rawReminders, rawAudit, rawPhone, rawMemStats] = await Promise.all([
     api('/api/settings'), api('/api/connectors'),
     api('/api/integrations').catch(() => []),
     api('/api/permissions').catch(() => ({ grants: {}, allowGroupSend: false })),
     api('/api/alarms').catch(() => []),
     api('/api/reminders').catch(() => []),
     api('/api/audit').catch(() => []),
-    api('/api/phone').catch(() => null)
+    api('/api/phone').catch(() => null),
+    api('/api/memory/stats').catch(() => null)
   ]);
   const s = normalizeSettings(rawSettings);
   const conns = A(rawConns);
@@ -1608,6 +1680,7 @@ async function viewSettings(main) {
   const reminderList = A(rawReminders);
   const auditList = A(rawAudit).slice(0, 8);
   const ph = rawPhone && typeof rawPhone === 'object' ? rawPhone : { enabled: false, tokenConfigured: false, recent: [], pendingCount: 0 };
+  s.memoryStats = rawMemStats && typeof rawMemStats === 'object' ? rawMemStats : { backend: 'local', dim: s.llm.embedDim || 768, count: 0 };
   const phoneEndpoint = location.origin + '/api/phone/pending';
   const intById = Object.fromEntries(ints.map(i => [i.id, i]));
   SETTINGS = s; CONNECTORS = conns;
@@ -1726,6 +1799,16 @@ async function viewSettings(main) {
           <label class="field">Handle / number<input id="ct-handle" placeholder="@user or +254…"></label>
           <button class="btn" id="ct-add">＋ Add</button>
         </div>
+      </div>
+
+      <div class="card"><h3>🧠 Semantic memory (pgvector)</h3>
+        <p style="color:var(--dim);font-size:12.5px;margin:0 0 10px">Durable facts, preferences and corrections live in <code>aria_memory</code> when Supabase is configured (with an offline local fallback). Retrieval is hybrid — BM25 + embeddings — and the top matches are injected before ARIA reasons. Manage them in <strong>Second Brain → 🧠 Long-term memory</strong>, or just say <em>“forget that”</em>.</p>
+        <div class="connector">
+          <div class="conn-icon">🧠</div>
+          <div class="conn-main"><div class="conn-name">${esc((s.memoryStats && s.memoryStats.backend) || 'local')} <span class="chip">${esc(String((s.memoryStats && s.memoryStats.dim) || s.llm.embedDim || 768))}-dim</span></div>
+            <div class="conn-desc">Embeddings: cloud (needs a key) → Ollama → lexical fallback. The dimension MUST match <code>aria_memory.embedding vector(N)</code> — change both together (see <code>docs/SEMANTIC_MEMORY.md</code>).</div></div>
+        </div>
+        <p style="color:var(--faint);font-size:12px;margin-top:8px">Run <code>supabase/migrations/&lt;timestamp&gt;_aria_memory.sql</code> in the Supabase SQL editor once. Secrets, PINs, tokens, card numbers and full message bodies are never stored.</p>
       </div>
 
       <div class="card"><h3>🎵 Music</h3>

@@ -38,7 +38,16 @@ function start() {
     } catch (e) { console.error('[scheduler] alarm tick failed:', e.message); }
   }, { timezone: tz }));
 
-  console.log(`[scheduler] started — brief at ${cfg.wakeTime} ${tz}, sync every 30 min`);
+  // Memory hygiene: expire low-importance, unused memories (Phase 3 policy lives in memory.js).
+  jobs.push(cron.schedule('7 * * * *', async () => {
+    try {
+      const memory = require('./memory');
+      const r = await memory.expireStale();
+      if (r.expired) console.log(`[scheduler] expired ${r.expired} stale memory item(s)`);
+    } catch (e) { console.error('[scheduler] memory sweep failed:', e.message); }
+  }, { timezone: tz }));
+
+  console.log(`[scheduler] started — brief at ${cfg.wakeTime} ${tz}, sync every 30 min, memory sweep hourly`);
 
   // Catch-up: if it's already past wake time today and no brief exists yet → generate now
   catchUp();

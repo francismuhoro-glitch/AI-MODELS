@@ -27,6 +27,7 @@ const integrations = require('./integrations');
 const messaging = require('./messaging');
 const media = require('./media');
 const phone = require('./phone');
+const memory = require('./memory');
 const secrets = require('./secrets');
 const automation = require('./automation');
 
@@ -127,6 +128,14 @@ function buildState() {
     integrations: integrations.status(),
     /* Android phone bridge: pending/acked commands. NEVER the bridge token. */
     phone: (() => { try { return phone.publicState(); } catch (_) { return null; } })(),
+    /* Semantic memory: counts + backend only (the rows have their own endpoint). */
+    memory: (() => {
+      try {
+        const db = dbm.load();
+        const local = Array.isArray(db.memories) ? db.memories.length : 0;
+        return { backend: (process.env.SUPABASE_URL && (process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_KEY)) ? 'supabase' : 'local', local, dim: memory.embedDim() };
+      } catch (_) { return null; }
+    })(),
     pendingConfirmation: permissions.publicConfirmation(permissions.latestPending()),
     stats: {
       engine: engine.activeEngine || 'offline',
@@ -139,7 +148,8 @@ function buildState() {
       tasks: tasks.length,
       agencyRuns: agencyRuns.length,
       alarms: alarmItems.length,
-      reminders: reminderItems.length
+      reminders: reminderItems.length,
+      memories: (() => { try { return (dbm.load().memories || []).length; } catch (_) { return 0; } })()
     },
     counts: {
       events: events.length,
@@ -151,7 +161,8 @@ function buildState() {
       briefs: briefs.length,
       agencyRuns: agencyRuns.length,
       alarms: alarmItems.length,
-      reminders: reminderItems.length
+      reminders: reminderItems.length,
+      memories: (() => { try { return (dbm.load().memories || []).length; } catch (_) { return 0; } })()
     }
   };
 }
@@ -177,7 +188,7 @@ api.get('/state', (req, res) => {
       engine: { activeEngine: 'offline', model: '' }, llm: { activeEngine: 'offline', model: '' },
       activeEngine: 'offline', unread: 0,
       events: [], allEvents: [], emails: [], inbox: [], tasks: [], messages: [], notes: [], chats: [], briefs: [], brief: null,
-      agencyRuns: [], agents: [], phone: null, alarms: [], reminders: [],
+      agencyRuns: [], agents: [], phone: null, memory: null, alarms: [], reminders: [],
       integrations: [],
       stats: { engine: 'offline', lastSync: null, notes: 0, briefs: 0, emails: 0, messages: 0, events: 0, tasks: 0, agencyRuns: 0, alarms: 0, reminders: 0 },
       counts: { events: 0, emails: 0, inbox: 0, notes: 0, messages: 0, chats: 0, briefs: 0, agencyRuns: 0 }
@@ -458,8 +469,10 @@ api.delete('/assistant/history', async (req, res) => {
 api.get('/ai/status', async (req, res) => {
   try {
     await checkOllama().catch(() => {});
-    ok(res, llmStatus());
-  } catch (e) { fail(res, e, { provider: 'offline', activeEngine: 'offline', model: '', ollamaReachable: false, models: [] }); }
+    let embedding = null;
+    try { embedding = await require('./embeddings').embeddingStatus(); } catch (_) { embedding = null; }
+    ok(res, { ...llmStatus(), embedding });
+  } catch (e) { fail(res, e, { provider: 'offline', activeEngine: 'offline', model: '', ollamaReachable: false, models: [], embedding: null }); }
 });
 
 /* ---------------- agency swarm (multi-agent) ----------------
@@ -729,6 +742,77 @@ api.post('/confirm', async (req, res) => {
 api.post('/confirm/cancel', (req, res) => {
   try { ok(res, permissions.cancel((req.body || {}).id)); }
   catch (e) { fail(res, e); }
+});
+
+/* ---------------- semantic memory (Supabase pgvector / local fallback) ----------------
+   GET answers with an ARRAY (endpoint contract); stats/search are their own endpoints.
+   Everything here works with no keys and no Ollama via the local fallback. */
+api.get('/memory', async (req, res) => {
+  try { ok(res, arr(await memory.listMemories({ limit: req.query.limit, offset: req.query.offset }))); }
+  catch (e) { fail(res, e, []); }
+});
+api.get('/memory/stats', async (req, res) => {
+  try { ok(res, await memory.stats()); }
+  catch (e) { fail(res, e, { backend: 'unavailable', count: 0 }); }
+});
+api.get('/memory/search', async (req, res) => {
+  try { ok(res, arr(await memory.searchMemories(req.query.q || '', Number(req.query.limit) || 10))); }
+  catch (e) { fail(res, e, []); }
+});
+api.post('/memory', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const saved = await memory.upsertMemory({
+      content: b.content,
+      kind: b.kind,
+      importance: b.importance,
+      source: b.source || 'user',
+      dedupeKey: b.dedupeKey,
+      expiresAt: b.expiresAt,
+      metadata: b.metadata
+    });
+    if (!saved) return res.status(400).json({ error: 'content required' });
+    permissions.audit({ integration: 'memory', action: 'store', status: 'ok', summary: `stored ${saved.kind} memory`, target: saved.id });
+    ok(res, saved);
+  } catch (e) { fail(res, e); }
+});
+async function updateMemoryRoute(req, res) {
+  try {
+    const saved = await memory.updateMemory(req.params.id, req.body || {});
+    if (!saved) return res.status(404).json({ error: 'memory not found or invalid' });
+    ok(res, saved);
+  } catch (e) { fail(res, e); }
+}
+api.put('/memory/:id', updateMemoryRoute);
+api.patch('/memory/:id', updateMemoryRoute);
+api.delete('/memory/:id', async (req, res) => {
+  try {
+    const result = await memory.removeMemory(req.params.id);
+    if (result.deleted) permissions.audit({ integration: 'memory', action: 'forget', status: 'ok', summary: 'deleted one memory', target: req.params.id });
+    ok(res, result);
+  } catch (e) { fail(res, e); }
+});
+/* "forget that": by id(s), by search query, or everything (only with confirm=true). */
+api.post('/memory/forget', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const ids = arr(b.ids);
+    if (ids.length) return ok(res, await memory.removeMany(ids));
+    const q = String(b.query || '').trim();
+    if (!q) return res.status(400).json({ error: 'ids[] or query required' });
+    const hits = await memory.searchMemories(q, Number(b.limit) || 5);
+    const result = await memory.removeMany(hits.map((m) => m.id));
+    permissions.audit({ integration: 'memory', action: 'forget', status: 'ok', summary: `forgot ${result.deleted} memory item(s) matching "${q}"` });
+    ok(res, { ...result, removed: hits.map((m) => ({ id: m.id, content: m.content })) });
+  } catch (e) { fail(res, e); }
+});
+api.delete('/memory', async (req, res) => {
+  try {
+    if (String(req.query.confirm) !== 'true') return res.status(400).json({ error: 'confirm=true required to delete every memory' });
+    const result = await memory.forgetAll();
+    permissions.audit({ integration: 'memory', action: 'forget-all', status: 'ok', summary: `deleted ${result.deleted} memor(ies)` });
+    ok(res, result);
+  } catch (e) { fail(res, e); }
 });
 
 api.get('/contacts', (req, res) => {
